@@ -1,0 +1,8 @@
+# --- .gitignore ---
+config.yaml
+.vscode/
+jarvis/runs/
+__pycache__/
+*.pyc
+.env
+temp_localhost

@@ -132,3 +132,7 @@ data/
 .tmp
 *ports
 
+VA/
+swanlog/
+flash-attention/
+

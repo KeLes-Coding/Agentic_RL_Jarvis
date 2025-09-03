@@ -1,0 +1,114 @@
+# ----------------- 主要调度配置 -----------------
+main:
+  # 在这里定义一个或多个需要执行的任务
+  tasks:
+    - "打开计算器，计算123乘以456，告诉我答案是多少"
+    - "打开维基百科，搜索周杰伦，告诉我他2000年发布的专辑是什么。"
+    # - "你的其他任务..."
+
+  # 设备配置
+  device_providers:
+    # a. 本机设备
+    local:
+      enabled: true
+
+    # b. 远程IP设备 (公网/内网IP直连)
+    remote_ip:
+      enabled: false
+      # 可以提供多个远程主机的地址 (IP:Port)
+      remotes:
+        - host: ""
+        # - host: "your_public_ip:5555"
+
+    # c. SSH反向隧道设备
+    #    服务器2通过反向SSH将自己的ADB端口暴露为服务器1的某个本地端口
+    ssh_reverse_tunnel:
+      enabled: false
+      # 列出所有已建立的隧道
+      ssh_reverse_tunnels:
+        # 示例：服务器2将自己的ADB服务(通常是localhost:5037)转发到了服务器1的5038端口
+        - local_port: 5038  # 服务器1上的本地端口
+        # 如果您建立了另一个隧道，例如将另一台机器的ADB转发到服务器1的5039端口
+        # - local_port: 5039
+
+    ssh_forward_tunnel:
+      enabled: false
+      # 可配置多个SSH服务器
+      ssh_connections:
+        - ssh_user: ""
+          ssh_host: ""
+          ssh_port: 
+          # 重要：请在此处填写您服务器上adb命令的绝对路径
+          # 如果不确定，可以在服务器上执行 `which adb` 来查找
+          remote_adb_path: "" # 示例路径，请务必修改为您的真实路径
+          # 本地起始端口，程序将从此端口开始为远程虚拟机建立映射
+          # 例如，第一个虚拟机会被映射到 15555，第二个到 15556，以此类推
+          local_start_port: 
+
+# 安卓调试桥 (ADB) 相关配置
+adb:
+  executable_path: "adb"
+
+# 日志系统配置
+logging:
+  # 日志级别: DEBUG, INFO, WARNING, ERROR, CRITICAL
+  level: "DEBUG"
+  # 日志格式
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+
+# 代理配置
+proxy:
+  # 是否启用代理。如果为 false 或此部分被注释，则不使用代理。
+  enabled: false
+  # 代理服务器地址。
+  server: "http://127.0.0.1:7890"
+
+# Agent行为配置
+agent:
+  # Agent执行任务的最大步骤数。超过此数值将自动停止。
+  max_steps: 15
+
+  # 新增：错误重试配置
+  retry_on_error:
+    # 是否在遇到可恢复错误（如LLM输出格式问题）时启用重试
+    enabled: true
+    # 最大重试次数
+    attempts: 3
+
+  # 图片压缩配置
+  image_compression:
+    # 是否启用截图压缩。 true: 启用, false: 关闭
+    enabled: true
+    # 缩放因子。0.5 表示将图片的宽度和高度都缩放到原来的50%。
+    scale_factor: 0.5
+
+# 大型语言模型 (LLM) 配置
+llm:
+  # 可选 'openai', 'gemini', or 'claude'
+  api_mode: "openai"
+
+  providers:
+    openai:
+      base_url: "https://dashscope.aliyuncs.com/compatible-mode/v1"
+      # 在下方填入 API Key
+      api_key: ""
+      model: "qwen3-coder-plus"
+      timeout: 120
+      # 此模型是否为视觉语言模型 (VLM)
+      is_vlm: true
+
+    gemini:
+      # 在下方填入 API Key
+      api_key: ""
+      model: "gemini-1.5-pro-latest"
+      timeout: 120
+      # 此模型是否为视觉语言模型 (VLM)
+      is_vlm: true
+
+    claude:
+      # 在下方填入 API Key
+      api_key: ""
+      model: "claude-3-opus-20240229"
+      timeout: 120
+      # 此模型是否为视觉语言模型 (VLM)
+      is_vlm: true

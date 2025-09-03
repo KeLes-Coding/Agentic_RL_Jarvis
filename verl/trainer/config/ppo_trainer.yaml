@@ -284,7 +284,9 @@ ray_init:
 
 
 env:
-  env_name: alfworld/AlfredTWEnv
+  name: jarvis  # <-- 将环境名称设置为 'jarvis'
+  jarvis_config_path: "agent_system/environments/env_package/jarvis/jarvis_v2/config.yaml" # <-- 指定jarvis_v2的配置文件路径
+  max_steps_per_episode: 50 # <-- 设置每个episode的最大步数
   seed: 0
   max_steps: 50
   history_length: 2
