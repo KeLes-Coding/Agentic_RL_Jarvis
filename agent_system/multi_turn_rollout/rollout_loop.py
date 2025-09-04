@@ -40,6 +40,159 @@ class TrajectoryCollector:
         self.tokenizer = tokenizer
         self.processor = processor
 
+    # def preprocess_single_sample(
+    #     self,
+    #     item: int,
+    #     gen_batch: DataProto,
+    #     obs: Dict,
+    # ):
+    #     """
+    #     Process a single observation sample, organizing environment observations (text and/or images) 
+    #     into a format processable by the model.
+        
+    #     Parameters:
+    #         item (int): Sample index in the batch
+    #         gen_batch (DataProto): Batch data containing original prompts
+    #         obs (Dict): Environment observation, may contain 'text', 'image', 'anchor' keys
+        
+    #     Returns:
+    #         dict: Contains processed input data such as input_ids, attention_mask, etc.
+    #     """
+
+    #     raw_prompt = gen_batch.non_tensor_batch['raw_prompt'][item]
+    #     # data_source = gen_batch.non_tensor_batch['data_source'][item]
+        
+    #     # 使用 .get() 安全地访问 'data_source'，如果不存在，则提供一个默认值 'unknown'
+    #     data_source_list = gen_batch.non_tensor_batch.get('data_source')
+    #     data_source = data_source_list[item] if data_source_list is not None else 'unknown'
+        
+    #     # Get observation components
+    #     obs_texts = obs.get('text', None)
+    #     obs_images = obs.get('image', None)
+    #     obs_anchors = obs.get('anchor', None)
+    #     obs_text = obs_texts[item] if obs_texts is not None else None
+    #     obs_image = obs_images[item] if obs_images is not None else None
+    #     obs_anchor = obs_anchors[item] if obs_anchors is not None else None
+    #     is_multi_modal = obs_image is not None
+
+    #     _obs_anchor = torch_to_numpy(obs_anchor, is_object=True) if isinstance(obs_anchor, torch.Tensor) else obs_anchor
+
+    #     # Build chat structure
+    #     # obs_content = raw_prompt[0]['content']
+    #     # if '<image>' in obs_content: 
+    #     #     obs_content = obs_content.replace('<image>', '')
+
+    #     # Build chat structure
+    #     obs_content = ''
+    #     if obs_text is not None:
+    #         obs_content += obs_text
+    #     else:
+    #         print(f"Warning: No text observation found!")
+
+        
+    #     chat = np.array([{
+    #         "content": obs_content,
+    #         "role": "user",
+    #     }])
+        
+    #     # Apply chat template
+    #     prompt_with_chat_template = self.tokenizer.apply_chat_template(
+    #         chat,
+    #         add_generation_prompt=True,
+    #         tokenize=False
+    #     )
+        
+    #     # Initialize return dict
+    #     row_dict = {}
+        
+    #     # Process multimodal data
+    #     if is_multi_modal:
+    #         # Replace image placeholder with vision tokens
+    #         raw_prompt = prompt_with_chat_template.replace('<image>', '<|vision_start|><|image_pad|><|vision_end|>')
+    #         row_dict['multi_modal_data'] = {'image': [process_image(obs_image)]}
+    #         image_inputs = self.processor.image_processor(row_dict['multi_modal_data']['image'], return_tensors='pt')
+    #         image_grid_thw = image_inputs['image_grid_thw']
+    #         row_dict['multi_modal_inputs'] = {key: val for key, val in image_inputs.items()}
+    #         if image_grid_thw is not None:
+    #             merge_length = self.processor.image_processor.merge_size**2
+    #             index = 0
+    #             while '<image>' in prompt_with_chat_template:
+    #                 prompt_with_chat_template = prompt_with_chat_template.replace(
+    #                     '<image>',
+    #                     '<|vision_start|>' + '<|placeholder|>' * (image_grid_thw[index].prod() // merge_length) +
+    #                     '<|vision_end|>',
+    #                     1,
+    #                 )
+    #                 index += 1
+
+    #             prompt_with_chat_template = prompt_with_chat_template.replace('<|placeholder|>',
+    #                                                                             self.processor.image_token)
+
+    #     else:
+    #         raw_prompt = prompt_with_chat_template
+        
+    #     input_ids, attention_mask = verl_F.tokenize_and_postprocess_data(prompt=prompt_with_chat_template,
+    #                                                                         tokenizer=self.tokenizer,
+    #                                                                         max_length=self.config.data.max_prompt_length,
+    #                                                                         pad_token_id=self.tokenizer.pad_token_id,
+    #                                                                         left_pad=True,
+    #                                                                         truncation=self.config.data.truncation,)
+        
+        
+
+    #     # if is_multi_modal:
+
+    #     #     position_ids = get_rope_index(
+    #     #         self.processor,
+    #     #         input_ids=input_ids[0],
+    #     #         image_grid_thw=image_grid_thw,
+    #     #         attention_mask=attention_mask[0],
+    #     #     )  # (3, seq_len)
+    #     # else:
+    #     #     position_ids = compute_position_id_with_mask(attention_mask)
+    #     if is_multi_modal:
+    #         # 对于多模态，直接调用专用的 rope_index 函数来创建 position_ids
+    #         position_ids = get_rope_index(
+    #             self.processor,
+    #             input_ids=input_ids[0],
+    #             image_grid_thw=image_grid_thw,
+    #             attention_mask=attention_mask[0],
+    #         )
+    #     else:
+    #         # 对于纯文本，使用通用的 position_id 计算函数
+    #         position_ids = compute_position_id_with_mask(attention_mask)
+    #         # 确保返回的是 Long 类型，以保持一致性
+    #         position_ids = position_ids.long()
+
+    #     raw_prompt_ids = self.tokenizer.encode(raw_prompt, add_special_tokens=False)
+    #     if len(raw_prompt_ids) > self.config.data.max_prompt_length:
+    #         if self.config.data.truncation == "left":
+    #             raw_prompt_ids = raw_prompt_ids[-self.config.data.max_prompt_length :]
+    #         elif self.config.data.truncation == "right":
+    #             raw_prompt_ids = raw_prompt_ids[: self.config.data.max_prompt_length]
+    #         elif self.config.data.truncation == "middle":
+    #             left_half = self.config.data.max_prompt_length // 2
+    #             right_half = self.config.data.max_prompt_length - left_half
+    #             raw_prompt_ids = raw_prompt_ids[:left_half] + raw_prompt_ids[-right_half:]
+    #         elif self.config.data.truncation == "error":
+    #             raise RuntimeError(f"Prompt length {len(raw_prompt_ids)} is longer than {self.config.data.max_prompt_length}.")
+
+    #     # Build final output dict
+    #     row_dict.update({
+    #         'input_ids': input_ids[0],
+    #         'attention_mask': attention_mask[0],
+    #         'position_ids': position_ids[0],
+    #         'raw_prompt_ids': raw_prompt_ids,
+    #         'anchor_obs': _obs_anchor,
+    #         'index': item,
+    #         'data_source': data_source
+    #     })
+
+    #     if self.config.data.get('return_raw_chat', False):
+    #         row_dict['raw_prompt'] = chat.tolist()
+        
+    #     return row_dict
+
     def preprocess_single_sample(
         self,
         item: int,
@@ -47,120 +200,75 @@ class TrajectoryCollector:
         obs: Dict,
     ):
         """
-        Process a single observation sample, organizing environment observations (text and/or images) 
+        Process a single observation sample, organizing environment observations
         into a format processable by the model.
-        
-        Parameters:
-            item (int): Sample index in the batch
-            gen_batch (DataProto): Batch data containing original prompts
-            obs (Dict): Environment observation, may contain 'text', 'image', 'anchor' keys
-        
-        Returns:
-            dict: Contains processed input data such as input_ids, attention_mask, etc.
         """
-
-        raw_prompt = gen_batch.non_tensor_batch['raw_prompt'][item]
-        data_source = gen_batch.non_tensor_batch['data_source'][item]
-        
-        # Get observation components
-        obs_texts = obs.get('text', None)
-        obs_images = obs.get('image', None)
-        obs_anchors = obs.get('anchor', None)
-        obs_text = obs_texts[item] if obs_texts is not None else None
-        obs_image = obs_images[item] if obs_images is not None else None
-        obs_anchor = obs_anchors[item] if obs_anchors is not None else None
+        # --- 1. Extract data ---
+        obs_text = obs.get('text', [''] * (item + 1))[item]
+        obs_image = obs.get('image', [None] * (item + 1))[item]
+        obs_anchor = obs.get('anchor', [None] * (item + 1))[item]
         is_multi_modal = obs_image is not None
 
         _obs_anchor = torch_to_numpy(obs_anchor, is_object=True) if isinstance(obs_anchor, torch.Tensor) else obs_anchor
+        
+        data_source_list = gen_batch.non_tensor_batch.get('data_source')
+        data_source = data_source_list[item] if data_source_list is not None else "unknown"
 
-        # Build chat structure
-        # obs_content = raw_prompt[0]['content']
-        # if '<image>' in obs_content: 
-        #     obs_content = obs_content.replace('<image>', '')
+        # --- 2. Build Chat Content for Template ---
+        row_dict = {}
+        chat_content = []
 
-        # Build chat structure
-        obs_content = ''
-        if obs_text is not None:
-            obs_content += obs_text
+        if is_multi_modal:
+            # For multi-modal, always add the image.
+            chat_content.append({"type": "image"})
+            # The entire obs_text is the text part.
+            chat_content.append({"type": "text", "text": obs_text})
+            
+            row_dict['multi_modal_data'] = {'image': [process_image(obs_image)]}
         else:
-            print(f"Warning: No text observation found!")
+            # For text-only, the content is just the text string.
+            chat_content.append({"type": "text", "text": obs_text})
 
+        chat = [{"role": "user", "content": chat_content}]
         
-        chat = np.array([{
-            "content": obs_content,
-            "role": "user",
-        }])
-        
-        # Apply chat template
-        prompt_with_chat_template = self.tokenizer.apply_chat_template(
+        # --- 3. Apply Chat Template ---
+        final_prompt_text = self.tokenizer.apply_chat_template(
             chat,
             add_generation_prompt=True,
             tokenize=False
         )
         
-        # Initialize return dict
-        row_dict = {}
-        
-        # Process multimodal data
-        if is_multi_modal:
-            # Replace image placeholder with vision tokens
-            raw_prompt = prompt_with_chat_template.replace('<image>', '<|vision_start|><|image_pad|><|vision_end|>')
-            row_dict['multi_modal_data'] = {'image': [process_image(obs_image)]}
-            image_inputs = self.processor.image_processor(row_dict['multi_modal_data']['image'], return_tensors='pt')
-            image_grid_thw = image_inputs['image_grid_thw']
-            row_dict['multi_modal_inputs'] = {key: val for key, val in image_inputs.items()}
-            if image_grid_thw is not None:
-                merge_length = self.processor.image_processor.merge_size**2
-                index = 0
-                while '<image>' in prompt_with_chat_template:
-                    prompt_with_chat_template = prompt_with_chat_template.replace(
-                        '<image>',
-                        '<|vision_start|>' + '<|placeholder|>' * (image_grid_thw[index].prod() // merge_length) +
-                        '<|vision_end|>',
-                        1,
-                    )
-                    index += 1
+        # --- 4. Tokenize ---
+        input_ids, attention_mask = verl_F.tokenize_and_postprocess_data(
+            prompt=final_prompt_text,
+            tokenizer=self.tokenizer,
+            max_length=self.config.data.max_prompt_length,
+            pad_token_id=self.tokenizer.pad_token_id,
+            left_pad=True,
+            truncation=self.config.data.truncation,
+        )
 
-                prompt_with_chat_template = prompt_with_chat_template.replace('<|placeholder|>',
-                                                                                self.processor.image_token)
-
-        else:
-            raw_prompt = prompt_with_chat_template
+        # --- 5. Compute Position IDs ---
+        image_grid_thw = None
+        if is_multi_modal and self.processor and hasattr(self.processor, 'image_processor'):
+            image_inputs = self.processor.image_processor(
+                [process_image(obs_image)], return_tensors='pt'
+            )
+            image_grid_thw = image_inputs.get('image_grid_thw')
         
-        input_ids, attention_mask = verl_F.tokenize_and_postprocess_data(prompt=prompt_with_chat_template,
-                                                                            tokenizer=self.tokenizer,
-                                                                            max_length=self.config.data.max_prompt_length,
-                                                                            pad_token_id=self.tokenizer.pad_token_id,
-                                                                            left_pad=True,
-                                                                            truncation=self.config.data.truncation,)
-        
-        
-
-        if is_multi_modal:
-
+        if is_multi_modal and image_grid_thw is not None:
             position_ids = get_rope_index(
                 self.processor,
                 input_ids=input_ids[0],
                 image_grid_thw=image_grid_thw,
                 attention_mask=attention_mask[0],
-            )  # (3, seq_len)
+            )
         else:
-            position_ids = compute_position_id_with_mask(attention_mask)
+            position_ids = compute_position_id_with_mask(attention_mask).long()
 
-        raw_prompt_ids = self.tokenizer.encode(raw_prompt, add_special_tokens=False)
-        if len(raw_prompt_ids) > self.config.data.max_prompt_length:
-            if self.config.data.truncation == "left":
-                raw_prompt_ids = raw_prompt_ids[-self.config.data.max_prompt_length :]
-            elif self.config.data.truncation == "right":
-                raw_prompt_ids = raw_prompt_ids[: self.config.data.max_prompt_length]
-            elif self.config.data.truncation == "middle":
-                left_half = self.config.data.max_prompt_length // 2
-                right_half = self.config.data.max_prompt_length - left_half
-                raw_prompt_ids = raw_prompt_ids[:left_half] + raw_prompt_ids[-right_half:]
-            elif self.config.data.truncation == "error":
-                raise RuntimeError(f"Prompt length {len(raw_prompt_ids)} is longer than {self.config.data.max_prompt_length}.")
-
-        # Build final output dict
+        # --- 6. Finalize and return dictionary ---
+        raw_prompt_ids = self.tokenizer.encode(final_prompt_text, add_special_tokens=False)
+        
         row_dict.update({
             'input_ids': input_ids[0],
             'attention_mask': attention_mask[0],
@@ -170,10 +278,10 @@ class TrajectoryCollector:
             'index': item,
             'data_source': data_source
         })
-
-        if self.config.data.get('return_raw_chat', False):
-            row_dict['raw_prompt'] = chat.tolist()
         
+        if self.config.data.get('return_raw_chat', False):
+            row_dict['raw_prompt'] = chat
+
         return row_dict
 
     def preprocess_batch(

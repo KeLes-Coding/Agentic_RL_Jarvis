@@ -706,22 +706,36 @@ class RayPPOTrainer:
 
             # Store original inputs
             input_ids = test_batch.batch["input_ids"]
+
+            input_ids = input_ids.long()
+            
             # TODO: Can we keep special tokens except for padding tokens?
             input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
             sample_inputs.extend(input_texts)
 
             batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
-            non_tensor_batch_keys_to_pop = ["raw_prompt_ids", "data_source"]
-            if "multi_modal_data" in test_batch.non_tensor_batch:
-                non_tensor_batch_keys_to_pop.append("multi_modal_data")
-            if "raw_prompt" in test_batch.non_tensor_batch:
-                non_tensor_batch_keys_to_pop.append("raw_prompt")
-            if "tools_kwargs" in test_batch.non_tensor_batch:
-                non_tensor_batch_keys_to_pop.append("tools_kwargs")
+            batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
+            # 在 pop 之前，先检查 key 是否存在
+            non_tensor_batch_keys_to_pop = [
+                key for key in ["raw_prompt_ids", "data_source", "multi_modal_data", "raw_prompt", "tools_kwargs"]
+                if key in test_batch.non_tensor_batch
+            ]
+
             test_gen_batch = test_batch.pop(
                 batch_keys=batch_keys_to_pop,
                 non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
             )
+            # non_tensor_batch_keys_to_pop = ["raw_prompt_ids", "data_source"]
+            # if "multi_modal_data" in test_batch.non_tensor_batch:
+            #     non_tensor_batch_keys_to_pop.append("multi_modal_data")
+            # if "raw_prompt" in test_batch.non_tensor_batch:
+            #     non_tensor_batch_keys_to_pop.append("raw_prompt")
+            # if "tools_kwargs" in test_batch.non_tensor_batch:
+            #     non_tensor_batch_keys_to_pop.append("tools_kwargs")
+            # test_gen_batch = test_batch.pop(
+            #     batch_keys=batch_keys_to_pop,
+            #     non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
+            # )
 
             test_gen_batch.meta_info = {
                 "eos_token_id": self.tokenizer.eos_token_id,
@@ -740,12 +754,43 @@ class RayPPOTrainer:
             # test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
 
             ################ agent-environment loop ###############
-            test_output_gen_batch = self.traj_collector.multi_turn_loop(
-                                                    gen_batch=test_gen_batch,
-                                                    actor_rollout_wg=self.actor_rollout_wg,
-                                                    envs=self.val_envs,
-                                                    is_train=False,
-                                                    )
+            # test_output_gen_batch = self.traj_collector.multi_turn_loop(
+            #                                         gen_batch=test_gen_batch,
+            #                                         actor_rollout_wg=self.actor_rollout_wg,
+            #                                         envs=self.val_envs,
+            #                                         is_train=False,
+            #                                         )
+            # --- 修改开始 ---
+            # 将大的验证批次分块处理
+            num_val_envs = self.val_envs.num_envs
+            all_output_batches = []
+            for i in range(0, len(test_gen_batch), num_val_envs):
+                chunk_batch = test_gen_batch[i:i + num_val_envs]
+                
+                # 确保最后一块的大小也正确 (如果需要，可以添加填充逻辑，但通常直接处理即可)
+                if len(chunk_batch) != num_val_envs and len(chunk_batch) > 0:
+                    print(f"Warning: The last validation chunk has size {len(chunk_batch)}, while num_val_envs is {num_val_envs}. This might cause issues if the environment cannot handle smaller batches.")
+                    # 如果环境不能处理小于num_envs的批次，你可能需要在这里跳过或者填充
+                    # continue 
+                
+                if len(chunk_batch) == 0:
+                    continue
+
+                output_chunk = self.traj_collector.multi_turn_loop(
+                    gen_batch=chunk_batch,
+                    actor_rollout_wg=self.actor_rollout_wg,
+                    envs=self.val_envs,
+                    is_train=False,
+                )
+                all_output_batches.append(output_chunk)
+            
+            # 将所有处理完的块合并回一个大的 batch
+            if not all_output_batches:
+                # 如果验证集为空或被完全跳过，返回空 metrics
+                return {}
+            test_output_gen_batch = DataProto.concat(all_output_batches)
+            # --- 修改结束 ---
+
             print('validation generation end')
             del test_batch
             test_batch = test_output_gen_batch

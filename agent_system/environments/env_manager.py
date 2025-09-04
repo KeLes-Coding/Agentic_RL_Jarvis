@@ -519,15 +519,28 @@ class JarvisEnvironmentManager(EnvironmentManagerBase):
     def __init__(self, envs, projection_f, config):
         self.memory = SimpleMemory()
         super().__init__(envs, projection_f, config)
+        # 将底层环境的 num_envs 属性暴露出来
+        self.num_envs = self.envs.num_envs
 
     def reset(self):
         raw_obs, infos = self.envs.reset()
         
-        # 假设任务描述来自于infos或一个外部列表，这里我们用一个占位符
-        self.tasks = ["Placeholder task description" for _ in range(self.envs.num_envs)]
+        # --- 修改开始 ---
+        # 1. 从传入的 initial_batch (gen_batch) 中获取任务描述。
+        #    如果不存在，则使用一个明确的默认值。
+        #    注意: 我们需要修改 rollout_loop 来传递这个 initial_batch。
+        #    暂时，我们先用一个占位符。
+        self.tasks = ["Please complete the task based on the user interface." for _ in range(self.envs.num_envs)]
+        
+        # 2. 将任务描述整合进 text observation
+        #    这样，obs['text'] 就永远不会是空的了。
+        initial_texts = []
+        for i in range(self.envs.num_envs):
+            initial_texts.append(f"{self.tasks[i]}\n{raw_obs['text'][i]}")
+        raw_obs['text'] = initial_texts
+        # --- 修改结束 ---
         
         self.memory.reset(batch_size=self.envs.num_envs)
-        # 初始观测值不需要存储到memory中，因为它没有对应的action
         self.pre_text_obs = raw_obs['text']
 
         full_text_obs = self.build_text_obs(raw_obs['text'], init=True)

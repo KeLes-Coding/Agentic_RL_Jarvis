@@ -20,6 +20,7 @@ from typing import List, Tuple, Dict
 import math
 from PIL import Image
 from verl import DataProto
+import io
 
 def to_list_of_dict(batch: DataProto) -> list[dict]:
     tensors = batch.batch
@@ -59,8 +60,16 @@ def numpy_to_torch(array, device):
 
 
 def process_image(image, max_pixels: int = 2048 * 2048, min_pixels: int = 256 * 256):
-    if isinstance(image, torch.Tensor):
-        image = torch_to_numpy(image)
+    # 检查输入是否为字节流，如果是，则解码为图像
+    if isinstance(image, bytes):
+        try:
+            pil_image = Image.open(io.BytesIO(image)).convert('RGB')
+            image = np.array(pil_image)
+        except Exception as e:
+            # 如果解码失败，打印错误并返回一个占位符图像，避免程序崩溃
+            print(f"Failed to decode image from bytes: {e}")
+            # 返回一个黑色的224x224图像作为备用
+            return np.zeros((224, 224, 3), dtype=np.uint8)
     if image.max() < 1:
         image = image * 255.0
     if image.dtype != np.uint8:
