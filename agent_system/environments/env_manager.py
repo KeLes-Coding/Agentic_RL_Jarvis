@@ -24,8 +24,11 @@ from agent_system.environments.base import EnvironmentManagerBase, to_numpy
 from agent_system.memory import SimpleMemory
 from agent_system.environments.env_package.jarvis.envs import build_jarvis_envs
 from agent_system.environments.env_package.jarvis.projection import jarvis_projection
-# 1. 修改导入的 prompt，使用新的函数
-from agent_system.environments.prompts.jarvis import get_jarvis_step_1_prompt, get_jarvis_intermediate_prompt
+from agent_system.environments.env_package.jarvis.envs import JarvisEnv
+from agent_system.environments.env_package.jarvis.projection import JarvisProjection
+from agent_system.environments.prompts.jarvis import JarvisPrompter
+
+import json
 
 def parse_gamefile(infos):
     gamefile = []
@@ -516,87 +519,115 @@ class AppWorldEnvironmentManager(EnvironmentManagerBase):
     
 # 2. 覆盖更新 JarvisEnvironmentManager 类
 class JarvisEnvironmentManager(EnvironmentManagerBase):
+    """
+    专门为 Jarvis 环境设计的管理器。
+    负责构建符合 step-by-step 交互模式的 prompt。
+    """
     def __init__(self, envs, projection_f, config):
         self.memory = SimpleMemory()
         super().__init__(envs, projection_f, config)
-        # 将底层环境的 num_envs 属性暴露出来
-        self.num_envs = self.envs.num_envs
+        self.prompter = JarvisPrompter() # 实例化我们的 Prompter
+        # self.num_envs 由父类通过 self.envs.num_envs 自动设置
 
     def reset(self):
-        raw_obs, infos = self.envs.reset()
+        """
+        重置所有并行的环境，并为第一步构建 prompt。
+        """
+        # self.envs 是一个 BatchedEnv 实例, reset 返回 ([obs_1, obs_2, ...], [info_1, info_2, ...])
+        observations, infos = self.envs.reset()
         
-        # --- 修改开始 ---
-        # 1. 从传入的 initial_batch (gen_batch) 中获取任务描述。
-        #    如果不存在，则使用一个明确的默认值。
-        #    注意: 我们需要修改 rollout_loop 来传递这个 initial_batch。
-        #    暂时，我们先用一个占位符。
-        self.tasks = ["Please complete the task based on the user interface." for _ in range(self.envs.num_envs)]
+        # 提取每个并行环境的任务描述
+        self.tasks = [info['task_prompt'] for info in infos]
         
-        # 2. 将任务描述整合进 text observation
-        #    这样，obs['text'] 就永远不会是空的了。
-        initial_texts = []
-        for i in range(self.envs.num_envs):
-            initial_texts.append(f"{self.tasks[i]}\n{raw_obs['text'][i]}")
-        raw_obs['text'] = initial_texts
-        # --- 修改结束 ---
+        # 初始化记忆
+        self.memory.reset(batch_size=self.num_envs)
         
-        self.memory.reset(batch_size=self.envs.num_envs)
-        self.pre_text_obs = raw_obs['text']
+        # `observations` 是一个字典列表，每个字典包含 'simplified_ui' 等
+        # 我们需要提取出用于构建 prompt 的 UI 描述
+        ui_descriptions = [obs['simplified_ui'] for obs in observations]
 
-        full_text_obs = self.build_text_obs(raw_obs['text'], init=True)
-        return {'text': full_text_obs, 'image': raw_obs['image'], 'anchor': raw_obs['text']}, infos
+        # 使用 prompter 构建第一步的 prompt
+        full_text_obs = self.build_text_obs(ui_descriptions, infos, init=True)
+        
+        # `anchor` 通常是更原始的、未经处理的观测，用于记忆或其他目的
+        # 在这里，我们可以用原始的 UI 描述
+        anchor_obs = ui_descriptions
+        
+        # JarvisEnv 不返回 image, 我们将其设为 None
+        return {'text': full_text_obs, 'image': None, 'anchor': anchor_obs}, infos
 
     def step(self, text_actions: List[str]):
-        # 1. 解析完整的JSON输出，获取动作和思考
-        # text_actions 是模型输出的原始JSON字符串列表
-        parsed_actions, valids, thoughts = self.projection_f(text_actions)
-
-        # 2. 在底层环境中执行解析出的动作
-        next_raw_obs, rewards, dones, infos = self.envs.step(parsed_actions)
+        """
+        接收模型的JSON输出，解析后在环境中执行，并构建下一步的prompt。
+        """
+        # 1. 解析模型输出的JSON字符串，获取低级动作和思考过程
+        # text_actions: ['{"thought": "...", "action": "tap(1)"}', ...]
+        actions_to_execute = []
+        thoughts = []
+        valids = []
+        for json_str in text_actions:
+            try:
+                parsed_json = json.loads(json_str)
+                actions_to_execute.append(parsed_json)
+                thoughts.append(parsed_json.get('thought', ''))
+                valids.append(True)
+            except json.JSONDecodeError:
+                # 如果模型输出的不是有效的JSON，则视为无效动作
+                actions_to_execute.append({"action": "wait(1)", "thought": "Invalid JSON format."})
+                thoughts.append("Invalid JSON format.")
+                valids.append(False)
         
-        # 3. 将上一步的思考和这一步的动作存入记忆
-        self.memory.store({'thought': thoughts, 'action': parsed_actions})
-        self.pre_text_obs = next_raw_obs['text']
+        # 2. 在环境中执行动作
+        # self.envs.step 期望接收一个动作列表: [{'action': 'tap(1)'}, ...]
+        next_observations, rewards, dones, infos = self.envs.step(actions_to_execute)
+        
+        # 3. 将上一步的完整动作（包含thought）存入记忆
+        self.memory.store(actions_to_execute)
 
-        # 4. 构建下一步的观测文本（Prompt）
-        full_text_obs = self.build_text_obs(next_raw_obs['text'])
-
+        # 4. 准备下一步的 prompt
+        ui_descriptions = [obs['simplified_ui'] for obs in next_observations]
+        full_text_obs = self.build_text_obs(ui_descriptions, infos)
+        
+        # 5. 打包返回结果
         for i, info in enumerate(infos):
             info['is_action_valid'] = to_numpy(valids[i])
 
-        next_observations = {'text': full_text_obs, 'image': next_raw_obs['image'], 'anchor': next_raw_obs['text']}
+        next_obs_dict = {'text': full_text_obs, 'image': None, 'anchor': ui_descriptions}
         rewards = to_numpy(rewards)
         dones = to_numpy(dones)
 
-        return next_observations, rewards, dones, infos
+        return next_obs_dict, rewards, dones, infos
 
-    def build_text_obs(self, text_obs: List[str], init: bool = False) -> List[str]:
+    def build_text_obs(self, ui_descriptions: List[str], infos: List[Dict], init: bool = False) -> List[str]:
+        """
+        使用 JarvisPrompter 构建用于模型输入的完整文本。
+        """
         postprocess_text_obs = []
         
-        # 如果不是第一步，并且需要历史记录，则从memory中获取
-        if not init and self.config.env.history_length > 0:
-            # 我们只需要上一步的记录来构建prompt
-            last_records = self.memory.fetch(1)
-
-        for i in range(len(text_obs)):
-            # 判断是第一步还是后续步骤
+        # 获取上一步的记忆（如果需要）
+        if not init:
+            # 我们只需要上一步的记录
+            last_records = self.memory.fetch_latest(1)
+        
+        for i in range(self.num_envs):
             if init or len(self.memory[i]) == 0:
-                # 调用第一步的prompt生成函数
-                obs = get_jarvis_step_1_prompt(
+                # 这是第一步
+                obs = self.prompter.get_step_1_prompt(
                     task=self.tasks[i],
-                    simplified_ui=text_obs[i]
+                    simplified_ui=ui_descriptions[i]
                 )
             else:
-                # 调用后续步骤的prompt生成函数
-                # last_records[i] 的格式是 [{'thought': '...', 'action': '...'}]
-                prev_thought = last_records[i][0].get('thought', 'N/A')
-                prev_action = last_records[i][0].get('action', 'N/A')
+                # 这是中间步骤
+                # last_records[i] 的格式是 [{'action': 'tap(1)', 'thought': '...'}]
+                prev_action_dict = last_records[i][0]
+                prev_thought = prev_action_dict.get('thought', 'N/A')
+                prev_action = prev_action_dict.get('action', 'N/A')
                 
-                obs = get_jarvis_intermediate_prompt(
+                obs = self.prompter.get_intermediate_prompt(
                     task=self.tasks[i],
                     prev_thought=prev_thought,
                     prev_action=prev_action,
-                    simplified_ui=text_obs[i]
+                    simplified_ui=ui_descriptions[i]
                 )
             postprocess_text_obs.append(obs)
             
@@ -687,17 +718,26 @@ def make_envs(config):
         envs = AppWorldEnvironmentManager(_envs, projection_f, config)
         val_envs = AppWorldEnvironmentManager(_val_envs, projection_f, config)
         return envs, val_envs
-    elif "jarvis" in config.env.env_name.lower():
+    elif "jarvis" in config.env.name.lower():
+        # 1. 导入Jarvis环境的构建器和投射器
+        from agent_system.environments.env_package.jarvis.envs import build_jarvis_envs
+        from agent_system.environments.env_package.jarvis.projection import JarvisProjection
+
+        # 2. 构建训练和验证环境
+        # BatchedEnv 将会在这里被创建
         _envs = build_jarvis_envs(
-            jarvis_config_path=config.env.jarvis_config_path,
-            max_steps=config.env.max_steps_per_episode
+            config=config,
+            env_num=config.data.train_batch_size
         )
         _val_envs = build_jarvis_envs(
-            jarvis_config_path=config.env.jarvis_config_path,
-            max_steps=config.env.max_steps_per_episode
+            config=config,
+            env_num=config.data.val_batch_size
         )
 
-        projection_f = partial(jarvis_projection)
+        # 3. 创建投射器实例
+        projection_f = JarvisProjection(config)
+        
+        # 4. 创建并返回环境管理器
         envs = JarvisEnvironmentManager(_envs, projection_f, config)
         val_envs = JarvisEnvironmentManager(_val_envs, projection_f, config)
         return envs, val_envs

@@ -127,20 +127,8 @@ def get_rope_index(
             text_len = len(input_tokens) - st
             llm_pos_ids_list.append(torch.arange(text_len).view(1, -1).expand(3, -1) + st_idx)
 
-        # llm_positions = torch.cat(llm_pos_ids_list, dim=1).reshape(3, -1)
-
-        device = input_ids.device
-
-        if not llm_pos_ids_list:
-            # 如果列表为空，创建一个空的占位张量，以避免 torch.cat 报错
-            # reshape(3, 0) 是为了匹配后续代码可能期望的维度结构
-            llm_positions = torch.tensor([], dtype=torch.long, device=device).reshape(3, 0)
-        else:
-            # 否则，正常执行
-            llm_positions = torch.cat(llm_pos_ids_list, dim=1).reshape(3, -1)
-
-        # position_ids[..., attention_mask == 1] = llm_positions.to(position_ids.device)
-        position_ids[..., attention_mask == 1] = llm_positions.to(position_ids.device, dtype=position_ids.dtype)
+        llm_positions = torch.cat(llm_pos_ids_list, dim=1).reshape(3, -1)
+        position_ids[..., attention_mask == 1] = llm_positions.to(position_ids.device)
     else:
         if attention_mask is not None:
             position_ids = attention_mask.long().cumsum(-1) - 1

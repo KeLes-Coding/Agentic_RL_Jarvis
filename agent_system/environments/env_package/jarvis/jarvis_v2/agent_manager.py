@@ -14,10 +14,10 @@ from typing import List, Dict, Any
 sys.path.append(os.path.join(os.path.dirname(__file__), "device_management"))
 
 # 导入现有的 agent_worker
-from .jarvis.agent import agent_worker
+from jarvis.agent import agent_worker
 
 # 从新的、独立的模块中导入设备提供者
-from .device_management.device_providers import (
+from device_management.device_providers import (
     DeviceProvider,
     LocalDeviceProvider,
     RemoteIPDeviceProvider,

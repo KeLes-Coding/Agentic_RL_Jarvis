@@ -1,116 +1,181 @@
-# agent_system/environments/env_package/jarvis/envs.py
+# agent_system/environments/env_package/jarvis/envs.py (最终修正版)
 
+import time
+import os
 import yaml
-import numpy as np
-from typing import List, Dict, Tuple
+import logging
+import pandas as pd
+import subprocess
+import json
+from typing import List, Dict, Any, Tuple, Optional
+import sys
 
-# 假设 jarvis_v2 源码位于 agent_system/environments/env_package/jarvis_v2
-from .jarvis_v2.jarvis.modules.observer import Observer
-from .jarvis_v2.jarvis.modules.actuator import Actuator
-from .jarvis_v2.agent_manager import discover_devices
+# --- 关键修正：正确设置模块搜索路径 ---
+# 1. 获取包含所有 jarvis_v2 代码的根目录
+#    根据你的描述，jarvis_v2 库放在了 envs.py 的同级目录
+jarvis_v2_root = os.path.join(os.path.dirname(__file__), 'jarvis_v2')
 
-class JarvisMultiDeviceEnv:
+# 2. 将此根目录添加到 sys.path
+if jarvis_v2_root not in sys.path:
+    sys.path.insert(0, jarvis_v2_root)
+
+
+# --- 关键修正：从正确的文件中导入真实的函数和类 ---
+# 从 agent_manager.py 导入 discover_devices 和 cleanup_ssh_tunnels
+from agent_manager import discover_devices, cleanup_ssh_tunnels
+# 从 jarvis_v2 的内部模块导入 Observer 和 Actuator
+from jarvis.modules.observer import Observer
+from jarvis.modules.actuator import Actuator
+
+
+def build_jarvis_envs(config, env_num):
     """
-    一个底层的、支持多设备的 Jarvis 环境。
-    它封装了与一组安卓设备的直接交互 (reset, step)。
-    这个类不处理复杂的 prompt 构建，只提供原始观测数据。
+    这个函数由 env_manager.py 调用，用于创建并行的、批处理的 Jarvis 环境。
     """
-    def __init__(self, jarvis_config_path: str, max_steps_per_episode: int):
-        try:
-            with open(jarvis_config_path, "r", encoding="utf-8") as f:
-                self.jarvis_config = yaml.safe_load(f)
-        except FileNotFoundError:
-            raise FileNotFoundError(f"错误: jarvis_v2 的配置文件 '{jarvis_config_path}' 未找到！")
+    from agent_system.environments.base import BatchedEnv
+    envs = [JarvisEnv(config) for _ in range(env_num)]
+    return BatchedEnv(envs)
 
-        self.device_serials: List[str] = discover_devices(self.jarvis_config)
-        if not self.device_serials:
-            raise RuntimeError("未能发现任何可用的安卓设备，请检查配置或设备连接。")
 
-        self.num_envs = len(self.device_serials)
-        print(f"JarvisMultiDeviceEnv 初始化成功，管理 {self.num_envs} 台设备: {self.device_serials}")
-
-        adb_path = self.jarvis_config.get("adb", {}).get("executable_path", "adb")
-        self.observers: Dict[str, Observer] = {s: Observer(adb_path, s) for s in self.device_serials}
-        self.actuators: Dict[str, Actuator] = {s: Actuator(adb_path, s) for s in self.device_serials}
+class JarvisEnv:
+    """
+    Jarvis 安卓控制环境 (Step-by-Step 交互模式)。
+    """
+    def __init__(self, config):
+        self.logger = logging.getLogger(f"JarvisEnv_{os.getpid()}")
         
-        self.max_steps_per_episode = max_steps_per_episode
-        self.episode_steps: Dict[str, int] = {s: 0 for s in self.device_serials}
-
-    def reset(self) -> Tuple[Dict[str, List], List[Dict]]:
-        """重置所有设备并返回初始观测值。"""
-        obs_images = []
-        obs_texts = []
-        infos = []
-
-        for serial in self.device_serials:
-            self.episode_steps[serial] = 0
-            self.actuators[serial].home() # 返回主屏幕作为初始状态
-            
-            obs_data = self.observers[serial].get_current_observation()
-            obs_images.append(obs_data.get("screenshot_bytes"))
-            obs_texts.append(obs_data.get("simplified_elements_str"))
-            infos.append({"device_serial": serial})
-
-        return {"image": obs_images, "text": obs_texts}, infos
-
-    def step(self, actions: List[str]) -> Tuple[Dict[str, List], List[float], List[bool], List[Dict]]:
-        """在所有设备上执行动作。"""
-        obs_images, obs_texts, rewards, dones, infos = [], [], [], [], []
-
-        for i, serial in enumerate(self.device_serials):
-            action_str = actions[i]
-            
-            # 1. 执行动作
-            elements = self.observers[serial].get_current_observation().get("simplified_elements_list")
-            status = self._dispatch_action(self.actuators[serial], action_str, elements)
-            action_success = (status == "SUCCESS")
-            
-            self.episode_steps[serial] += 1
-
-            # 2. 获取新观测
-            obs_data = self.observers[serial].get_current_observation()
-            obs_images.append(obs_data.get("screenshot_bytes"))
-            obs_texts.append(obs_data.get("simplified_elements_str"))
-
-            # 3. 计算奖励和结束状态
-            done = False
-            reward = 0.0
-            if action_str.startswith("finish"):
-                reward = 1.0  # 任务成功，给予高奖励
-                done = True
-            elif not action_success:
-                reward = -0.1 # 动作执行失败，给予惩罚
-            
-            if self.episode_steps[serial] >= self.max_steps_per_episode:
-                done = True # 到达最大步数
-
-            rewards.append(reward)
-            dones.append(done)
-            infos.append({"device_serial": serial, "action_success": action_success})
-
-        observations = {"image": obs_images, "text": obs_texts}
-        return observations, rewards, dones, infos
-
-    def _dispatch_action(self, actuator: Actuator, action_str: str, elements: list) -> str:
-        # (这个函数与之前版本相同，负责解析和执行动作)
+        # 从 hydra 传入的完整配置中获取 jarvis 的专属配置
+        jarvis_config = config.env.jarvis
+        
+        # 1. 加载 Jarvis V2 自身的配置文件
+        # 注意：这里的路径是相对于项目根目录的，或者你需要提供一个绝对路径
+        self.jarvis_config_path = jarvis_config.jarvis_config_path
         try:
-            action_name = action_str.split("(")[0]
-            params_str = action_str[len(action_name) + 1 : -1] if "(" in action_str else ""
-            if action_name in ["tap", "input_text", "swipe"] and not elements: return "FAILURE_NO_ELEMENTS"
-            if action_name == "tap": result = actuator.tap(int(params_str), elements)
-            elif action_name == "input_text":
-                uid, text = params_str.split(",", 1)
-                result = actuator.input_text(int(uid), text.strip().strip("'\""), elements)
-            elif action_name == "swipe":
-                s_uid, e_uid = map(int, params_str.split(","))
-                result = actuator.swipe(s_uid, e_uid, elements)
-            elif action_name == "back": result = actuator.back()
-            elif action_name == "home": result = actuator.home()
-            elif action_name == "wait": result = actuator.wait(float(params_str))
-            else: return "UNKNOWN_ACTION"
-            return "SUCCESS" if result else "FAILURE"
-        except Exception: return "EXECUTION_ERROR"
+            with open(self.jarvis_config_path, "r", encoding="utf-8") as f:
+                self.jarvis_internal_config = yaml.safe_load(f)
+        except FileNotFoundError:
+            self.logger.error(f"错误: Jarvis V2 配置文件未找到于 {self.jarvis_config_path}")
+            raise
+        
+        # 2. 发现设备 (使用从 agent_manager.py 导入的真实函数)
+        all_devices = discover_devices(self.jarvis_internal_config)
+        if not all_devices:
+            raise RuntimeError("未发现任何可用的安卓设备")
+        
+        # TODO: 在多环境并行时，需要一个机制来为每个Env实例分配唯一的设备
+        # 这个逻辑需要根据你的具体硬件设置来完善
+        self.device_serial = all_devices[0] # 简单起见，暂时总是选择第一台设备
+        self.logger.info(f"JarvisEnv 实例将使用设备: {self.device_serial}")
 
-def build_jarvis_envs(jarvis_config_path: str, max_steps: int) -> JarvisMultiDeviceEnv:
-    """构建并返回一个 JarvisMultiDeviceEnv 实例"""
-    return JarvisMultiDeviceEnv(jarvis_config_path, max_steps)
+        # 3. 初始化设备观察器和执行器
+        self.observer = Observer(self.device_serial)
+        self.actuator = Actuator(self.device_serial)
+
+        # 4. 加载任务数据集
+        dataset_path = jarvis_config.dataset_path
+        if not dataset_path or not os.path.exists(dataset_path):
+            raise ValueError(f"必须在配置中提供有效的数据集路径，当前路径: {dataset_path}")
+        self.dataset = pd.read_parquet(dataset_path)
+        self.task_idx = 0
+
+        # 5. Episode 状态追踪
+        self.current_task_prompt = ""
+        self.current_ground_truth = ""
+        self.episode_steps = 0
+        self.max_steps_per_episode = jarvis_config.max_steps_per_episode
+
+    def reset(self) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        self.logger.info(f"开始新的 Episode (任务索引: {self.task_idx})...")
+        self.actuator.home()
+        time.sleep(2)
+        self.episode_steps = 0
+
+        if self.task_idx >= len(self.dataset):
+            self.task_idx = 0
+        
+        task_data = self.dataset.iloc[self.task_idx]
+        try:
+            # 解析JSON格式的prompt
+            prompt_content = json.loads(task_data['prompt'])[0]['content']
+        except (json.JSONDecodeError, IndexError):
+             # 如果解析失败，直接使用原始字符串
+            prompt_content = task_data['prompt']
+
+        self.current_task_prompt = prompt_content
+        self.current_ground_truth = task_data['ground_truth_answer']
+        
+        observation = self._get_observation()
+        
+        info = {
+            "task_id": f"episode_{self.task_idx}",
+            "task_prompt": self.current_task_prompt,
+            "ground_truth_answer": self.current_ground_truth
+        }
+        
+        self.task_idx += 1
+        return observation, info
+
+    def step(self, action: Dict[str, Any]) -> Tuple[Dict[str, Any], float, bool, Dict]:
+        self.episode_steps += 1
+        
+        action_str = action.get("action", "")
+        self.actuator.execute(action_str)
+        
+        observation = self._get_observation()
+        
+        done = False
+        reward = 0.0
+        
+        if self.episode_steps >= self.max_steps_per_episode:
+            done = True
+            reward = 0.0
+            self.logger.warning("Episode 因超时而结束。")
+
+        if action_str.startswith("finish"):
+            done = True
+            summary = self._parse_finish_summary(action_str)
+            reward = self._calculate_final_reward(summary, self.current_ground_truth, observation)
+            self.logger.info(f"Episode 由 'finish' 动作结束，最终奖励: {reward}")
+
+        info = {
+            "action_str": action_str,
+            "thought": action.get("thought", "")
+        }
+        
+        return observation, reward, done, info
+
+    def _get_observation(self) -> Dict[str, Any]:
+        screenshot_path, simplified_ui, _ = self.observer.observe()
+        return {
+            "screenshot_path": screenshot_path,
+            "simplified_ui": simplified_ui,
+        }
+        
+    def _parse_finish_summary(self, action_str: str) -> str:
+        try:
+            return action_str[action_str.find("(")+1:action_str.rfind(")")].strip("'\"")
+        except:
+            return ""
+
+    def _calculate_final_reward(self, final_answer: str, ground_truth: str, last_obs: Dict) -> float:
+        final_answer = final_answer.strip()
+        is_correct = (final_answer == ground_truth)
+        if not is_correct:
+            return 0.0
+        
+        gui_verified = False
+        ui_text = last_obs.get('simplified_ui', '')
+        if ground_truth in ui_text:
+            gui_verified = True
+            
+        if is_correct and gui_verified:
+            return 1.0
+        elif is_correct and not gui_verified:
+            return 0.5
+        else:
+            return 0.0
+
+    def close(self):
+        self.logger.info("正在关闭 JarvisEnv...")
+        # 使用从 agent_manager.py 导入的真实函数
+        cleanup_ssh_tunnels()

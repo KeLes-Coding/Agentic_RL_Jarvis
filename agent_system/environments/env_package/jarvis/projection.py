@@ -1,41 +1,42 @@
 # agent_system/environments/env_package/jarvis/projection.py
 
-import numpy as np
-import json
-from typing import List, Tuple
+from typing import Any, Dict
 
-def jarvis_projection(text_actions: List[str]) -> Tuple[List[str], np.ndarray, List[str]]:
+class JarvisProjection:
     """
-    解析模型生成的JSON字符串。
-
-    Args:
-        text_actions: 模型生成的包含 "thought" 和 "action" 的JSON字符串列表。
-
-    Returns:
-        - A list of action strings (e.g., "tap(1)").
-        - A numpy array of booleans indicating if the parsing was valid.
-        - A list of thought strings.
+    一个简单的投射器，用于Jarvis环境。
+    由于Jarvis环境的观测和动作都已经是自然语言字符串，
+    这个类主要负责确保数据格式的统一性，无需复杂的转换。
     """
-    parsed_actions = []
-    thoughts = []
-    valids = []
+    def __init__(self, config: Dict[str, Any]):
+        """
+        初始化投射器。
+        :param config: 环境配置，可能包含未来扩展所需的参数。
+        """
+        self.config = config
 
-    for text_action in text_actions:
-        try:
-            # 去除可能的 markdown 代码块标记
-            cleaned_text = text_action.strip().removeprefix("```json").removesuffix("```").strip()
-            
-            data = json.loads(cleaned_text)
-            thought = data.get("thought", "")
-            action = data.get("action", "finish(reason='Parsing error')")
-            
-            parsed_actions.append(action)
-            thoughts.append(thought)
-            valids.append(True)
-        except json.JSONDecodeError:
-            # 如果JSON解析失败，我们默认执行 finish 动作并记录错误
-            parsed_actions.append("finish(reason='Invalid JSON format')")
-            thoughts.append("Error: Failed to parse LLM response as valid JSON.")
-            valids.append(False)
-            
-    return parsed_actions, np.array(valids, dtype=bool), thoughts
+    def project_observation(self, obs: Any) -> str:
+        """
+        将环境的观测投射为字符串。
+        在JarvisEnv中，观测直接就是任务的prompt。
+        
+        :param obs: 来自JarvisEnv.reset()的原始观测。
+        :return: 格式化后的字符串观测。
+        """
+        if not isinstance(obs, str):
+            # 做一个类型检查以保证健壮性
+            return str(obs)
+        return obs
+
+    def project_action(self, action: Any) -> str:
+        """
+        将智能体的动作投射为环境可以执行的字符串。
+        在JarvisEnv中，动作就是需要执行的高级指令（prompt）。
+        
+        :param action: 来自语言模型的动作。
+        :return: 格式化为字符串的动作。
+        """
+        if not isinstance(action, str):
+            # 同样进行类型检查
+            return str(action)
+        return action
