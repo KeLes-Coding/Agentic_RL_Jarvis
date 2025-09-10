@@ -11,7 +11,7 @@ import atexit
 from typing import List, Dict, Any
 
 # 动态添加`device_management`到系统路径，使其可被导入
-sys.path.append(os.path.join(os.path.dirname(__file__), "device_management"))
+sys.path.append(os.path.join(os.path.dirname(__file__)))
 
 # 导入现有的 agent_worker
 from jarvis.agent import agent_worker

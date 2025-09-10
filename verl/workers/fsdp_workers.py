@@ -202,9 +202,12 @@ class ActorRolloutRefWorker(Worker):
 
         torch_dtype = fsdp_config.get("model_dtype", None)
         if torch_dtype is None:
-            torch_dtype = torch.float32 if self._is_actor else torch.bfloat16
+            # torch_dtype = torch.float32 if self._is_actor else torch.bfloat16
+            torch_dtype = torch.bfloat16 if self._is_actor else torch.bfloat16
+            print(f"======> [Rank {self.rank}] DEBUG: 从配置中强制读取的数据类型 (dtype) 为: {torch_dtype}")
         else:
             torch_dtype = PrecisionType.to_dtype(torch_dtype)
+            print(f"======> [Rank {self.rank}] DEBUG: 转换为 torch annd np dtypes 后的数据类型为: {torch_dtype}")
 
         # override model kwargs
         actor_model_config = AutoConfig.from_pretrained(local_path, trust_remote_code=trust_remote_code, attn_implementation="flash_attention_2")

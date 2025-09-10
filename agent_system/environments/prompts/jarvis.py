@@ -1,6 +1,8 @@
 # agent_system/environments/prompts/jarvis.py
 
-# 系统角色定义，为Agent设定身份和目标
+# 系统角色定义，为Agent设定身份和目标。
+# 注意：这个SYSTEM_PROMPT通常由verl-agent的tokenizer通过聊天模板（Chat Template）在最开始应用，
+# 我们在这里定义它是为了完整性，但在 build_text_obs 中我们只构建用户输入部分。
 SYSTEM_PROMPT = """
 You are Jarvis, a proficient AI agent designed to operate an Android device.
 You will be given a high-level task. Your goal is to complete this task by operating the device.
@@ -34,22 +36,11 @@ The JSON object must contain exactly two keys:
 Analyze the UI elements and screenshots carefully. Be precise and methodical. Your response MUST be a single, clean JSON object.
 """
 
-class JarvisPrompter:
+def get_jarvis_step_1_prompt(task: str, simplified_ui: str) -> str:
     """
-    为 Jarvis 环境生成和管理 prompts 的类。
+    为任务的第一步生成提示。此时没有“上一步”的信息。
     """
-    def __init__(self):
-        # 系统提示定义了 Agent 的核心职责和行为准则
-        self.system_prompt = SYSTEM_PROMPT
-
-    def get_step_1_prompt(self, task: str, simplified_ui: str) -> str:
-        """
-        为任务的第一步生成提示。此时没有“上一步”的信息。
-        :param task: 总体任务描述。
-        :param simplified_ui: 当前屏幕的简化UI元素描述。
-        :return: 格式化后的第一步提示。
-        """
-        return f"""
+    return f"""
 The user's overall task is: "{task}"
 
 This is the first step. Here is the current screen's UI layout:
@@ -60,19 +51,14 @@ This is the first step. Here is the current screen's UI layout:
 Based on the screenshot and the UI elements, what is the first logical action to take to accomplish the task?
 """
 
-    def get_intermediate_prompt(
-        self, task: str, prev_thought: str, prev_action: str, simplified_ui: str
-    ) -> str:
-        """
-        为任务的中间步骤生成提示。
-        它包含对上一步动作的回顾，以及当前屏幕的观察。
-        :param task: 总体任务描述。
-        :param prev_thought: 上一步的思考过程。
-        :param prev_action: 上一步执行的动作。
-        :param simplified_ui: 当前屏幕的简化UI元素描述。
-        :return: 格式化后的中间步骤提示。
-        """
-        return f"""
+def get_jarvis_intermediate_prompt(
+    task: str, prev_thought: str, prev_action: str, simplified_ui: str
+) -> str:
+    """
+    为任务的中间步骤生成提示。
+    它包含对上一步动作的回顾，以及当前屏幕的观察。
+    """
+    return f"""
 The user's overall task is: "{task}"
 
 In the previous step, your thought process was: "{prev_thought}"

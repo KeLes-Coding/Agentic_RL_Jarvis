@@ -27,6 +27,7 @@ actor_rollout_ref:
   hybrid_engine: True
   model:
     path: ~/models/deepseek-llm-7b-chat
+    dtype: "bfloat16"
     use_shm: False
     external_lib: null
     override_config: { }
@@ -159,6 +160,7 @@ critic:
     weight_decay: 0.01
   model:
     path: ~/models/deepseek-llm-7b-chat
+    dtype: "bfloat16"
     use_shm: False
     tokenizer_path: ${actor_rollout_ref.model.path}
     override_config: { }
@@ -284,21 +286,21 @@ ray_init:
 
 
 env:
-  name: jarvis                   # <-- 默认环境名称
+  env_name: jarvis                   # <-- 默认环境名称
   seed: 0
   history_length: 2              # 这个参数在我们的管理器中未使用，可以保留或删除
+  max_steps: 50
   rollout:
     n: -1
 
   # --- 为 Jarvis 环境新增的专属配置块 ---
   jarvis:
-    # 这个路径是JarvisEnv用来加载自身配置的，例如ADB路径、设备提供者等
-    jarvis_config_path: "agent_system/environments/env_package/jarvis/config.yaml"
-    # 每个 episode (任务) 的最大操作步数
+    jarvis_config_path: "agent_system/environments/env_package/jarvis/jarvis_v2/config.yaml"
     max_steps_per_episode: 50
-    # 数据集路径，这个将在 run_jarvis.sh 中被覆盖
-    dataset_path: "path/to/your/default/dataset.csv"
-
+    seed: 0
+    history_length: 2
+    rollout:
+      n: -1
   sokoban:
     dim_room: [6, 6]
     num_boxes: 1
