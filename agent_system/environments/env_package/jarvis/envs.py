@@ -1,7 +1,7 @@
 # agent_system/environments/env_package/jarvis/envs.py
 
 import yaml
-import numpy as np
+import numpy as np  # <-- 确保导入 numpy
 from typing import List, Dict, Tuple
 import io
 try:
@@ -41,7 +41,6 @@ class JarvisMultiDeviceEnv:
         self.max_steps_per_episode = max_steps_per_episode
         self.episode_steps: Dict[str, int] = {s: 0 for s in self.device_serials}
 
-        # --- 新增代码: 获取图像压缩配置 ---
         self.compression_config = self.jarvis_config.get("image_compression", {})
         if self.compression_config.get("enabled", False):
             print("图像压缩已启用。")
@@ -49,43 +48,23 @@ class JarvisMultiDeviceEnv:
                 raise ImportError("未安装 Pillow 库，无法进行图像压缩。请运行 `pip install Pillow`。")
 
     def _compress_image(self, image_bytes: bytes) -> bytes:
-        """
-        根据配置对给定的图片二进制数据进行压缩。
-        """
         if not self.compression_config.get("enabled", False) or not image_bytes:
             return image_bytes
-
         try:
             scale_factor = self.compression_config.get("scale_factor", 0.5)
-            
-            # 将二进制数据读入Pillow Image对象
             img = Image.open(io.BytesIO(image_bytes))
-
-            # 计算新的尺寸
             original_width, original_height = img.size
             new_width = int(original_width * scale_factor)
             new_height = int(original_height * scale_factor)
-
-            # 调整图片大小
             resized_img = img.resize((new_width, new_height), Image.Resampling.LANCZOS)
-
-            # 将压缩后的图片存回二进制流
             buffer = io.BytesIO()
-            # 推荐使用JPEG以获得更好的压缩效果和更小的文件大小
             image_format = self.compression_config.get("format", "JPEG")
             resized_img.save(buffer, format=image_format)
-            
             compressed_bytes = buffer.getvalue()
-
-            # (可选) 打印压缩信息用于调试
-            # original_size_kb = len(image_bytes) / 1024
-            # compressed_size_kb = len(compressed_bytes) / 1024
-            # print(f"图像压缩: {original_size_kb:.2f} KB -> {compressed_size_kb:.2f} KB")
-
             return compressed_bytes
         except Exception as e:
             print(f"图像压缩失败: {e}")
-            return image_bytes  # 压缩失败则返回原图
+            return image_bytes
 
     def reset(self) -> Tuple[Dict[str, List], List[Dict]]:
         """重置所有设备并返回初始观测值。"""
@@ -95,14 +74,22 @@ class JarvisMultiDeviceEnv:
 
         for serial in self.device_serials:
             self.episode_steps[serial] = 0
-            self.actuators[serial].home() # 返回主屏幕作为初始状态
+            self.actuators[serial].home()
             
             obs_data = self.observers[serial].get_current_observation()
             
             # --- 修改部分 ---
             screenshot_bytes = obs_data.get("screenshot_bytes")
             compressed_screenshot = self._compress_image(screenshot_bytes)
-            obs_images.append(compressed_screenshot)
+            
+            # 将 bytes 转换为 NumPy 数组
+            if compressed_screenshot:
+                img = Image.open(io.BytesIO(compressed_screenshot)).convert("RGB")
+                obs_images.append(np.array(img))
+            else:
+                # 如果没有截图，可以添加一个占位符，例如全黑图片
+                # 注意：尺寸需要与你的模型输入匹配，这里用一个小的占位符
+                obs_images.append(np.zeros((64, 64, 3), dtype=np.uint8))
             # --- 修改结束 ---
 
             obs_texts.append(obs_data.get("simplified_elements_str"))
@@ -117,35 +104,38 @@ class JarvisMultiDeviceEnv:
         for i, serial in enumerate(self.device_serials):
             action_str = actions[i]
             
-            # 1. 执行动作
             elements = self.observers[serial].get_current_observation().get("simplified_elements_list")
             status = self._dispatch_action(self.actuators[serial], action_str, elements)
             action_success = (status == "SUCCESS")
             
             self.episode_steps[serial] += 1
 
-            # 2. 获取新观测
             obs_data = self.observers[serial].get_current_observation()
             
             # --- 修改部分 ---
             screenshot_bytes = obs_data.get("screenshot_bytes")
             compressed_screenshot = self._compress_image(screenshot_bytes)
-            obs_images.append(compressed_screenshot)
+
+            # 将 bytes 转换为 NumPy 数组
+            if compressed_screenshot:
+                img = Image.open(io.BytesIO(compressed_screenshot)).convert("RGB")
+                obs_images.append(np.array(img))
+            else:
+                obs_images.append(np.zeros((64, 64, 3), dtype=np.uint8))
             # --- 修改结束 ---
             
             obs_texts.append(obs_data.get("simplified_elements_str"))
 
-            # 3. 计算奖励和结束状态
             done = False
             reward = 0.0
             if action_str.startswith("finish"):
-                reward = 1.0  # 任务成功，给予高奖励
+                reward = 1.0
                 done = True
             elif not action_success:
-                reward = -0.1 # 动作执行失败，给予惩罚
+                reward = -0.1
             
             if self.episode_steps[serial] >= self.max_steps_per_episode:
-                done = True # 到达最大步数
+                done = True
 
             rewards.append(reward)
             dones.append(done)
@@ -155,7 +145,6 @@ class JarvisMultiDeviceEnv:
         return observations, rewards, dones, infos
 
     def _dispatch_action(self, actuator: Actuator, action_str: str, elements: list) -> str:
-        # (这个函数与之前版本相同，负责解析和执行动作)
         try:
             action_name = action_str.split("(")[0]
             params_str = action_str[len(action_name) + 1 : -1] if "(" in action_str else ""

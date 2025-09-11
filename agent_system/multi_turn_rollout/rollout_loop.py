@@ -105,7 +105,12 @@ class TrajectoryCollector:
         if is_multi_modal:
             # Replace image placeholder with vision tokens
             raw_prompt = prompt_with_chat_template.replace('<image>', '<|vision_start|><|image_pad|><|vision_end|>')
-            row_dict['multi_modal_data'] = {'image': [process_image(obs_image)]}
+            # row_dict['multi_modal_data'] = {'image': [process_image(obs_image)]}
+            # 检查obs_image是否是列表或元组，如果是，则分别处理其中的每张图片
+            if isinstance(obs_image, (list, tuple)):
+                row_dict['multi_modal_data'] = {'image': [process_image(img) for img in obs_image]}
+            else:
+                row_dict['multi_modal_data'] = {'image': [process_image(obs_image)]}
             image_inputs = self.processor.image_processor(row_dict['multi_modal_data']['image'], return_tensors='pt')
             image_grid_thw = image_inputs['image_grid_thw']
             row_dict['multi_modal_inputs'] = {key: val for key, val in image_inputs.items()}

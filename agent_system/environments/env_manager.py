@@ -26,6 +26,7 @@ from agent_system.environments.env_package.jarvis.envs import build_jarvis_envs
 from agent_system.environments.env_package.jarvis.projection import jarvis_projection
 # 1. 修改导入的 prompt，使用新的函数
 from agent_system.environments.prompts.jarvis import get_jarvis_step_1_prompt, get_jarvis_intermediate_prompt
+# from agent_system.memory import Trajectory
 
 import json
 
@@ -521,39 +522,47 @@ class JarvisEnvironmentManager(EnvironmentManagerBase):
     def __init__(self, envs, projection_f, config):
         self.memory = SimpleMemory()
         super().__init__(envs, projection_f, config)
+        self.num_envs = self.envs.num_envs
+        self.prev_image_obs = None
 
     def reset(self):
         raw_obs, infos = self.envs.reset()
         
-        # 假设任务描述来自于infos或一个外部列表，这里我们用一个占位符
-        self.tasks = ["Placeholder task description" for _ in range(self.envs.num_envs)]
+        self.tasks = ["Placeholder task description" for _ in range(self.num_envs)]
+        self.memory.reset(batch_size=self.num_envs)
         
-        self.memory.reset(batch_size=self.envs.num_envs)
-        # 初始观测值不需要存储到memory中，因为它没有对应的action
-        self.pre_text_obs = raw_obs['text']
+        self.prev_image_obs = raw_obs['image']
 
+        batched_images = []
+        for i in range(self.num_envs):
+            current_image = raw_obs['image'][i]
+            placeholder_image = np.zeros_like(current_image)
+            # 使用元组来打包图片
+            batched_images.append((placeholder_image, current_image))
+            
         full_text_obs = self.build_text_obs(raw_obs['text'], init=True)
-        return {'text': full_text_obs, 'image': raw_obs['image'], 'anchor': raw_obs['text']}, infos
+        return {'text': full_text_obs, 'image': batched_images, 'anchor': raw_obs['text']}, infos
 
     def step(self, text_actions: List[str]):
-        # 1. 解析完整的JSON输出，获取动作和思考
-        # text_actions 是模型输出的原始JSON字符串列表
         parsed_actions, valids, thoughts = self.projection_f(text_actions)
-
-        # 2. 在底层环境中执行解析出的动作
         next_raw_obs, rewards, dones, infos = self.envs.step(parsed_actions)
         
-        # 3. 将上一步的思考和这一步的动作存入记忆
-        self.memory.store({'thought': thoughts, 'action': parsed_actions})
-        self.pre_text_obs = next_raw_obs['text']
+        batched_images = []
+        for i in range(self.num_envs):
+            prev_image = self.prev_image_obs[i]
+            current_image = next_raw_obs['image'][i]
+            # 使用元组来打包图片
+            batched_images.append((prev_image, current_image))
 
-        # 4. 构建下一步的观测文本（Prompt）
+        self.memory.store({'thought': thoughts, 'action': parsed_actions})
+        self.prev_image_obs = next_raw_obs['image']
+
         full_text_obs = self.build_text_obs(next_raw_obs['text'])
 
         for i, info in enumerate(infos):
             info['is_action_valid'] = to_numpy(valids[i])
 
-        next_observations = {'text': full_text_obs, 'image': next_raw_obs['image'], 'anchor': next_raw_obs['text']}
+        next_observations = {'text': full_text_obs, 'image': batched_images, 'anchor': next_raw_obs['text']}
         rewards = to_numpy(rewards)
         dones = to_numpy(dones)
 
@@ -562,25 +571,20 @@ class JarvisEnvironmentManager(EnvironmentManagerBase):
     def build_text_obs(self, text_obs: List[str], init: bool = False) -> List[str]:
         postprocess_text_obs = []
         
-        # 如果不是第一步，并且需要历史记录，则从memory中获取
         if not init and self.config.env.history_length > 0:
-            # 我们只需要上一步的记录来构建prompt
             last_records = self.memory.fetch(1)
-
+        
         for i in range(len(text_obs)):
-            # 判断是第一步还是后续步骤
             if init or len(self.memory[i]) == 0:
-                # 调用第一步的prompt生成函数
                 obs = get_jarvis_step_1_prompt(
                     task=self.tasks[i],
                     simplified_ui=text_obs[i]
                 )
             else:
-                # 调用后续步骤的prompt生成函数
-                # last_records[i] 的格式是 [{'thought': '...', 'action': '...'}]
-                prev_thought = last_records[i][0].get('thought', 'N/A')
-                prev_action = last_records[i][0].get('action', 'N/A')
-                
+                last_step_record = self.memory[i][-1]
+                prev_thought = last_step_record.get('thought', 'N/A')
+                prev_action = last_step_record.get('action', 'N/A')
+
                 obs = get_jarvis_intermediate_prompt(
                     task=self.tasks[i],
                     prev_thought=prev_thought,
