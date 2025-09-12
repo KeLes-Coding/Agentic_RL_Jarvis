@@ -75,36 +75,50 @@ class JarvisMultiDeviceEnv:
             self.actuators[serial].home()
             obs_data = self.observers[serial].get_current_observation()
 
-            # --- 最终修改 ---
+            # --- 开始替换 ---
             screenshots_bytes = obs_data.get("screenshot_bytes")
             if not isinstance(screenshots_bytes, list):
                 screenshots_bytes = [screenshots_bytes] if screenshots_bytes else []
-            
-            compressed_bytes_list = [self._compress_single_image(s) for s in screenshots_bytes]
-            
-            # 直接创建标准的 uint8 Numpy 数组列表
-            current_obs_images = []
-            for shot_bytes in compressed_bytes_list:
-                if shot_bytes:
-                    img = Image.open(io.BytesIO(shot_bytes)).convert("RGB")
-                    # 关键: 创建一个标准的、类型明确的Numpy数组
-                    current_obs_images.append(np.array(img, dtype=np.uint8))
-            
-            obs_images.append(current_obs_images)
 
-            image_placeholders = "".join(["<image>\n" for _ in current_obs_images])
+            final_image_array = None
+            # 检查是否有截图
+            if screenshots_bytes:
+                # 只处理第一张截图
+                first_shot_bytes = screenshots_bytes[0]
+                compressed_bytes = self._compress_single_image(first_shot_bytes)
+                if compressed_bytes:
+                    try:
+                        img = Image.open(io.BytesIO(compressed_bytes)).convert("RGB")
+                        final_image_array = np.array(img, dtype=np.uint8)
+                    except Exception as e:
+                        print(f"警告: 图像解码失败 - {e}")
+
+            # 如果没有有效图像，则创建一个黑色占位图，确保数据类型正确
+            if final_image_array is None:
+                print(f"警告: 设备 {serial} 未能获取截图, 将使用黑色图像占位。")
+                final_image_array = np.zeros((256, 256, 3), dtype=np.uint8)
+
+            # 确保每次只添加一个Numpy数组
+            obs_images.append(final_image_array)
+
+            # 相应地，只创建一个占位符
+            image_placeholders = "<image>\n"
             obs_text = obs_data.get("simplified_elements_str", "")
             obs_texts.append(f"{image_placeholders}{obs_text}")
-            # --- 修改结束 ---
+            # --- 替换结束 ---
 
             infos.append({"device_serial": serial})
+
+        print(f"--- 调试信息 [envs.py/reset] ---")
+        print(f"即将返回 obs_images，首元素类型: {type(obs_images[0]) if obs_images else 'N/A'}")
+        print(f"即将返回 obs_texts，首元素内容: '{obs_texts[0] if obs_texts else 'N/A'}'")
+
         return {"image": obs_images, "text": obs_texts}, infos
 
     def step(self, actions: List[str]) -> Tuple[Dict[str, List], List[float], List[bool], List[Dict]]:
         obs_images, obs_texts, rewards, dones, infos = [], [], [], [], []
 
         for i, serial in enumerate(self.device_serials):
-            # ... (action dispatching code) ...
             action_str = actions[i]
             elements = self.observers[serial].get_current_observation().get("simplified_elements_list")
             status = self._dispatch_action(self.actuators[serial], action_str, elements)
@@ -112,29 +126,39 @@ class JarvisMultiDeviceEnv:
             self.episode_steps[serial] += 1
             obs_data = self.observers[serial].get_current_observation()
             
-            # --- 最终修改 ---
+            # --- 开始替换 ---
             screenshots_bytes = obs_data.get("screenshot_bytes")
             if not isinstance(screenshots_bytes, list):
                 screenshots_bytes = [screenshots_bytes] if screenshots_bytes else []
-            
-            compressed_bytes_list = [self._compress_single_image(s) for s in screenshots_bytes]
 
-            # 直接创建标准的 uint8 Numpy 数组列表
-            current_obs_images = []
-            for shot_bytes in compressed_bytes_list:
-                if shot_bytes:
-                    img = Image.open(io.BytesIO(shot_bytes)).convert("RGB")
-                    current_obs_images.append(np.array(img, dtype=np.uint8))
-            
-            obs_images.append(current_obs_images)
-            
-            image_placeholders = "".join(["<image>\n" for _ in current_obs_images])
+            final_image_array = None
+            # 检查是否有截图
+            if screenshots_bytes:
+                # 只处理第一张截图
+                first_shot_bytes = screenshots_bytes[0]
+                compressed_bytes = self._compress_single_image(first_shot_bytes)
+                if compressed_bytes:
+                    try:
+                        img = Image.open(io.BytesIO(compressed_bytes)).convert("RGB")
+                        final_image_array = np.array(img, dtype=np.uint8)
+                    except Exception as e:
+                        print(f"警告: 图像解码失败 - {e}")
+
+            # 如果没有有效图像，则创建一个黑色占位图，确保数据类型正确
+            if final_image_array is None:
+                print(f"警告: 设备 {serial} 未能获取截图, 将使用黑色图像占位。")
+                final_image_array = np.zeros((256, 256, 3), dtype=np.uint8)
+
+            # 确保每次只添加一个Numpy数组
+            obs_images.append(final_image_array)
+
+            # 相应地，只创建一个占位符
+            image_placeholders = "<image>\n"
             obs_text = obs_data.get("simplified_elements_str", "")
             obs_texts.append(f"{image_placeholders}{obs_text}")
-            # --- 修改结束 ---
+            # --- 替换结束 ---
             
             done = False
-            # ... (reward and done logic) ...
             reward = 0.0
             if action_str.startswith("finish"):
                 reward = 1.0
@@ -146,7 +170,13 @@ class JarvisMultiDeviceEnv:
             rewards.append(reward)
             dones.append(done)
             infos.append({"device_serial": serial, "action_success": action_success})
+            
         observations = {"image": obs_images, "text": obs_texts}
+
+        # 在 step 方法的 return observations, ... 之前
+        print(f"--- 调试信息 [envs.py/step] ---")
+        print(f"即将返回 obs_images，首元素类型: {type(obs_images[0]) if obs_images else 'N/A'}")
+        print(f"即将返回 obs_texts，首元素内容: '{obs_texts[0] if obs_texts else 'N/A'}'")
         return observations, np.array(rewards, dtype=np.float32), np.array(dones, dtype=bool), infos
 
     def _dispatch_action(self, actuator: Actuator, action_str: str, elements: list) -> str:

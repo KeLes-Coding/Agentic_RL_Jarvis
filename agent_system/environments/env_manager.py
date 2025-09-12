@@ -518,6 +518,11 @@ class AppWorldEnvironmentManager(EnvironmentManagerBase):
         return postprocess_text_obs
     
 # 2. 覆盖更新 JarvisEnvironmentManager 类
+def to_numpy(x):
+    if isinstance(x, np.ndarray):
+        return x
+    return np.array(x)
+
 class JarvisEnvironmentManager(EnvironmentManagerBase):
     def __init__(self, envs, projection_f, config):
         self.memory = SimpleMemory()
@@ -531,31 +536,34 @@ class JarvisEnvironmentManager(EnvironmentManagerBase):
         self.tasks = ["Placeholder task description" for _ in range(self.num_envs)]
         self.memory.reset(batch_size=self.num_envs)
         
-        self.prev_image_obs = raw_obs['image']
-
-        batched_images = []
-        for i in range(self.num_envs):
-            current_image = raw_obs['image'][i]
-            placeholder_image = np.zeros_like(current_image)
-            # 使用元组来打包图片
-            batched_images.append((placeholder_image, current_image))
+        # --- 核心修正：不再创建元组 ---
+        # 直接使用从环境中获取的单张图片列表
+        batched_images = raw_obs['image']
             
         full_text_obs = self.build_text_obs(raw_obs['text'], init=True)
+
+        print(f"--- 调试信息 [env_manager.py/reset] ---")
+        print(f"处理后 batched_images，首元素类型: {type(batched_images[0]) if batched_images else 'N/A'}")
+        print(f"处理后 full_text_obs，首元素内容: '{full_text_obs[0] if full_text_obs else 'N/A'}'")
+
         return {'text': full_text_obs, 'image': batched_images, 'anchor': raw_obs['text']}, infos
 
     def step(self, text_actions: List[str]):
         parsed_actions, valids, thoughts = self.projection_f(text_actions)
         next_raw_obs, rewards, dones, infos = self.envs.step(parsed_actions)
         
-        batched_images = []
-        for i in range(self.num_envs):
-            prev_image = self.prev_image_obs[i]
-            current_image = next_raw_obs['image'][i]
-            # 使用元组来打包图片
-            batched_images.append((prev_image, current_image))
+        # --- 核心修正：不再创建元组 ---
+        # 直接使用新观测到的单张图片列表
+        batched_images = next_raw_obs['image']
+
+        print(f"--- 调试信息 [env_manager.py/step] ---")
+        if batched_images:
+            print(f"处理后 batched_images 列表，其中第一个元素的类型: {type(batched_images[0])}")
+        else:
+            print("处理后 batched_images 为空")
 
         self.memory.store({'thought': thoughts, 'action': parsed_actions})
-        self.prev_image_obs = next_raw_obs['image']
+        # self.prev_image_obs = next_raw_obs['image'] # 如果不需要上一帧，这行可以注释掉
 
         full_text_obs = self.build_text_obs(next_raw_obs['text'])
 
@@ -565,6 +573,10 @@ class JarvisEnvironmentManager(EnvironmentManagerBase):
         next_observations = {'text': full_text_obs, 'image': batched_images, 'anchor': next_raw_obs['text']}
         rewards = to_numpy(rewards)
         dones = to_numpy(dones)
+
+        print(f"--- 调试信息 [env_manager.py/step] ---")
+        print(f"处理后 batched_images，首元素类型: {type(batched_images[0]) if batched_images else 'N/A'}")
+        print(f"处理后 full_text_obs，首元素内容: '{full_text_obs[0] if full_text_obs else 'N/A'}'")
 
         return next_observations, rewards, dones, infos
 
