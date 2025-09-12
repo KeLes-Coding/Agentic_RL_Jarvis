@@ -1,15 +1,15 @@
 # agent_system/environments/env_package/jarvis/envs.py
 
 import yaml
-import numpy as np  # <-- 确保导入 numpy
-from typing import List, Dict, Tuple
+import numpy as np
 import io
+from typing import List, Dict, Tuple, Union
+
 try:
     from PIL import Image
 except ImportError:
     Image = None
 
-# 假设 jarvis_v2 源码位于 agent_system/environments/env_package/jarvis_v2
 from .jarvis_v2.jarvis.modules.observer import Observer
 from .jarvis_v2.jarvis.modules.actuator import Actuator
 from .jarvis_v2.agent_manager import discover_devices
@@ -47,7 +47,7 @@ class JarvisMultiDeviceEnv:
             if Image is None:
                 raise ImportError("未安装 Pillow 库，无法进行图像压缩。请运行 `pip install Pillow`。")
 
-    def _compress_image(self, image_bytes: bytes) -> bytes:
+    def _compress_single_image(self, image_bytes: bytes) -> bytes:
         if not self.compression_config.get("enabled", False) or not image_bytes:
             return image_bytes
         try:
@@ -60,14 +60,12 @@ class JarvisMultiDeviceEnv:
             buffer = io.BytesIO()
             image_format = self.compression_config.get("format", "JPEG")
             resized_img.save(buffer, format=image_format)
-            compressed_bytes = buffer.getvalue()
-            return compressed_bytes
+            return buffer.getvalue()
         except Exception as e:
             print(f"图像压缩失败: {e}")
             return image_bytes
 
     def reset(self) -> Tuple[Dict[str, List], List[Dict]]:
-        """重置所有设备并返回初始观测值。"""
         obs_images = []
         obs_texts = []
         infos = []
@@ -75,74 +73,81 @@ class JarvisMultiDeviceEnv:
         for serial in self.device_serials:
             self.episode_steps[serial] = 0
             self.actuators[serial].home()
-            
             obs_data = self.observers[serial].get_current_observation()
+
+            # --- 最终修改 ---
+            screenshots_bytes = obs_data.get("screenshot_bytes")
+            if not isinstance(screenshots_bytes, list):
+                screenshots_bytes = [screenshots_bytes] if screenshots_bytes else []
             
-            # --- 修改部分 ---
-            screenshot_bytes = obs_data.get("screenshot_bytes")
-            compressed_screenshot = self._compress_image(screenshot_bytes)
+            compressed_bytes_list = [self._compress_single_image(s) for s in screenshots_bytes]
             
-            # 将 bytes 转换为 NumPy 数组
-            if compressed_screenshot:
-                img = Image.open(io.BytesIO(compressed_screenshot)).convert("RGB")
-                obs_images.append(np.array(img))
-            else:
-                # 如果没有截图，可以添加一个占位符，例如全黑图片
-                # 注意：尺寸需要与你的模型输入匹配，这里用一个小的占位符
-                obs_images.append(np.zeros((64, 64, 3), dtype=np.uint8))
+            # 直接创建标准的 uint8 Numpy 数组列表
+            current_obs_images = []
+            for shot_bytes in compressed_bytes_list:
+                if shot_bytes:
+                    img = Image.open(io.BytesIO(shot_bytes)).convert("RGB")
+                    # 关键: 创建一个标准的、类型明确的Numpy数组
+                    current_obs_images.append(np.array(img, dtype=np.uint8))
+            
+            obs_images.append(current_obs_images)
+
+            image_placeholders = "".join(["<image>\n" for _ in current_obs_images])
+            obs_text = obs_data.get("simplified_elements_str", "")
+            obs_texts.append(f"{image_placeholders}{obs_text}")
             # --- 修改结束 ---
 
-            obs_texts.append(obs_data.get("simplified_elements_str"))
             infos.append({"device_serial": serial})
-
         return {"image": obs_images, "text": obs_texts}, infos
 
     def step(self, actions: List[str]) -> Tuple[Dict[str, List], List[float], List[bool], List[Dict]]:
-        """在所有设备上执行动作。"""
         obs_images, obs_texts, rewards, dones, infos = [], [], [], [], []
 
         for i, serial in enumerate(self.device_serials):
+            # ... (action dispatching code) ...
             action_str = actions[i]
-            
             elements = self.observers[serial].get_current_observation().get("simplified_elements_list")
             status = self._dispatch_action(self.actuators[serial], action_str, elements)
             action_success = (status == "SUCCESS")
-            
             self.episode_steps[serial] += 1
-
             obs_data = self.observers[serial].get_current_observation()
             
-            # --- 修改部分 ---
-            screenshot_bytes = obs_data.get("screenshot_bytes")
-            compressed_screenshot = self._compress_image(screenshot_bytes)
+            # --- 最终修改 ---
+            screenshots_bytes = obs_data.get("screenshot_bytes")
+            if not isinstance(screenshots_bytes, list):
+                screenshots_bytes = [screenshots_bytes] if screenshots_bytes else []
+            
+            compressed_bytes_list = [self._compress_single_image(s) for s in screenshots_bytes]
 
-            # 将 bytes 转换为 NumPy 数组
-            if compressed_screenshot:
-                img = Image.open(io.BytesIO(compressed_screenshot)).convert("RGB")
-                obs_images.append(np.array(img))
-            else:
-                obs_images.append(np.zeros((64, 64, 3), dtype=np.uint8))
+            # 直接创建标准的 uint8 Numpy 数组列表
+            current_obs_images = []
+            for shot_bytes in compressed_bytes_list:
+                if shot_bytes:
+                    img = Image.open(io.BytesIO(shot_bytes)).convert("RGB")
+                    current_obs_images.append(np.array(img, dtype=np.uint8))
+            
+            obs_images.append(current_obs_images)
+            
+            image_placeholders = "".join(["<image>\n" for _ in current_obs_images])
+            obs_text = obs_data.get("simplified_elements_str", "")
+            obs_texts.append(f"{image_placeholders}{obs_text}")
             # --- 修改结束 ---
             
-            obs_texts.append(obs_data.get("simplified_elements_str"))
-
             done = False
+            # ... (reward and done logic) ...
             reward = 0.0
             if action_str.startswith("finish"):
                 reward = 1.0
                 done = True
             elif not action_success:
                 reward = -0.1
-            
             if self.episode_steps[serial] >= self.max_steps_per_episode:
                 done = True
-
             rewards.append(reward)
             dones.append(done)
             infos.append({"device_serial": serial, "action_success": action_success})
-
         observations = {"image": obs_images, "text": obs_texts}
-        return observations, rewards, dones, infos
+        return observations, np.array(rewards, dtype=np.float32), np.array(dones, dtype=bool), infos
 
     def _dispatch_action(self, actuator: Actuator, action_str: str, elements: list) -> str:
         try:

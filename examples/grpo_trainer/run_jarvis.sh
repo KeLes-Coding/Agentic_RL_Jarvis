@@ -3,6 +3,8 @@ ENGINE=${1:-vllm}
 export VLLM_ATTENTION_BACKEND=XFORMERS
 export SWANLAB_API_KEY="oB8w36PCJxKeqwif2ijWz"
 
+export CUDA_VISIBLE_DEVICES="0,2"
+
 train_data_size=16
 val_data_size=128
 group_size=8
