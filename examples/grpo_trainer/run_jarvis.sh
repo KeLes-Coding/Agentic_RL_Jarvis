@@ -24,7 +24,7 @@ python3 -m verl.trainer.main_ppo \
     data.max_prompt_length=4096 \
     data.max_response_length=512 \
     data.filter_overlong_prompts=True \
-    data.truncation='error' \
+    data.truncation='left' \
     data.return_raw_chat=True \
     data.return_full_prompt=True \
     actor_rollout_ref.model.path=/home/zzh/Workspace/modelscope/models/Qwen/Qwen2-VL-2B \
@@ -56,7 +56,7 @@ python3 -m verl.trainer.main_ppo \
     env.seed=0 \
     env.max_steps=15 \
     env.rollout.n=$group_size \
-    env.jarvis.jarvis_config_path=agent_system/environments/env_package/jarvis/jarvis_v2/config.template.yaml \
+    env.jarvis.jarvis_config_path=agent_system/environments/env_package/jarvis/jarvis_v2/config.yaml \
     trainer.critic_warmup=0 \
     trainer.logger='[console,swanlab]' \
     trainer.project_name='verl_agent_jarvis' \

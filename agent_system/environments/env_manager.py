@@ -533,18 +533,22 @@ class JarvisEnvironmentManager(EnvironmentManagerBase):
     def reset(self):
         raw_obs, infos = self.envs.reset()
         
+        # --- 增加调试信息 ---
+        print(f"--- 调试信息 [env_manager.py/reset] ---")
+        print(f"从 envs.reset() 收到的 raw_obs['text']，首元素的前100字符: '{raw_obs['text'][0][:100] if raw_obs['text'] else 'N/A'}'")
+        print(f"检查 '<image>' token 是否在 raw_obs['text'][0] 中: {'<image>' in raw_obs['text'][0] if raw_obs['text'] else 'N/A'}")
+        
         self.tasks = ["Placeholder task description" for _ in range(self.num_envs)]
         self.memory.reset(batch_size=self.num_envs)
         
-        # --- 核心修正：不再创建元组 ---
-        # 直接使用从环境中获取的单张图片列表
         batched_images = raw_obs['image']
             
         full_text_obs = self.build_text_obs(raw_obs['text'], init=True)
 
-        print(f"--- 调试信息 [env_manager.py/reset] ---")
-        print(f"处理后 batched_images，首元素类型: {type(batched_images[0]) if batched_images else 'N/A'}")
-        print(f"处理后 full_text_obs，首元素内容: '{full_text_obs[0] if full_text_obs else 'N/A'}'")
+        print(f"处理后 batched_images，共 {len(batched_images)} 个元素，首元素类型: {type(batched_images[0]) if batched_images else 'N/A'}")
+        print(f"build_text_obs 生成的 full_text_obs，首元素的前200字符: '{full_text_obs[0][:200] if full_text_obs else 'N/A'}'")
+        print(f"检查 '<image>' token 是否在 full_text_obs[0] 中: {'<image>' in full_text_obs[0] if full_text_obs else 'N/A'}")
+        print(f"----------------------------------------")
 
         return {'text': full_text_obs, 'image': batched_images, 'anchor': raw_obs['text']}, infos
 
@@ -552,19 +556,15 @@ class JarvisEnvironmentManager(EnvironmentManagerBase):
         parsed_actions, valids, thoughts = self.projection_f(text_actions)
         next_raw_obs, rewards, dones, infos = self.envs.step(parsed_actions)
         
-        # --- 核心修正：不再创建元组 ---
-        # 直接使用新观测到的单张图片列表
+        # --- 增加调试信息 ---
+        print(f"--- 调试信息 [env_manager.py/step] ---")
+        print(f"从 envs.step() 收到的 next_raw_obs['text']，首元素的前100字符: '{next_raw_obs['text'][0][:100] if next_raw_obs['text'] else 'N/A'}'")
+        print(f"检查 '<image>' token 是否在 next_raw_obs['text'][0] 中: {'<image>' in next_raw_obs['text'][0] if next_raw_obs['text'] else 'N/A'}")
+        
         batched_images = next_raw_obs['image']
 
-        print(f"--- 调试信息 [env_manager.py/step] ---")
-        if batched_images:
-            print(f"处理后 batched_images 列表，其中第一个元素的类型: {type(batched_images[0])}")
-        else:
-            print("处理后 batched_images 为空")
-
         self.memory.store({'thought': thoughts, 'action': parsed_actions})
-        # self.prev_image_obs = next_raw_obs['image'] # 如果不需要上一帧，这行可以注释掉
-
+        
         full_text_obs = self.build_text_obs(next_raw_obs['text'])
 
         for i, info in enumerate(infos):
@@ -574,9 +574,10 @@ class JarvisEnvironmentManager(EnvironmentManagerBase):
         rewards = to_numpy(rewards)
         dones = to_numpy(dones)
 
-        print(f"--- 调试信息 [env_manager.py/step] ---")
-        print(f"处理后 batched_images，首元素类型: {type(batched_images[0]) if batched_images else 'N/A'}")
-        print(f"处理后 full_text_obs，首元素内容: '{full_text_obs[0] if full_text_obs else 'N/A'}'")
+        print(f"处理后 batched_images，共 {len(batched_images)} 个元素，首元素类型: {type(batched_images[0]) if batched_images else 'N/A'}")
+        print(f"build_text_obs 生成的 full_text_obs，首元素的前200字符: '{full_text_obs[0][:200] if full_text_obs else 'N/A'}'")
+        print(f"检查 '<image>' token 是否在 full_text_obs[0] 中: {'<image>' in full_text_obs[0] if full_text_obs else 'N/A'}")
+        print(f"---------------------------------------")
 
         return next_observations, rewards, dones, infos
 

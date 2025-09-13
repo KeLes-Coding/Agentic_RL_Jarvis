@@ -41,11 +41,13 @@ class JarvisMultiDeviceEnv:
         self.max_steps_per_episode = max_steps_per_episode
         self.episode_steps: Dict[str, int] = {s: 0 for s in self.device_serials}
 
-        self.compression_config = self.jarvis_config.get("image_compression", {})
+        self.compression_config = self.jarvis_config.get("agent", {}).get("image_compression", {})
         if self.compression_config.get("enabled", False):
-            print("图像压缩已启用。")
+            print("===图像压缩已启用。===")
             if Image is None:
                 raise ImportError("未安装 Pillow 库，无法进行图像压缩。请运行 `pip install Pillow`。")
+        else:
+            print("===图像压缩未启用。===")
 
     def _compress_single_image(self, image_bytes: bytes) -> bytes:
         if not self.compression_config.get("enabled", False) or not image_bytes:
@@ -53,6 +55,13 @@ class JarvisMultiDeviceEnv:
         try:
             scale_factor = self.compression_config.get("scale_factor", 0.5)
             img = Image.open(io.BytesIO(image_bytes))
+
+            # --- 核心修改：在这里转换图像模式 ---
+            # JPEG 不支持 RGBA 的 Alpha 通道，需要转换为 RGB
+            if img.mode == 'RGBA':
+                img = img.convert('RGB')
+            # --- 修改结束 ---
+            
             original_width, original_height = img.size
             new_width = int(original_width * scale_factor)
             new_height = int(original_height * scale_factor)
@@ -60,9 +69,10 @@ class JarvisMultiDeviceEnv:
             buffer = io.BytesIO()
             image_format = self.compression_config.get("format", "JPEG")
             resized_img.save(buffer, format=image_format)
+            print("===图像压缩成功===")
             return buffer.getvalue()
         except Exception as e:
-            print(f"图像压缩失败: {e}")
+            print(f"===图像压缩失败: {e}===")
             return image_bytes
 
     def reset(self) -> Tuple[Dict[str, List], List[Dict]]:
@@ -110,8 +120,10 @@ class JarvisMultiDeviceEnv:
             infos.append({"device_serial": serial})
 
         print(f"--- 调试信息 [envs.py/reset] ---")
-        print(f"即将返回 obs_images，首元素类型: {type(obs_images[0]) if obs_images else 'N/A'}")
-        print(f"即将返回 obs_texts，首元素内容: '{obs_texts[0] if obs_texts else 'N/A'}'")
+        print(f"即将返回 obs_images，共 {len(obs_images)} 个元素，首元素类型: {type(obs_images[0]) if obs_images else 'N/A'}")
+        print(f"即将返回 obs_texts，共 {len(obs_texts)} 个元素，首元素内容的前100个字符: '{obs_texts[0][:100] if obs_texts else 'N/A'}'")
+        print(f"检查 '<image>' token 是否在 obs_texts[0] 中: {'<image>' in obs_texts[0] if obs_texts else 'N/A'}")
+        print(f"------------------------------------")
 
         return {"image": obs_images, "text": obs_texts}, infos
 
@@ -175,8 +187,11 @@ class JarvisMultiDeviceEnv:
 
         # 在 step 方法的 return observations, ... 之前
         print(f"--- 调试信息 [envs.py/step] ---")
-        print(f"即将返回 obs_images，首元素类型: {type(obs_images[0]) if obs_images else 'N/A'}")
-        print(f"即将返回 obs_texts，首元素内容: '{obs_texts[0] if obs_texts else 'N/A'}'")
+        print(f"即将返回 obs_images，共 {len(obs_images)} 个元素，首元素类型: {type(obs_images[0]) if obs_images else 'N/A'}")
+        print(f"即将返回 obs_texts，共 {len(obs_texts)} 个元素，首元素内容的前100个字符: '{obs_texts[0][:100] if obs_texts else 'N/A'}'")
+        print(f"检查 '<image>' token 是否在 obs_texts[0] 中: {'<image>' in obs_texts[0] if obs_texts else 'N/A'}")
+        print(f"----------------------------------")
+
         return observations, np.array(rewards, dtype=np.float32), np.array(dones, dtype=bool), infos
 
     def _dispatch_action(self, actuator: Actuator, action_str: str, elements: list) -> str:
