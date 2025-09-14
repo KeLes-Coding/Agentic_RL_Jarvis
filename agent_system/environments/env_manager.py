@@ -528,14 +528,21 @@ class JarvisEnvironmentManager(EnvironmentManagerBase):
         self.memory = SimpleMemory()
         super().__init__(envs, projection_f, config)
         self.num_envs = self.envs.num_envs
+        # self.tasks 应该在这里被初始化为一个空列表
+        self.tasks = []
 
     def reset(self):
-        # reset 方法保持不变，它是正确的
+        # 注意：这里的 self.tasks 需要被外部调用者用真实的 task list 覆写
         raw_obs, infos = self.envs.reset()
         print(f"--- 调试信息 [env_manager.py/reset] ---")
         raw_text_sample = raw_obs['text'][0] if raw_obs['text'] else 'N/A'
         print(f"从 envs.reset() 收到的 raw_obs['text'] (前100字符): '{raw_text_sample[:100]}'")
-        self.tasks = ["Placeholder task description" for _ in range(self.num_envs)]
+        
+        # 警告：这里使用了占位符任务。请确保你的训练流程会提供真实的 self.tasks
+        if not self.tasks or len(self.tasks) != self.num_envs:
+            print("警告: self.tasks 未被正确初始化，将使用占位符。")
+            self.tasks = [f"Placeholder task description for env {i}" for i in range(self.num_envs)]
+            
         self.memory.reset(batch_size=self.num_envs)
         batched_images = raw_obs['image']
         full_text_obs = self.build_text_obs(raw_obs['text'], init=True)
@@ -545,6 +552,13 @@ class JarvisEnvironmentManager(EnvironmentManagerBase):
         return {'text': full_text_obs, 'image': batched_images, 'anchor': raw_obs['text']}, infos
 
     def step(self, text_actions: List[str]):
+        # --- 修改开始：在处理LLM回复前，打印当前所有环境正在执行的任务 ---
+        print("\n--- 当前各环境执行的任务 ---")
+        for i, task in enumerate(self.tasks):
+            print(f"  [环境 {i} 的任务]: {task}")
+        print("--------------------------\n")
+        # --- 修改结束 ---
+
         parsed_actions, valids, thoughts = self.projection_f(text_actions)
         next_raw_obs, rewards, dones, infos = self.envs.step(parsed_actions)
         
@@ -554,7 +568,6 @@ class JarvisEnvironmentManager(EnvironmentManagerBase):
         
         batched_images = next_raw_obs['image']
 
-        # --- 核心修改 1：只存储 thought 和 action，保持记忆纯净 ---
         self.memory.store({'thought': thoughts, 'action': parsed_actions})
         
         full_text_obs = self.build_text_obs(next_raw_obs['text'])
@@ -572,20 +585,16 @@ class JarvisEnvironmentManager(EnvironmentManagerBase):
 
         return next_observations, rewards, dones, infos
 
-    # --- 核心修改 2：手动访问和格式化记忆，不再使用 self.memory.fetch() ---
     def build_text_obs(self, text_obs: List[str], init: bool = False) -> List[str]:
         postprocess_text_obs = []
         
         for i in range(len(text_obs)):
             if init or len(self.memory[i]) == 0:
-                # 第一步，使用无历史的 prompt
                 user_content = get_jarvis_step_1_prompt(
                     task=self.tasks[i],
                     simplified_ui=text_obs[i]
                 )
             else:
-                # 直接访问 memory buffer 获取上一步的记录
-                # self.memory[i] 是一个列表，[-1] 就是最后一条记录
                 last_record = self.memory[i][-1]
                 prev_thought = last_record.get('thought', 'N/A')
                 prev_action = last_record.get('action', 'N/A')
@@ -597,7 +606,6 @@ class JarvisEnvironmentManager(EnvironmentManagerBase):
                     simplified_ui=text_obs[i]
                 )
             
-            # 注入 System Prompt
             final_obs = f"{SYSTEM_PROMPT}\n\n{user_content}"
             postprocess_text_obs.append(final_obs)
             

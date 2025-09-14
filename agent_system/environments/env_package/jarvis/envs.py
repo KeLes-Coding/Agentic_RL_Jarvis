@@ -4,6 +4,7 @@ import yaml
 import numpy as np
 import io
 from typing import List, Dict, Tuple, Union
+import logging
 
 try:
     from PIL import Image
@@ -134,7 +135,8 @@ class JarvisMultiDeviceEnv:
         for i, serial in enumerate(self.device_serials):
             action_str = actions[i]
             elements = self.observers[serial].get_current_observation().get("simplified_elements_list")
-            status = self._dispatch_action(self.actuators[serial], action_str, elements)
+            # status = self._dispatch_action(self.actuators[serial], action_str, elements)
+            status = self._dispatch_action(self.actuators[serial], serial, action_str, elements)
             action_success = (status == "SUCCESS")
             self.episode_steps[serial] += 1
             obs_data = self.observers[serial].get_current_observation()
@@ -182,7 +184,17 @@ class JarvisMultiDeviceEnv:
                 done = True
             rewards.append(reward)
             dones.append(done)
-            infos.append({"device_serial": serial, "action_success": action_success})
+            # infos.append({"device_serial": serial, "action_success": action_success})
+
+            # --- 修改开始 ---
+            # 判断任务是否成功 'won'。当任务结束(done=True)且奖励为正(reward > 0)时，视为成功。
+            task_won = done and (reward > 0)
+            infos.append({
+                "device_serial": serial,
+                "action_success": action_success,
+                "won": task_won  # 添加 'won' 键
+            })
+            # --- 修改结束 ---
             
         observations = {"image": obs_images, "text": obs_texts}
 
@@ -195,24 +207,47 @@ class JarvisMultiDeviceEnv:
 
         return observations, np.array(rewards, dtype=np.float32), np.array(dones, dtype=bool), infos
 
-    def _dispatch_action(self, actuator: Actuator, action_str: str, elements: list) -> str:
+    def _dispatch_action(self, actuator: Actuator, serial: str, action_str: str, elements: list) -> str:
+        print(f"--- [设备: {serial}] 正在分发动作: '{action_str}' ---")
         try:
-            action_name = action_str.split("(")[0]
+            action_name = action_str.split("(")[0].strip()
+
+            # --- 修改 1：正确处理 finish 动作 ---
+            # finish 是一个合法的终结动作，直接返回成功状态。
+            if action_name == "finish":
+                print(f"--- [设备: {serial}] 接收到 'finish' 动作, 任务结束 ---")
+                return "SUCCESS"
+
+            # --- 修改 2：将 'click' 视为 'tap' 的别名 ---
+            if action_name == "click":
+                action_name = "tap"
+
             params_str = action_str[len(action_name) + 1 : -1] if "(" in action_str else ""
-            if action_name in ["tap", "input_text", "swipe"] and not elements: return "FAILURE_NO_ELEMENTS"
+            if action_name in ["tap", "input_text", "swipe"] and not elements:
+                print(f"动作执行失败: '{action_name}' 需要UI元素，但当前为空。")
+                return "FAILURE_NO_ELEMENTS"
+
             if action_name == "tap": result = actuator.tap(int(params_str), elements)
             elif action_name == "input_text":
                 uid, text = params_str.split(",", 1)
                 result = actuator.input_text(int(uid), text.strip().strip("'\""), elements)
             elif action_name == "swipe":
+                # 假设 swipe 的参数是 start_uid, end_uid
                 s_uid, e_uid = map(int, params_str.split(","))
                 result = actuator.swipe(s_uid, e_uid, elements)
             elif action_name == "back": result = actuator.back()
             elif action_name == "home": result = actuator.home()
             elif action_name == "wait": result = actuator.wait(float(params_str))
-            else: return "UNKNOWN_ACTION"
-            return "SUCCESS" if result else "FAILURE"
-        except Exception: return "EXECUTION_ERROR"
+            else:
+                print(f"未知的动作: '{action_name}'")
+                return "UNKNOWN_ACTION"
+
+            status = "SUCCESS" if result else "FAILURE"
+            print(f"--- [设备: {serial}] 动作 '{action_name}' 执行状态: {status} ---")
+            return status
+        except Exception as e:
+            print(f"--- [设备: {serial}] 动作 '{action_str}' 执行时出错: {e} ---")
+            return "EXECUTION_ERROR"
 
 def build_jarvis_envs(jarvis_config_path: str, max_steps: int) -> JarvisMultiDeviceEnv:
     """构建并返回一个 JarvisMultiDeviceEnv 实例"""
