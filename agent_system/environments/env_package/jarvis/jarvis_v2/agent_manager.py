@@ -94,7 +94,7 @@ def discover_devices(config: Dict[str, Any]) -> List[str]:
             )
 
     unique_devices = sorted(list(set(all_devices)))
-    logging.info(f"发现 {len(unique_devices)} 台唯一可用设备: {unique_devices}")
+    logging.info(f"发现 {len(unique_devices)} 台可用设备: {unique_devices}")
     return unique_devices
 
 

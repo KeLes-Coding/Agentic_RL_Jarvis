@@ -528,45 +528,34 @@ class JarvisEnvironmentManager(EnvironmentManagerBase):
         self.memory = SimpleMemory()
         super().__init__(envs, projection_f, config)
         self.num_envs = self.envs.num_envs
-        # self.prev_image_obs = None # 不再需要
 
     def reset(self):
+        # reset 方法保持不变，它是正确的
         raw_obs, infos = self.envs.reset()
-        
-        # --- 增加调试信息 ---
         print(f"--- 调试信息 [env_manager.py/reset] ---")
         raw_text_sample = raw_obs['text'][0] if raw_obs['text'] else 'N/A'
         print(f"从 envs.reset() 收到的 raw_obs['text'] (前100字符): '{raw_text_sample[:100]}'")
-        print(f"检查 '<image>' token 是否在 raw_obs['text'][0] 中: {'<image>' in raw_text_sample}")
-        
         self.tasks = ["Placeholder task description" for _ in range(self.num_envs)]
         self.memory.reset(batch_size=self.num_envs)
-        
         batched_images = raw_obs['image']
-            
         full_text_obs = self.build_text_obs(raw_obs['text'], init=True)
-
         full_text_sample = full_text_obs[0] if full_text_obs else 'N/A'
         print(f"build_text_obs 生成的 full_text_obs (前200字符): '{full_text_sample[:200]}'")
-        print(f"检查 '<image>' token 是否在 full_text_obs[0] 中: {'<image>' in full_text_sample}")
         print(f"----------------------------------------")
-
         return {'text': full_text_obs, 'image': batched_images, 'anchor': raw_obs['text']}, infos
 
     def step(self, text_actions: List[str]):
         parsed_actions, valids, thoughts = self.projection_f(text_actions)
         next_raw_obs, rewards, dones, infos = self.envs.step(parsed_actions)
         
-        # --- 增加调试信息 ---
         print(f"--- 调试信息 [env_manager.py/step] ---")
         next_raw_text_sample = next_raw_obs['text'][0] if next_raw_obs['text'] else 'N/A'
         print(f"从 envs.step() 收到的 next_raw_obs['text'] (前100字符): '{next_raw_text_sample[:100]}'")
-        print(f"检查 '<image>' token 是否在 next_raw_obs['text'][0] 中: {'<image>' in next_raw_text_sample}")
         
         batched_images = next_raw_obs['image']
 
-        # --- 核心修改：对齐 AlfWorld 的 memory 存储方式 ---
-        self.memory.store({'thought': thoughts, 'action': parsed_actions, 'text_obs': next_raw_obs['text']})
+        # --- 核心修改 1：只存储 thought 和 action，保持记忆纯净 ---
+        self.memory.store({'thought': thoughts, 'action': parsed_actions})
         
         full_text_obs = self.build_text_obs(next_raw_obs['text'])
 
@@ -579,48 +568,36 @@ class JarvisEnvironmentManager(EnvironmentManagerBase):
 
         full_text_sample_step = full_text_obs[0] if full_text_obs else 'N/A'
         print(f"build_text_obs 生成的 full_text_obs (前200字符): '{full_text_sample_step[:200]}'")
-        print(f"检查 '<image>' token 是否在 full_text_obs[0] 中: {'<image>' in full_text_sample_step}")
         print(f"---------------------------------------")
 
         return next_observations, rewards, dones, infos
 
-    # --- 核心修改：重写 build_text_obs ---
+    # --- 核心修改 2：手动访问和格式化记忆，不再使用 self.memory.fetch() ---
     def build_text_obs(self, text_obs: List[str], init: bool = False) -> List[str]:
         postprocess_text_obs = []
         
-        if not init and self.config.env.history_length > 0:
-            memory_records, valid_lens = self.memory.fetch(
-                    self.config.env.history_length
-            )
-        
         for i in range(len(text_obs)):
             if init or len(self.memory[i]) == 0:
-                user_content = JARVIS_TEMPLATE_NO_HIS.format(
-                    task_description=self.tasks[i],
-                    current_observation=text_obs[i]
+                # 第一步，使用无历史的 prompt
+                user_content = get_jarvis_step_1_prompt(
+                    task=self.tasks[i],
+                    simplified_ui=text_obs[i]
                 )
             else:
-                action_history = ""
-                # Safely handle records that might not be dictionaries
-                for step_idx, record in enumerate(memory_records[i]):
-                    # Check if record is a dictionary before using .get()
-                    if isinstance(record, dict):
-                        thought = record.get('thought', 'N/A')
-                        action = record.get('action', 'N/A')
-                        action_history += f"Step {step_idx + 1}:\nThought: {thought}\nAction: {action}\n"
-                    else:
-                        # Fallback for malformed records
-                        action_history += f"Step {step_idx + 1}:\nInvalid record format: {record}\n"
-                
-                user_content = JARVIS_TEMPLATE.format(
-                    task_description=self.tasks[i],
-                    action_history=action_history.strip(),
-                    current_step=len(self.memory[i]) + 1,
-                    current_observation=text_obs[i]
-                )
+                # 直接访问 memory buffer 获取上一步的记录
+                # self.memory[i] 是一个列表，[-1] 就是最后一条记录
+                last_record = self.memory[i][-1]
+                prev_thought = last_record.get('thought', 'N/A')
+                prev_action = last_record.get('action', 'N/A')
 
-            # 将 SYSTEM_PROMPT 和 user_content 组合成最终的文本
-            # 这种格式可以被 `apply_chat_template` 识别为 "一个带有超长指令的用户回合"
+                user_content = get_jarvis_intermediate_prompt(
+                    task=self.tasks[i],
+                    prev_thought=prev_thought,
+                    prev_action=prev_action,
+                    simplified_ui=text_obs[i]
+                )
+            
+            # 注入 System Prompt
             final_obs = f"{SYSTEM_PROMPT}\n\n{user_content}"
             postprocess_text_obs.append(final_obs)
             
