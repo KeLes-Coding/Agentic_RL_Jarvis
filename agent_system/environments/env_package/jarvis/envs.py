@@ -100,6 +100,7 @@ class JarvisMultiDeviceEnv:
                     try:
                         img = Image.open(io.BytesIO(compressed_bytes)).convert("RGB")
                         final_image_array = np.array(img, dtype=np.uint8)
+                        print("图片解码成功")
                     except Exception as e:
                         print(f"警告: 图像解码失败 - {e}")
 

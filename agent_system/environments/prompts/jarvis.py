@@ -74,3 +74,15 @@ Here is the current screen's UI layout:
 
 Analyze the result of your last action. Was it successful? What is the next logical action to take to continue the task?
 """
+
+JARVIS_TEMPLATE_NO_HIS = """Task: {task_description}
+Current Screen Observation:
+{current_observation}"""
+
+JARVIS_TEMPLATE = """Task: {task_description}
+
+--- Previous Steps ---
+{action_history}
+--- Current Step ({current_step}) ---
+Current Screen Observation:
+{current_observation}"""

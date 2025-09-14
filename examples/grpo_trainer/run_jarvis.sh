@@ -27,7 +27,7 @@ python3 -m verl.trainer.main_ppo \
     data.truncation='left' \
     data.return_raw_chat=True \
     data.return_full_prompt=True \
-    actor_rollout_ref.model.path=/home/zzh/Workspace/modelscope/models/Qwen/Qwen2-VL-2B \
+    actor_rollout_ref.model.path=/home/zzh/Workspace/modelscope/models/Qwen/Qwen2___5-VL-3B-Instruct \
     actor_rollout_ref.actor.optim.lr=1e-6 \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.actor.ppo_mini_batch_size=2 \

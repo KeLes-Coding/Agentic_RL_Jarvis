@@ -59,6 +59,11 @@ class TrajectoryCollector:
             dict: Contains processed input data such as input_ids, attention_mask, etc.
         """
 
+        print(f"\n--- 监控: 进入 preprocess_single_sample (item {item}) ---")
+        obs_text_sample = obs.get('text', [''])[item]
+        print(f"收到的 obs['text'] (前200字符): '{obs_text_sample[:200]}'")
+        print(f"收到的 obs['image'] 类型: {type(obs.get('image', [None])[item])}")
+
         raw_prompt = gen_batch.non_tensor_batch['raw_prompt'][item]
         data_source = gen_batch.non_tensor_batch['data_source'][item]
         
@@ -97,6 +102,8 @@ class TrajectoryCollector:
             add_generation_prompt=True,
             tokenize=False
         )
+
+        print(f"生成的 prompt_with_chat_template (前200字符): '{prompt_with_chat_template[:200]}'")
         
         # Initialize return dict
         row_dict = {}
@@ -173,7 +180,11 @@ class TrajectoryCollector:
 
         if self.config.data.get('return_raw_chat', False):
             row_dict['raw_prompt'] = chat.tolist()
-        
+
+        print(f"最终 raw_prompt (前200字符): '{raw_prompt[:200]}'")
+        print(f"检查 '<|image_pad|>' 是否在最终 raw_prompt 中: {'<|image_pad|>' in raw_prompt}")
+        print(f"--- 监控: 退出 preprocess_single_sample (item {item}) ---\n")
+
         return row_dict
 
     def preprocess_batch(
@@ -336,6 +347,12 @@ class TrajectoryCollector:
 
             batch = self.preprocess_batch(gen_batch=gen_batch, obs=obs)
 
+            print("\n" + "="*50)
+            print(f"--- 监控: 即将输入到 LLM 的完整 Prompt (Batch Item 0) (Step {_step+1}) ---")
+            full_prompt_for_llm = self.tokenizer.decode(batch.batch['input_ids'][0], skip_special_tokens=False)
+            print(full_prompt_for_llm)
+            print("="*50 + "\n")
+
             batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
             non_tensor_batch_keys_to_pop = ["raw_prompt_ids"]
             if "multi_modal_data" in batch.non_tensor_batch:
@@ -359,6 +376,12 @@ class TrajectoryCollector:
             batch = batch.union(batch_output)
             
             text_actions = self.tokenizer.batch_decode(batch.batch['responses'], skip_special_tokens=True)
+
+            print("\n" + "*"*50)
+            print(f"--- 监控: LLM 的完整回复 (Step {_step+1}) ---")
+            for i, response in enumerate(text_actions):
+                print(f"  [环境 {i}]: {response}")
+            print("*"*50 + "\n")
             
             next_obs, rewards, dones, infos = envs.step(text_actions)
 
