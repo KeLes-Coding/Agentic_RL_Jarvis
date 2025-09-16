@@ -316,6 +316,21 @@ class TrajectoryCollector:
         # Initial observations from the environment
         obs, infos = envs.reset()
 
+        try:
+            # 你的数据集格式是 [{'content': '...', 'role': 'user'}]
+            # 我们需要从中提取 'content'
+            raw_prompts = gen_batch.non_tensor_batch['raw_prompt']
+            # 使用列表推导式从复杂结构中提取出任务字符串列表
+            tasks_list = [item[0]['content'] for item in raw_prompts]
+
+            # 检查 envs 是否有 set_tasks 方法，确保代码的健壮性
+            if hasattr(envs, 'set_tasks'):
+                envs.set_tasks(tasks_list)
+            else:
+                print("警告: 当前 env_manager 不支持 set_tasks 方法。将使用默认任务。")
+        except (KeyError, IndexError, TypeError) as e:
+            print(f"严重警告: 无法从 gen_batch 中解析任务列表，将回退到占位符任务。错误: {e}")
+
         # Initialize trajectory collection
         lenght_obs = len(obs['text']) if obs['text'] is not None else len(obs['image'])
         if len(gen_batch.batch) != lenght_obs and self.config.env.rollout.n > 0:

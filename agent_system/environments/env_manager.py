@@ -531,16 +531,24 @@ class JarvisEnvironmentManager(EnvironmentManagerBase):
         # self.tasks 应该在这里被初始化为一个空列表
         self.tasks = []
 
+    def set_tasks(self, tasks: List[str]):
+        """从外部接收并设置当前批次的环境任务。"""
+        if len(tasks) != self.num_envs:
+            print(f"警告: 接收到的任务数量 ({len(tasks)}) 与环境数量 ({self.num_envs}) 不匹配。")
+        print("--- [env_manager.py] 成功接收并更新任务列表 ---")
+        self.tasks = tasks
+        for i, task in enumerate(self.tasks):
+            print(f"  [环境 {i} 的新任务]: {task}")
+        print("-------------------------------------------------")
+
     def reset(self):
-        # 注意：这里的 self.tasks 需要被外部调用者用真实的 task list 覆写
         raw_obs, infos = self.envs.reset()
         print(f"--- 调试信息 [env_manager.py/reset] ---")
         raw_text_sample = raw_obs['text'][0] if raw_obs['text'] else 'N/A'
         print(f"从 envs.reset() 收到的 raw_obs['text'] (前100字符): '{raw_text_sample[:100]}'")
         
-        # 警告：这里使用了占位符任务。请确保你的训练流程会提供真实的 self.tasks
+        # 即使在这里初始化，也会被 set_tasks 覆盖
         if not self.tasks or len(self.tasks) != self.num_envs:
-            print("警告: self.tasks 未被正确初始化，将使用占位符。")
             self.tasks = [f"Placeholder task description for env {i}" for i in range(self.num_envs)]
             
         self.memory.reset(batch_size=self.num_envs)
@@ -552,13 +560,11 @@ class JarvisEnvironmentManager(EnvironmentManagerBase):
         return {'text': full_text_obs, 'image': batched_images, 'anchor': raw_obs['text']}, infos
 
     def step(self, text_actions: List[str]):
-        # --- 修改开始：在处理LLM回复前，打印当前所有环境正在执行的任务 ---
         print("\n--- 当前各环境执行的任务 ---")
         for i, task in enumerate(self.tasks):
             print(f"  [环境 {i} 的任务]: {task}")
         print("--------------------------\n")
-        # --- 修改结束 ---
-
+        
         parsed_actions, valids, thoughts = self.projection_f(text_actions)
         next_raw_obs, rewards, dones, infos = self.envs.step(parsed_actions)
         
