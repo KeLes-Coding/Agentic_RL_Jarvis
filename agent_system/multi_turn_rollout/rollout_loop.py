@@ -300,62 +300,68 @@ class TrajectoryCollector:
             envs: EnvironmentManagerBase,
             ) -> DataProto:
         """
-        Collects trajectories through parallel agent-environment agent_loop.
-        Parameters:
-            gen_batch (DataProto): Initial batch with prompts to start the agent_loop
-            actor_rollout_wg (WorkerGroup): Worker group containing the actor model for policy decisions
-            envs (EnvironmentManagerBase): Environment manager containing parallel environment instances
-        
-        Returns:
-            total_batch_list (List[Dict]): List of trajectory data for each environment
-            episode_rewards (np.ndarray): Total rewards for each environment
-            episode_lengths (np.ndarray): Total steps for each environment
-            success (Dict[str, np.ndarray]): Success samples for each environment
-            traj_uid (np.ndarray): Trajectory unique identifiers
+        为物理设备环境优化的轨迹收集循环。
         """
-        # Initial observations from the environment
         obs, infos = envs.reset()
+        
+        lenght_obs = len(obs['text']) if obs['text'] is not None else len(obs['image'])
 
+        # 对于物理环境，我们期望批次大小与环境数直接匹配。
+        # 不再使用 gen_batch.repeat()，因为它适用于可无限实例化的模拟环境。
+        assert len(gen_batch.batch) == lenght_obs, \
+            f"对于物理设备环境，初始数据批次大小 ({len(gen_batch.batch)}) 必须与检测到的设备数 ({lenght_obs}) 完全匹配。" \
+            "请检查你的 data.train_batch_size 和 data.val_batch_size 配置。"
+        
         try:
-            # 你的数据集格式是 [{'content': '...', 'role': 'user'}]
-            # 我们需要从中提取 'content'
             raw_prompts = gen_batch.non_tensor_batch['raw_prompt']
-            # 使用列表推导式从复杂结构中提取出任务字符串列表
             tasks_list = [item[0]['content'] for item in raw_prompts]
 
-            # 检查 envs 是否有 set_tasks 方法，确保代码的健壮性
-            if hasattr(envs, 'set_tasks'):
+            if hasattr(envs, 'set_tasks') and hasattr(envs, '_initialize_loggers_for_new_run'):
                 envs.set_tasks(tasks_list)
+                envs._initialize_loggers_for_new_run()
+                obs['text'] = envs.build_text_obs(obs['text'], tasks_list, init=True)
             else:
-                print("警告: 当前 env_manager 不支持 set_tasks 方法。将使用默认任务。")
+                print("警告: 当前 env_manager 不支持任务设置或日志初始化。")
         except (KeyError, IndexError, TypeError) as e:
-            print(f"严重警告: 无法从 gen_batch 中解析任务列表，将回退到占位符任务。错误: {e}")
-
-        # Initialize trajectory collection
-        lenght_obs = len(obs['text']) if obs['text'] is not None else len(obs['image'])
-        if len(gen_batch.batch) != lenght_obs and self.config.env.rollout.n > 0:
-            gen_batch = gen_batch.repeat(repeat_times=self.config.env.rollout.n, interleave=True)
-        assert len(gen_batch.batch) == lenght_obs, f"gen_batch size {len(gen_batch.batch)} does not match obs size {lenght_obs}"
+            print(f"严重警告: 无法从 gen_batch 中解析任务列表。错误: {e}")
 
         batch_size = len(gen_batch.batch['input_ids'])
         batch_output = None
         
-        if self.config.env.rollout.n > 0: # env grouping
+        if self.config.env.rollout.n > 0:
             uid_batch = []
             for i in range(batch_size):
                 if i % self.config.env.rollout.n == 0:
                     uid = str(uuid.uuid4())
                 uid_batch.append(uid)
             uid_batch = np.array(uid_batch, dtype=object)
-        else: # no env grouping, set all to the same uid
+        else:
             uid = str(uuid.uuid4())
             uid_batch = np.array([uid for _ in range(len(gen_batch.batch))], dtype=object)
+        
         is_done = np.zeros(batch_size, dtype=bool)
         traj_uid = np.array([str(uuid.uuid4()) for _ in range(batch_size)], dtype=object)
         total_batch_list = [[] for _ in range(batch_size)]
         total_infos = [[] for _ in range(batch_size)]
         episode_lengths = np.zeros(batch_size, dtype=np.int32)
         episode_rewards = np.zeros(batch_size, dtype=np.float32)
+
+        # 记录 reset 这一步（作为 step 0）
+        if hasattr(envs, 'info_pool_managers'):
+            for i in range(len(infos)):
+                if i in envs.info_pool_managers:
+                    step_data = {
+                        "task": envs.tasks[i],
+                        "thought": "Episode started.",
+                        "parsed_action": "reset()",
+                        "action_success": True,
+                        "raw_obs_data": infos[i].get("raw_obs_data", {}),
+                        "compressed_screenshot_bytes": infos[i].get("compressed_screenshot_bytes"),
+                        "llm_prompt": "N/A",
+                        "raw_llm_response": "N/A"
+                    }
+                    envs.info_pool_managers[i].record_step(step_data)
+
         # Trajectory collection loop
         for _step in range(self.config.env.max_steps):
             active_masks = np.logical_not(is_done)
@@ -382,12 +388,9 @@ class TrajectoryCollector:
             )
 
             batch_input.meta_info = gen_batch.meta_info
-
             batch_output = actor_rollout_wg.generate_sequences(batch_input)
-
             batch.non_tensor_batch['uid'] = uid_batch
             batch.non_tensor_batch['traj_uid'] = traj_uid
-
             batch = batch.union(batch_output)
             
             text_actions = self.tokenizer.batch_decode(batch.batch['responses'], skip_special_tokens=True)
@@ -399,12 +402,10 @@ class TrajectoryCollector:
             print("*"*50 + "\n")
             
             next_obs, rewards, dones, infos = envs.step(text_actions)
-
             
             if len(rewards.shape) == 2:
                 rewards = rewards.squeeze(1)
             if len(dones.shape) == 2:
-                # dones is numpy, delete a dimension
                 dones = dones.squeeze(1)
 
             if 'is_action_valid' in infos[0]:
@@ -412,7 +413,6 @@ class TrajectoryCollector:
             else:
                 batch.non_tensor_batch['is_action_valid'] = np.ones(batch_size, dtype=bool)
 
-            # Create reward tensor, only assign rewards for active environments
             episode_rewards += torch_to_numpy(rewards) * torch_to_numpy(active_masks)
             episode_lengths[active_masks] += 1
 
@@ -420,30 +420,22 @@ class TrajectoryCollector:
             batch.non_tensor_batch['rewards'] = torch_to_numpy(rewards, is_object=True)
             batch.non_tensor_batch['active_masks'] = torch_to_numpy(active_masks, is_object=True)
             
-            # Update episode lengths for active environments
             batch_list: list[dict] = to_list_of_dict(batch)
-
             for i in range(batch_size):
                 total_batch_list[i].append(batch_list[i])
                 total_infos[i].append(infos[i])
 
-            # Update done states
             is_done = np.logical_or(is_done, dones)
-                
-            # Update observations for next step
             obs = next_obs
-
-            # Break if all environments are done
             if is_done.all():
                 break
         
         success: Dict[str, np.ndarray] = envs.success_evaluator(
-                    total_infos=total_infos,
-                    total_batch_list=total_batch_list,
-                    episode_rewards=episode_rewards, 
-                    episode_lengths=episode_lengths,
-                    )
-        
+            total_infos=total_infos,
+            total_batch_list=total_batch_list,
+            episode_rewards=episode_rewards, 
+            episode_lengths=episode_lengths,
+        )
         return total_batch_list, episode_rewards, episode_lengths, success, traj_uid
     
     def dynamic_multi_turn_loop(

@@ -5,9 +5,9 @@ export SWANLAB_API_KEY="oB8w36PCJxKeqwif2ijWz"
 
 export CUDA_VISIBLE_DEVICES="0,2"
 
-train_data_size=16
-val_data_size=128
-group_size=8
+train_data_size=2
+val_data_size=2
+group_size=1
 
 # We only use data preparation to indicate the modality and the data size.
 # python3 -m examples.data_preprocess.prepare \

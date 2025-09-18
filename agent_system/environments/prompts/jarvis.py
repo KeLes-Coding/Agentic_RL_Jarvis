@@ -24,13 +24,13 @@ The JSON object must contain exactly two keys:
 2. "action": The specific action to perform.
 
 --- AVAILABLE ACTIONS ---
-- `tap(uid)`: Tap the center of the element with the given `uid`.
-- `input_text(uid, text)`: Tap on the element with `uid` and then input the `text`.
-- `swipe(start_uid, end_uid)`: Swipe from the center of `start_uid` to the center of `end_uid`.
-- `back()`: Press the system back button.
-- `home()`: Press the system home button.
-- `wait(seconds)`: Wait for a specified number of seconds.
-- `finish(summary)`: Use this action ONLY when the entire task is successfully completed. Provide a brief summary of the completion.
+- `tap(uid: int)`: Tap the center of the element with the given integer `uid`. Example: `tap(12)`
+- `input_text(uid: int, text: str)`: Tap on the element with `uid` and then input the `text`. The text must be enclosed in single or double quotes. Example: `input_text(5, text='hello world')`
+- `swipe(start_uid: int, end_uid: int)`: Swipe from the center of element `start_uid` to the center of element `end_uid`. Example: `swipe(2, 10)`
+- `back()`: Press the system back button. No parameters. Example: `back()`
+- `home()`: Press the system home button. No parameters. Example: `home()`
+- `wait(seconds: float)`: Wait for a specified number of seconds. Example: `wait(3.5)`
+- `finish(summary: str)`: Use this action ONLY when the entire task is successfully completed. Provide a brief summary of the completion. Example: `finish(summary='Successfully calculated 123 * 456 and found the answer.')
 
 --- FINAL REMINDER ---
 Analyze the UI elements and screenshots carefully. Be precise and methodical. Your response MUST be a single, clean JSON object.

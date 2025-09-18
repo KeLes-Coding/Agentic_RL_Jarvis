@@ -7,14 +7,7 @@ from typing import List, Tuple
 def jarvis_projection(text_actions: List[str]) -> Tuple[List[str], np.ndarray, List[str]]:
     """
     解析模型生成的JSON字符串。
-
-    Args:
-        text_actions: 模型生成的包含 "thought" 和 "action" 的JSON字符串列表。
-
-    Returns:
-        - A list of action strings (e.g., "tap(1)").
-        - A numpy array of booleans indicating if the parsing was valid.
-        - A list of thought strings.
+    如果解析失败，会生成一个特殊的'format_error'动作，以便环境可以捕获并提供反馈。
     """
     parsed_actions = []
     thoughts = []
@@ -26,15 +19,23 @@ def jarvis_projection(text_actions: List[str]) -> Tuple[List[str], np.ndarray, L
             cleaned_text = text_action.strip().removeprefix("```json").removesuffix("```").strip()
             
             data = json.loads(cleaned_text)
-            thought = data.get("thought", "")
-            action = data.get("action", "finish(reason='Parsing error')")
+            thought = data.get("thought", "Missing 'thought' key in JSON.")
+            action = data.get("action", "format_error(reason='Missing action key in JSON')")
             
+            # 如果 thought 或 action 为空，也视为一种格式错误
+            if not thought or not action:
+                 action = f"format_error(reason='Empty thought or action value in JSON')"
+                 valids.append(False)
+            else:
+                 valids.append(True)
+
             parsed_actions.append(action)
             thoughts.append(thought)
-            valids.append(True)
-        except json.JSONDecodeError:
-            # 如果JSON解析失败，我们默认执行 finish 动作并记录错误
-            parsed_actions.append("finish(reason='Invalid JSON format')")
+
+        except json.JSONDecodeError as e:
+            # --- 修改：不再发送finish，而是发送一个可识别的格式错误动作 ---
+            error_reason = f"Invalid JSON format: {e}"
+            parsed_actions.append(f"format_error(reason='{error_reason}')")
             thoughts.append("Error: Failed to parse LLM response as valid JSON.")
             valids.append(False)
             

@@ -5,6 +5,7 @@ import numpy as np
 import io
 from typing import List, Dict, Tuple, Union
 import logging
+import re
 
 try:
     from PIL import Image
@@ -57,11 +58,8 @@ class JarvisMultiDeviceEnv:
             scale_factor = self.compression_config.get("scale_factor", 0.5)
             img = Image.open(io.BytesIO(image_bytes))
 
-            # --- 核心修改：在这里转换图像模式 ---
-            # JPEG 不支持 RGBA 的 Alpha 通道，需要转换为 RGB
             if img.mode == 'RGBA':
                 img = img.convert('RGB')
-            # --- 修改结束 ---
             
             original_width, original_height = img.size
             new_width = int(original_width * scale_factor)
@@ -70,7 +68,6 @@ class JarvisMultiDeviceEnv:
             buffer = io.BytesIO()
             image_format = self.compression_config.get("format", "JPEG")
             resized_img.save(buffer, format=image_format)
-            print("===图像压缩成功===")
             return buffer.getvalue()
         except Exception as e:
             print(f"===图像压缩失败: {e}===")
@@ -85,48 +82,37 @@ class JarvisMultiDeviceEnv:
             self.episode_steps[serial] = 0
             self.actuators[serial].home()
             obs_data = self.observers[serial].get_current_observation()
-
-            # --- 开始替换 ---
+            
             screenshots_bytes = obs_data.get("screenshot_bytes")
             if not isinstance(screenshots_bytes, list):
                 screenshots_bytes = [screenshots_bytes] if screenshots_bytes else []
 
             final_image_array = None
-            # 检查是否有截图
+            compressed_bytes = None
             if screenshots_bytes:
-                # 只处理第一张截图
                 first_shot_bytes = screenshots_bytes[0]
                 compressed_bytes = self._compress_single_image(first_shot_bytes)
                 if compressed_bytes:
                     try:
                         img = Image.open(io.BytesIO(compressed_bytes)).convert("RGB")
                         final_image_array = np.array(img, dtype=np.uint8)
-                        print("图片解码成功")
                     except Exception as e:
                         print(f"警告: 图像解码失败 - {e}")
 
-            # 如果没有有效图像，则创建一个黑色占位图，确保数据类型正确
             if final_image_array is None:
-                print(f"警告: 设备 {serial} 未能获取截图, 将使用黑色图像占位。")
                 final_image_array = np.zeros((256, 256, 3), dtype=np.uint8)
 
-            # 确保每次只添加一个Numpy数组
             obs_images.append(final_image_array)
-
-            # 相应地，只创建一个占位符
             image_placeholders = "<image>\n"
             obs_text = obs_data.get("simplified_elements_str", "")
             obs_texts.append(f"{image_placeholders}{obs_text}")
-            # --- 替换结束 ---
 
-            infos.append({"device_serial": serial})
-
-        print(f"--- 调试信息 [envs.py/reset] ---")
-        print(f"即将返回 obs_images，共 {len(obs_images)} 个元素，首元素类型: {type(obs_images[0]) if obs_images else 'N/A'}")
-        print(f"即将返回 obs_texts，共 {len(obs_texts)} 个元素，首元素内容的前100个字符: '{obs_texts[0][:100] if obs_texts else 'N/A'}'")
-        print(f"检查 '<image>' token 是否在 obs_texts[0] 中: {'<image>' in obs_texts[0] if obs_texts else 'N/A'}")
-        print(f"------------------------------------")
-
+            info_dict = {
+                "device_serial": serial,
+                "raw_obs_data": obs_data,
+                "compressed_screenshot_bytes": compressed_bytes
+            }
+            infos.append(info_dict)
         return {"image": obs_images, "text": obs_texts}, infos
 
     def step(self, actions: List[str]) -> Tuple[Dict[str, List], List[float], List[bool], List[Dict]]:
@@ -134,22 +120,22 @@ class JarvisMultiDeviceEnv:
 
         for i, serial in enumerate(self.device_serials):
             action_str = actions[i]
-            elements = self.observers[serial].get_current_observation().get("simplified_elements_list")
-            # status = self._dispatch_action(self.actuators[serial], action_str, elements)
+            pre_action_obs_data = self.observers[serial].get_current_observation()
+            elements = pre_action_obs_data.get("simplified_elements_list")
+            
             status = self._dispatch_action(self.actuators[serial], serial, action_str, elements)
             action_success = (status == "SUCCESS")
             self.episode_steps[serial] += 1
-            obs_data = self.observers[serial].get_current_observation()
             
-            # --- 开始替换 ---
-            screenshots_bytes = obs_data.get("screenshot_bytes")
+            post_action_obs_data = self.observers[serial].get_current_observation()
+            
+            screenshots_bytes = post_action_obs_data.get("screenshot_bytes")
             if not isinstance(screenshots_bytes, list):
                 screenshots_bytes = [screenshots_bytes] if screenshots_bytes else []
 
             final_image_array = None
-            # 检查是否有截图
+            compressed_bytes = None
             if screenshots_bytes:
-                # 只处理第一张截图
                 first_shot_bytes = screenshots_bytes[0]
                 compressed_bytes = self._compress_single_image(first_shot_bytes)
                 if compressed_bytes:
@@ -159,96 +145,121 @@ class JarvisMultiDeviceEnv:
                     except Exception as e:
                         print(f"警告: 图像解码失败 - {e}")
 
-            # 如果没有有效图像，则创建一个黑色占位图，确保数据类型正确
             if final_image_array is None:
-                print(f"警告: 设备 {serial} 未能获取截图, 将使用黑色图像占位。")
                 final_image_array = np.zeros((256, 256, 3), dtype=np.uint8)
 
-            # 确保每次只添加一个Numpy数组
             obs_images.append(final_image_array)
 
-            # 相应地，只创建一个占位符
+            # --- 核心修改：构建带有详细错误反馈的观察文本 ---
+            # 捕获来自 projection.py 的格式错误
+            feedback_prefix = ""
+            format_reminder = (
+                "--- CORRECT FORMAT ---\n"
+                "You MUST respond in a strict, valid JSON format. Your entire output must be a single JSON object, without any markdown formatting, comments, or extra text.\n"
+                'The JSON object must contain exactly two keys:\n1. "thought": Your reasoning.\n2. "action": The action to perform.\n\n'
+                "--- AVAILABLE ACTIONS ---\n"
+                "- `tap(uid: int)`: Example: `tap(12)`\n"
+                "- `input_text(uid: int, text: str)`: Example: `input_text(5, 'hello world')`\n"
+                "- `swipe(start_uid: int, end_uid: int)`: Example: `swipe(2, 10)`\n"
+                "- `back()`: Example: `back()`\n"
+                "- `home()`: Example: `home()`\n"
+                "- `wait(seconds: float)`: Example: `wait(3.5)`\n"
+                "- `finish(summary: str)`: Example: `finish(summary='Task is complete.')`\n"
+            )
+
+            if action_str.startswith("format_error"):
+                reason = action_str[len("format_error(reason='"):-2]
+                feedback_prefix = (
+                    f"SYSTEM FEEDBACK: Your last output had a JSON format error.\n"
+                    f"Error Details: {reason}\n"
+                    f"{format_reminder}\nPlease correct your output and try again.\n\n"
+                )
+            elif not action_success:
+                feedback_prefix = (
+                    f"SYSTEM FEEDBACK: Your previous action failed to execute.\n"
+                    f"Action Sent: {action_str}\n"
+                    f"Execution Status: {status}\n"
+                    f"{format_reminder}\nPlease analyze the error, check your action format and parameters, and try again.\n\n"
+                )
+            
             image_placeholders = "<image>\n"
-            obs_text = obs_data.get("simplified_elements_str", "")
-            obs_texts.append(f"{image_placeholders}{obs_text}")
-            # --- 替换结束 ---
+            obs_text = post_action_obs_data.get("simplified_elements_str", "")
+            obs_texts.append(f"{feedback_prefix}{image_placeholders}{obs_text}")
             
             done = False
             reward = 0.0
+            # 只有用户主动发出的、非错误的 finish 才能结束任务
             if action_str.startswith("finish"):
                 reward = 1.0
                 done = True
-            elif not action_success:
+            elif not action_success: # 所有失败的动作都给予惩罚
                 reward = -0.1
+            
             if self.episode_steps[serial] >= self.max_steps_per_episode:
                 done = True
+            
             rewards.append(reward)
             dones.append(done)
-            # infos.append({"device_serial": serial, "action_success": action_success})
-
-            # --- 修改开始 ---
-            # 判断任务是否成功 'won'。当任务结束(done=True)且奖励为正(reward > 0)时，视为成功。
+            
             task_won = done and (reward > 0)
-            infos.append({
+            
+            info_dict = {
                 "device_serial": serial,
                 "action_success": action_success,
-                "won": task_won  # 添加 'won' 键
-            })
-            # --- 修改结束 ---
+                "won": task_won,
+                "raw_obs_data": pre_action_obs_data,
+                "compressed_screenshot_bytes": self._compress_single_image(pre_action_obs_data.get("screenshot_bytes", b'')),
+            }
+            infos.append(info_dict)
             
         observations = {"image": obs_images, "text": obs_texts}
-
-        # 在 step 方法的 return observations, ... 之前
-        print(f"--- 调试信息 [envs.py/step] ---")
-        print(f"即将返回 obs_images，共 {len(obs_images)} 个元素，首元素类型: {type(obs_images[0]) if obs_images else 'N/A'}")
-        print(f"即将返回 obs_texts，共 {len(obs_texts)} 个元素，首元素内容的前100个字符: '{obs_texts[0][:100] if obs_texts else 'N/A'}'")
-        print(f"检查 '<image>' token 是否在 obs_texts[0] 中: {'<image>' in obs_texts[0] if obs_texts else 'N/A'}")
-        print(f"----------------------------------")
-
         return observations, np.array(rewards, dtype=np.float32), np.array(dones, dtype=bool), infos
 
     def _dispatch_action(self, actuator: Actuator, serial: str, action_str: str, elements: list) -> str:
         print(f"--- [设备: {serial}] 正在分发动作: '{action_str}' ---")
         try:
-            action_name = action_str.split("(")[0].strip()
+            if action_str.startswith("format_error"):
+                return f"FORMAT_ERROR: {action_str.split('reason=')[1][:-1]}"
 
-            # --- 修改 1：正确处理 finish 动作 ---
-            # finish 是一个合法的终结动作，直接返回成功状态。
+            original_action_name = action_str.split("(")[0].strip()
+            action_name = original_action_name
+
             if action_name == "finish":
-                print(f"--- [设备: {serial}] 接收到 'finish' 动作, 任务结束 ---")
                 return "SUCCESS"
-
-            # --- 修改 2：将 'click' 视为 'tap' 的别名 ---
             if action_name == "click":
                 action_name = "tap"
 
-            params_str = action_str[len(action_name) + 1 : -1] if "(" in action_str else ""
-            if action_name in ["tap", "input_text", "swipe"] and not elements:
-                print(f"动作执行失败: '{action_name}' 需要UI元素，但当前为空。")
+            params_str = action_str[len(original_action_name) + 1 : -1] if "(" in action_str else ""
+            
+            if action_name in ["tap", "input_text", "swipe", "wait"] and not elements:
                 return "FAILURE_NO_ELEMENTS"
 
-            if action_name == "tap": result = actuator.tap(int(params_str), elements)
+            def extract_uid(param_part):
+                numbers = re.findall(r'\d+', param_part)
+                if not numbers:
+                    raise ValueError(f"Cannot find a valid integer UID in parameter '{param_part}'")
+                return int(numbers[0])
+
+            if action_name == "tap": result = actuator.tap(extract_uid(params_str), elements)
             elif action_name == "input_text":
-                uid, text = params_str.split(",", 1)
-                result = actuator.input_text(int(uid), text.strip().strip("'\""), elements)
+                uid_part, text = params_str.split(",", 1)
+                result = actuator.input_text(extract_uid(uid_part), text.strip().strip("'\""), elements)
             elif action_name == "swipe":
-                # 假设 swipe 的参数是 start_uid, end_uid
-                s_uid, e_uid = map(int, params_str.split(","))
-                result = actuator.swipe(s_uid, e_uid, elements)
+                start_part, end_part = params_str.split(",", 1)
+                result = actuator.swipe(extract_uid(start_part), extract_uid(end_part), elements)
             elif action_name == "back": result = actuator.back()
             elif action_name == "home": result = actuator.home()
             elif action_name == "wait": result = actuator.wait(float(params_str))
             else:
-                print(f"未知的动作: '{action_name}'")
-                return "UNKNOWN_ACTION"
+                return f"UNKNOWN_ACTION: '{action_name}' is not a valid action."
 
             status = "SUCCESS" if result else "FAILURE"
             print(f"--- [设备: {serial}] 动作 '{action_name}' 执行状态: {status} ---")
             return status
         except Exception as e:
-            print(f"--- [设备: {serial}] 动作 '{action_str}' 执行时出错: {e} ---")
-            return "EXECUTION_ERROR"
+            error_message = f"EXECUTION_ERROR: {repr(e)}"
+            print(f"--- [设备: {serial}] 动作 '{action_str}' 执行时出错: {error_message} ---")
+            return error_message
 
 def build_jarvis_envs(jarvis_config_path: str, max_steps: int) -> JarvisMultiDeviceEnv:
-    """构建并返回一个 JarvisMultiDeviceEnv 实例"""
     return JarvisMultiDeviceEnv(jarvis_config_path, max_steps)

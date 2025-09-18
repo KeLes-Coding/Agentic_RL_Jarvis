@@ -19,6 +19,8 @@ import torch
 import numpy as np
 from functools import partial
 import os
+import datetime
+import re
 from agent_system.environments.prompts import *
 from agent_system.environments.base import EnvironmentManagerBase, to_numpy
 from agent_system.memory import SimpleMemory
@@ -27,6 +29,7 @@ from agent_system.environments.env_package.jarvis.projection import jarvis_proje
 # 1. 修改导入的 prompt，使用新的函数
 from agent_system.environments.prompts.jarvis import get_jarvis_step_1_prompt, get_jarvis_intermediate_prompt, JARVIS_TEMPLATE, JARVIS_TEMPLATE_NO_HIS, SYSTEM_PROMPT
 # from agent_system.memory import Trajectory
+from .env_package.jarvis.info_pool import InfoPoolManager
 
 import json
 
@@ -528,55 +531,96 @@ class JarvisEnvironmentManager(EnvironmentManagerBase):
         self.memory = SimpleMemory()
         super().__init__(envs, projection_f, config)
         self.num_envs = self.envs.num_envs
-        # self.tasks 应该在这里被初始化为一个空列表
         self.tasks = []
+        
+        # --- 修改：为整个训练运行创建一个唯一的顶级日志目录 ---
+        log_root_dir = config.env.jarvis.get("log_dir", "trajectory_logs")
+        run_timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
+        self.log_dir = os.path.join(log_root_dir, f"training_run_{run_timestamp}")
+        os.makedirs(self.log_dir, exist_ok=True)
+        print(f"所有轨迹日志将保存在唯一的训练目录中: {self.log_dir}")
+        
+        self.info_pool_managers: Dict[int, InfoPoolManager] = {}
+        self.run_start_times: Dict[int, datetime.datetime] = {}
+        self.last_prompts: List[str] = [""] * self.num_envs
+        # active_batch_size 将由 set_tasks 动态设置
+        self.active_batch_size = 0
 
     def set_tasks(self, tasks: List[str]):
-        """从外部接收并设置当前批次的环境任务。"""
-        if len(tasks) != self.num_envs:
-            print(f"警告: 接收到的任务数量 ({len(tasks)}) 与环境数量 ({self.num_envs}) 不匹配。")
-        print("--- [env_manager.py] 成功接收并更新任务列表 ---")
+        """仅更新任务列表和当前活动的批次大小。"""
         self.tasks = tasks
-        for i, task in enumerate(self.tasks):
-            print(f"  [环境 {i} 的新任务]: {task}")
+        self.active_batch_size = len(tasks)
+        print(f"--- [env_manager.py] 接收到 {self.active_batch_size} 个任务 ---")
+
+    def _initialize_loggers_for_new_run(self):
+        """为当前批次的所有环境初始化或重置日志记录器。"""
+        print("--- [env_manager.py] 正在为新批次初始化日志记录器 ---")
+        # 清空旧的记录器实例
+        self.info_pool_managers.clear()
+        
+        for i in range(self.active_batch_size):
+            task = self.tasks[i]
+            timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S_%f') # 增加微秒以确保唯一性
+            safe_task_name = re.sub(r'[^\w\-_\. ]', '_', task)[:50]
+            run_dir_name = f"{timestamp}_env{i}_{safe_task_name}"
+            full_path = os.path.join(self.log_dir, run_dir_name)
+            
+            self.info_pool_managers[i] = InfoPoolManager(full_path)
+            self.run_start_times[i] = datetime.datetime.now(datetime.timezone.utc)
+            print(f"  [环境 {i}] 的日志目录: {full_path}")
         print("-------------------------------------------------")
 
     def reset(self):
         raw_obs, infos = self.envs.reset()
-        print(f"--- 调试信息 [env_manager.py/reset] ---")
-        raw_text_sample = raw_obs['text'][0] if raw_obs['text'] else 'N/A'
-        print(f"从 envs.reset() 收到的 raw_obs['text'] (前100字符): '{raw_text_sample[:100]}'")
-        
-        # 即使在这里初始化，也会被 set_tasks 覆盖
-        if not self.tasks or len(self.tasks) != self.num_envs:
-            self.tasks = [f"Placeholder task description for env {i}" for i in range(self.num_envs)]
-            
         self.memory.reset(batch_size=self.num_envs)
+        
+        # 构建临时的 prompts，因为此时真实 tasks 可能还未设置
+        temp_tasks = self.tasks if self.tasks else ["Initializing..."] * self.num_envs
         batched_images = raw_obs['image']
-        full_text_obs = self.build_text_obs(raw_obs['text'], init=True)
-        full_text_sample = full_text_obs[0] if full_text_obs else 'N/A'
-        print(f"build_text_obs 生成的 full_text_obs (前200字符): '{full_text_sample[:200]}'")
-        print(f"----------------------------------------")
+        full_text_obs = self.build_text_obs(raw_obs['text'], temp_tasks, init=True)
+
         return {'text': full_text_obs, 'image': batched_images, 'anchor': raw_obs['text']}, infos
 
     def step(self, text_actions: List[str]):
-        print("\n--- 当前各环境执行的任务 ---")
-        for i, task in enumerate(self.tasks):
-            print(f"  [环境 {i} 的任务]: {task}")
-        print("--------------------------\n")
-        
         parsed_actions, valids, thoughts = self.projection_f(text_actions)
         next_raw_obs, rewards, dones, infos = self.envs.step(parsed_actions)
-        
-        print(f"--- 调试信息 [env_manager.py/step] ---")
-        next_raw_text_sample = next_raw_obs['text'][0] if next_raw_obs['text'] else 'N/A'
-        print(f"从 envs.step() 收到的 next_raw_obs['text'] (前100字符): '{next_raw_text_sample[:100]}'")
-        
-        batched_images = next_raw_obs['image']
 
+        # 只处理活动环境的数据
+        for i in range(self.active_batch_size):
+            if i in self.info_pool_managers:
+                step_data = {
+                    "task": self.tasks[i],
+                    "thought": thoughts[i],
+                    "parsed_action": parsed_actions[i],
+                    "action_success": infos[i].get("action_success", False),
+                    "raw_obs_data": infos[i].get("raw_obs_data", {}),
+                    "compressed_screenshot_bytes": infos[i].get("compressed_screenshot_bytes"),
+                    "llm_prompt": self.last_prompts[i],
+                    "raw_llm_response": text_actions[i]
+                }
+                self.info_pool_managers[i].record_step(step_data)
+
+                if dones[i]:
+                    final_status = "SUCCESS" if rewards[i] > 0 else "FAILURE"
+                    summary_text = "Task finished."
+                    if parsed_actions[i].startswith("finish"):
+                        match = re.search(r"summary=['\"](.*?)['\"]", parsed_actions[i])
+                        if match: summary_text = match.group(1)
+                    
+                    self.info_pool_managers[i].finalize_run(
+                        status=final_status,
+                        summary=summary_text,
+                        run_start_time=self.run_start_times[i],
+                        task=self.tasks[i]
+                    )
+                    # 清理完成的任务，避免重复终结
+                    self.info_pool_managers.pop(i, None)
+
+        batched_images = next_raw_obs['image']
         self.memory.store({'thought': thoughts, 'action': parsed_actions})
+        full_text_obs = self.build_text_obs(next_raw_obs['text'], self.tasks)
         
-        full_text_obs = self.build_text_obs(next_raw_obs['text'])
+        self.last_prompts = full_text_obs
 
         for i, info in enumerate(infos):
             info['is_action_valid'] = to_numpy(valids[i])
@@ -585,36 +629,30 @@ class JarvisEnvironmentManager(EnvironmentManagerBase):
         rewards = to_numpy(rewards)
         dones = to_numpy(dones)
 
-        full_text_sample_step = full_text_obs[0] if full_text_obs else 'N/A'
-        print(f"build_text_obs 生成的 full_text_obs (前200字符): '{full_text_sample_step[:200]}'")
-        print(f"---------------------------------------")
-
         return next_observations, rewards, dones, infos
 
-    def build_text_obs(self, text_obs: List[str], init: bool = False) -> List[str]:
+    def build_text_obs(self, text_obs: List[str], tasks: List[str], init: bool = False) -> List[str]:
         postprocess_text_obs = []
-        
-        for i in range(len(text_obs)):
+        num_obs = len(text_obs)
+        for i in range(num_obs):
+            current_task = tasks[i] if i < len(tasks) else "Task not assigned yet."
             if init or len(self.memory[i]) == 0:
                 user_content = get_jarvis_step_1_prompt(
-                    task=self.tasks[i],
+                    task=current_task,
                     simplified_ui=text_obs[i]
                 )
             else:
                 last_record = self.memory[i][-1]
                 prev_thought = last_record.get('thought', 'N/A')
                 prev_action = last_record.get('action', 'N/A')
-
                 user_content = get_jarvis_intermediate_prompt(
-                    task=self.tasks[i],
+                    task=current_task,
                     prev_thought=prev_thought,
                     prev_action=prev_action,
                     simplified_ui=text_obs[i]
                 )
-            
             final_obs = f"{SYSTEM_PROMPT}\n\n{user_content}"
             postprocess_text_obs.append(final_obs)
-            
         return postprocess_text_obs
 
 def make_envs(config):
