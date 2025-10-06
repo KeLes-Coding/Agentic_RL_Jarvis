@@ -1,126 +1,129 @@
+# agent_system/environments/env_package/jarvis/info_pool.py
+
 import os
 import json
 import datetime
-import logging
-import copy
-import re
+import io
+from typing import List, Dict, Any
+
+try:
+    from PIL import Image
+except ImportError:
+    Image = None
 
 class InfoPoolManager:
-    """
-    管理单个任务运行的日志记录，为每个任务实例创建一个独立的日志目录。
-    """
-    def __init__(self, run_directory: str):
-        self.logger = logging.getLogger(self.__class__.__name__)
-        self.run_dir = run_directory
+    def __init__(self, log_dir: str):
+        self.log_dir = log_dir
+        os.makedirs(self.log_dir, exist_ok=True)
+        self.trajectory_data: List[Dict[str, Any]] = []
+        self.step_count = -1  # 从-1开始，reset是第0步
 
-        if not os.path.isdir(self.run_dir):
-            try:
-                os.makedirs(self.run_dir, exist_ok=True)
-                self.logger.info(f"日志目录已创建: {self.run_dir}")
-            except OSError as e:
-                self.logger.error(f"创建运行目录 {self.run_dir} 失败: {e}")
-                raise
+        # --- 修改：定义 trace 文件路径并在初始化时创建空文件 ---
+        self.trace_path = os.path.join(self.log_dir, "execution_trace.json")
+        # 初始化一个空的JSON列表，确保文件存在且格式正确
+        with open(self.trace_path, "w", encoding="utf-8") as f:
+            json.dump([], f)
 
-        self.full_trace = []
-        self.step_count = 0
-        self.logger.info(f"信息池已关联到目录: {self.run_dir}")
-
-    def record_step(self, step_data: dict):
-        """
-        按照 jarvis_v2 的格式记录一个步骤的数据。
-        """
+    def record_step(self, step_data: Dict[str, Any]):
         self.step_count += 1
-        step_folder_name = f"step_{self.step_count:03d}"
-        step_dir = os.path.join(self.run_dir, step_folder_name)
+        step_dir = os.path.join(self.log_dir, f"step_{self.step_count}")
+        os.makedirs(step_dir, exist_ok=True)
 
-        try:
-            os.makedirs(step_dir, exist_ok=True)
-        except OSError as e:
-            self.logger.error(f"为步骤 {self.step_count} 创建目录失败: {e}")
-            return
-
-        # --- 仿照 jarvis_v2 格式构建 step_details.json 的内容 ---
-        step_details = {
-            "step_id": self.step_count,
-            "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
-            "overall_task": step_data.get("task"),
-            "observation": {},
-            "llm_response": {
-                "thought": step_data.get("thought"),
-                "action": step_data.get("parsed_action"),
-            },
-            "execution": {
-                "validated_action": step_data.get("parsed_action"),
-                "status": "SUCCESS" if step_data.get("action_success") else "FAILURE",
-            },
+        # 准备要记录的步骤数据
+        current_step_record = {
+            "step": self.step_count,
+            "thought": step_data["thought"],
+            "action": step_data["parsed_action"],
+            "action_success": step_data["action_success"]
         }
-
-        raw_obs = step_data.get("raw_obs_data", {})
         
-        # 处理文件保存和路径更新
-        if step_data.get("compressed_screenshot_bytes"):
-            screenshot_path = os.path.join(step_dir, "screenshot.png")
-            with open(screenshot_path, "wb") as f:
-                f.write(step_data["compressed_screenshot_bytes"])
-            step_details["observation"]["screenshot_path"] = os.path.join(step_folder_name, "screenshot.png")
+        # 添加到内存轨迹列表中
+        self.trajectory_data.append(current_step_record)
 
-        if raw_obs.get("xml_content"):
-            xml_path = os.path.join(step_dir, "layout.xml")
-            with open(xml_path, "w", encoding="utf-8") as f:
-                f.write(raw_obs["xml_content"])
-            step_details["observation"]["xml_path"] = os.path.join(step_folder_name, "layout.xml")
-        
-        if raw_obs.get("simplified_elements_str"):
-            simplified_path = os.path.join(step_dir, "simplified_layout.txt")
-            with open(simplified_path, "w", encoding="utf-8") as f:
-                f.write(raw_obs["simplified_elements_str"])
-            step_details["observation"]["simplified_layout_path"] = os.path.join(step_folder_name, "simplified_layout.txt")
-            step_details["observation"]["simplified_elements_str"] = raw_obs["simplified_elements_str"]
-
-
-        # 保存 llm_dialogue.json
-        dialogue_path = os.path.join(step_dir, "llm_dialogue.json")
-        dialogue_content = {
-            "prompt": step_data.get("llm_prompt"),
-            "response": step_data.get("raw_llm_response"),
-        }
-        with open(dialogue_path, "w", encoding="utf-8") as f:
-            json.dump(dialogue_content, f, indent=2, ensure_ascii=False)
-        step_details["llm_dialogue_path"] = os.path.join(step_folder_name, "llm_dialogue.json")
-
-        # 保存 step_details.json
-        step_details_path = os.path.join(step_dir, "step_details.json")
+        # --- 修改：在每一步都将完整的轨迹数据覆写到文件中 ---
         try:
-            with open(step_details_path, "w", encoding="utf-8") as f:
-                json.dump(step_details, f, indent=2, ensure_ascii=False)
+            with open(self.trace_path, "w", encoding="utf-8") as f:
+                json.dump(self.trajectory_data, f, indent=4, ensure_ascii=False)
         except Exception as e:
-            self.logger.error(f"保存步骤 {self.step_count} JSON数据失败: {e}")
-
-        # 将格式化后的数据追加到完整轨迹中
-        self.full_trace.append(step_details)
-
-    def finalize_run(self, status: str, summary: str, run_start_time: datetime.datetime, task: str):
-        run_end_time = datetime.datetime.now(run_start_time.tzinfo)
-        duration = run_end_time - run_start_time
-
-        summary_data = {
-            "run_start_time": run_start_time.isoformat(),
-            "run_end_time": run_end_time.isoformat(),
-            "duration_seconds": round(duration.total_seconds(), 2),
-            "task_description": task,
-            "final_status": status,
-            "total_steps": self.step_count,
-            "summary_text": summary,
-            "token_usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}, # Placeholder
-        }
+            print(f"Error synchronously writing to {self.trace_path} at step {self.step_count}: {e}")
         
-        summary_path = os.path.join(self.run_dir, "summary.json")
-        with open(summary_path, "w", encoding="utf-8") as f:
-            json.dump(summary_data, f, indent=2, ensure_ascii=False)
-        self.logger.info(f"任务运行总结已保存: {summary_path}")
+        # --- 保存每一步的详细文件 (这部分逻辑保持不变) ---
+        try:
+            # 1. layout.xml
+            xml_content = step_data["raw_obs_data"].get("xml", "")
+            if xml_content:
+                with open(os.path.join(step_dir, "layout.xml"), "w", encoding="utf-8") as f:
+                    f.write(xml_content)
 
-        trace_data = {"metadata": summary_data, "trace": self.full_trace}
-        trace_path = os.path.join(self.run_dir, "execution_trace.json")
-        with open(trace_path, "w", encoding="utf-8") as f:
-            json.dump(trace_data, f, indent=2, ensure_ascii=False)
-        self.logger.info(f"完整执行轨迹已保存: {trace_path}")
+            # 2. llm_dialogue.json
+            dialogue_data = {
+                "prompt": step_data["llm_prompt"],
+                "response": step_data["raw_llm_response"]
+            }
+            with open(os.path.join(step_dir, "llm_dialogue.json"), "w", encoding="utf-8") as f:
+                json.dump(dialogue_data, f, indent=4, ensure_ascii=False)
+
+            # 3. screenshot.png
+            if Image and step_data.get("compressed_screenshot_bytes"):
+                screenshot_bytes = step_data["compressed_screenshot_bytes"]
+                if screenshot_bytes:
+                    img = Image.open(io.BytesIO(screenshot_bytes))
+                    img.save(os.path.join(step_dir, "screenshot.png"))
+
+            # 4. simplified_layout.txt
+            simplified_layout = step_data["raw_obs_data"].get("simplified_elements_str", "")
+            with open(os.path.join(step_dir, "simplified_layout.txt"), "w", encoding="utf-8") as f:
+                f.write(simplified_layout)
+                 
+            # 5. step_details.json
+            details = {
+                "step_number": self.step_count,
+                "task": step_data["task"],
+                "thought": step_data["thought"],
+                "parsed_action": step_data["parsed_action"],
+                "action_success": step_data["action_success"],
+            }
+            with open(os.path.join(step_dir, "step_details.json"), "w", encoding="utf-8") as f:
+                json.dump(details, f, indent=4, ensure_ascii=False)
+
+        except Exception as e:
+            print(f"Error saving step artifacts for step {self.step_count}: {e}")
+
+    def finalize_run(self, status: str, summary: str, run_start_time: datetime, task: str, token_usage: Dict[str, int] = None):
+        end_time = datetime.datetime.now(datetime.timezone.utc)
+        duration = end_time - run_start_time
+
+        # --- 修改：execution_trace.json 已经是最新状态，这里的写入作为最终确认 ---
+        # 这一步也可以移除，但保留可以作为一种保障机制
+        try:
+            with open(self.trace_path, "w", encoding="utf-8") as f:
+                json.dump(self.trajectory_data, f, indent=4, ensure_ascii=False)
+        except Exception as e:
+            print(f"Error writing final execution_trace.json: {e}")
+
+        # --- 保存 summary.json (这部分逻辑保持不变) ---
+        if token_usage is None:
+            token_usage = {"prompt_tokens": 0, "completion_tokens": 0}
+             
+        total_tokens = token_usage.get("prompt_tokens", 0) + token_usage.get("completion_tokens", 0)
+         
+        summary_data = {
+            "task": task,
+            "status": status,
+            "summary": summary,
+            "start_time_utc": run_start_time.isoformat(),
+            "end_time_utc": end_time.isoformat(),
+            "duration_seconds": duration.total_seconds(),
+            "step_count": self.step_count,
+            "token_usage": {
+                "prompt_tokens": token_usage.get("prompt_tokens", 0),
+                "completion_tokens": token_usage.get("completion_tokens", 0),
+                "total_tokens": total_tokens
+            }
+        }
+        summary_path = os.path.join(self.log_dir, "summary.json")
+        try:
+            with open(summary_path, "w", encoding="utf-8") as f:
+                json.dump(summary_data, f, indent=4, ensure_ascii=False)
+        except Exception as e:
+            print(f"Error writing summary.json: {e}")
