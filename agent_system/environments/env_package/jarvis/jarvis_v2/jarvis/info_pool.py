@@ -21,6 +21,12 @@ class InfoPoolManager:
         # 新增：用于存储整个运行过程的轨迹列表
         self.full_trace = []
         self.step_count = 0
+        
+        # --- 新增: 初始化Token累加器 ---
+        self.total_prompt_tokens = 0
+        self.total_completion_tokens = 0
+        self.total_tokens = 0
+        # --------------------------------
 
         self.logger.info(f"信息池已关联到目录: {self.run_dir}")
 
@@ -42,6 +48,13 @@ class InfoPoolManager:
             self.logger.error(f"为步骤 {self.step_count} 创建目录失败: {e}")
             return  # 如果目录创建失败，则不继续
 
+        # --- 新增: 累加Token使用量 ---
+        if "token_usage" in step_data and isinstance(step_data["token_usage"], dict):
+            self.total_prompt_tokens += step_data["token_usage"].get("prompt_tokens", 0)
+            self.total_completion_tokens += step_data["token_usage"].get("completion_tokens", 0)
+            self.total_tokens += step_data["token_usage"].get("total_tokens", 0)
+        # -----------------------------
+
         # 创建一个数据的深拷贝，用于追加到完整轨迹，避免后续修改影响
         trace_step_data = copy.deepcopy(step_data)
 
@@ -53,6 +66,7 @@ class InfoPoolManager:
             with open(screenshot_path, "wb") as f:
                 f.write(step_data["screenshot_bytes"])
             # 更新JSON中的路径为相对路径
+            if "observation" not in trace_step_data: trace_step_data["observation"] = {}
             trace_step_data["observation"]["screenshot_path"] = os.path.join(
                 step_folder_name, "screenshot.png"
             )
@@ -62,18 +76,20 @@ class InfoPoolManager:
             xml_path = os.path.join(step_dir, "layout.xml")
             with open(xml_path, "w", encoding="utf-8") as f:
                 f.write(step_data["xml_content"])
+            if "observation" not in trace_step_data: trace_step_data["observation"] = {}
             trace_step_data["observation"]["xml_path"] = os.path.join(
                 step_folder_name, "layout.xml"
             )
 
         # 新增：保存简化后的UI布局
         if (
-            "simplified_elements_str" in step_data["observation"]
+            "observation" in step_data and "simplified_elements_str" in step_data["observation"]
             and step_data["observation"]["simplified_elements_str"]
         ):
             simplified_path = os.path.join(step_dir, "simplified_layout.txt")
             with open(simplified_path, "w", encoding="utf-8") as f:
                 f.write(step_data["observation"]["simplified_elements_str"])
+            if "observation" not in trace_step_data: trace_step_data["observation"] = {}
             trace_step_data["observation"]["simplified_layout_path"] = os.path.join(
                 step_folder_name, "simplified_layout.txt"
             )
@@ -91,27 +107,34 @@ class InfoPoolManager:
                 step_folder_name, "llm_dialogue.json"
             )
 
-        # --- 清理原始数据，准备写入JSON ---
-        step_data.pop("screenshot_bytes", None)
-        step_data.pop("xml_content", None)
-        step_data.pop("llm_prompt", None)  # 从JSON中移除，因为它已经存为文件
-        step_data.pop("raw_llm_response", None)  # 从JSON中移除
+        # --- 修正与调试: 先准备好要写入JSON的数据，再进行清理 ---
+        # 1. 创建一个专门用于写入 step_details.json 的副本
+        json_data_to_save = copy.deepcopy(step_data)
 
+        # 2. 从这个副本中移除大文件内容
+        json_data_to_save.pop("screenshot_bytes", None)
+        json_data_to_save.pop("xml_content", None)
+        json_data_to_save.pop("llm_prompt", None)
+        json_data_to_save.pop("raw_llm_response", None)
+        
+        # 3. (关键调试步骤) 在写入前打印最终内容
+        print(f"--- [info_pool.py] 准备写入 step_details.json 的内容 (Step {self.step_count}):\n{json.dumps(json_data_to_save, indent=2, ensure_ascii=False)}\n---")
+
+        # 4. 保存该步骤的详细JSON
+        step_details_path = os.path.join(step_dir, "step_details.json")
+        try:
+            with open(step_details_path, "w", encoding="utf-8") as f:
+                json.dump(json_data_to_save, f, indent=2, ensure_ascii=False)
+            self.logger.info(f"步骤 {self.step_count} 详情已保存至 {step_details_path}")
+        except Exception as e:
+            self.logger.error(f"保存步骤 {self.step_count} JSON数据失败: {e}")
+        # -------------------------------------------------------------
+
+        # --- 准备用于完整轨迹（trace）的数据 ---
         trace_step_data.pop("screenshot_bytes", None)
         trace_step_data.pop("xml_content", None)
         trace_step_data.pop("llm_prompt", None)
         trace_step_data.pop("raw_llm_response", None)
-
-        # 保存该步骤的详细JSON
-        step_details_path = os.path.join(step_dir, "step_details.json")
-        try:
-            with open(step_details_path, "w", encoding="utf-8") as f:
-                json.dump(step_data, f, indent=2, ensure_ascii=False)
-            self.logger.info(f"步骤 {self.step_count} 详情已保存至 {step_details_path}")
-        except Exception as e:
-            self.logger.error(f"保存步骤 {self.step_count} JSON数据失败: {e}")
-
-        # --- 将本步骤信息追加到完整轨迹中 ---
         self.full_trace.append(trace_step_data)
 
     def finalize_run(
@@ -120,7 +143,6 @@ class InfoPoolManager:
         summary: str,
         run_start_time: datetime.datetime,  # 这个是带时区的时间
         task: str,
-        token_usage: dict = None,  # 新增: 接收token使用情况
     ):
         """
         在任务结束时写入总结文件和完整的执行轨迹文件。
@@ -129,7 +151,7 @@ class InfoPoolManager:
         # 使用 run_start_time 的时区信息来获取当前的结束时间，从而确保两者都是 offset-aware
         run_end_time = datetime.datetime.now(run_start_time.tzinfo)
         duration = run_end_time - run_start_time
-
+        
         # 1. 写入包含最终状态和摘要的 summary.json 文件
         summary_data = {
             "run_start_time": run_start_time.isoformat(),
@@ -139,13 +161,13 @@ class InfoPoolManager:
             "final_status": status,
             "total_steps": self.step_count,
             "summary_text": summary,
-            # 新增: 将token使用情况添加到总结中
-            "token_usage": token_usage
-            or {
-                "prompt_tokens": 0,
-                "completion_tokens": 0,
-                "total_tokens": 0,
+            # --- 修改: 使用内部累加的Token数据 ---
+            "token_usage": {
+                "prompt_tokens": self.total_prompt_tokens,
+                "completion_tokens": self.total_completion_tokens,
+                "total_tokens": self.total_tokens,
             },
+            # ------------------------------------
         }
         summary_path = os.path.join(self.run_dir, "summary.json")
         try:

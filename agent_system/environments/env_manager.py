@@ -545,12 +545,26 @@ class JarvisEnvironmentManager(EnvironmentManagerBase):
         self.last_prompts: List[str] = [""] * self.num_envs
         # active_batch_size 将由 set_tasks 动态设置
         self.active_batch_size = 0
+        # ======================= ✅ 添加用于暂存 Token 和置信度信息的变量 ✅ =======================
+        self.last_token_usage: List[dict] = None
+        self.last_confidence: List[dict] = None
+        # ===================================================================================
 
     def set_tasks(self, tasks: List[str]):
         """仅更新任务列表和当前活动的批次大小。"""
         self.tasks = tasks
         self.active_batch_size = len(tasks)
         print(f"--- [env_manager.py] 接收到 {self.active_batch_size} 个任务 ---")
+
+    # ======================= ✅ 添加用于接收和暂存数据的新方法 ✅ =======================
+    def set_last_step_token_usage(self, token_usage_list: List[dict]):
+        """从外部（rollout_loop）接收并暂存当前步骤的 token 使用情况。"""
+        self.last_token_usage = token_usage_list
+
+    def set_last_step_confidence(self, confidence_list: List[dict]):
+        """从外部（rollout_loop）接收并暂存当前步骤的置信度信息。"""
+        self.last_confidence = confidence_list
+    # ================================================================================
 
     def _initialize_loggers_for_new_run(self):
         """为当前批次的所有环境初始化或重置日志记录器。"""
@@ -598,6 +612,16 @@ class JarvisEnvironmentManager(EnvironmentManagerBase):
                     "llm_prompt": self.last_prompts[i],
                     "raw_llm_response": text_actions[i]
                 }
+                
+                # --- 注入 Token 信息 ---
+                if self.last_token_usage and i < len(self.last_token_usage):
+                    step_data["token_usage"] = self.last_token_usage[i]
+                
+                # ======================= ✅ 在这里读取并注入置信度信息 ✅ =======================
+                if self.last_confidence and i < len(self.last_confidence):
+                    step_data["confidence_metrics"] = self.last_confidence[i]
+                # =========================================================================
+
                 self.info_pool_managers[i].record_step(step_data)
 
                 if dones[i]:

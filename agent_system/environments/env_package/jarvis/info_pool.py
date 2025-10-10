@@ -1,4 +1,4 @@
-# agent_system/environments/env_package/jarvis/info_pool.py
+# agent_system/environments/env_package/jarvis/jarvis_v2/jarvis/info_pool.py
 
 import os
 import json
@@ -24,10 +24,27 @@ class InfoPoolManager:
         with open(self.trace_path, "w", encoding="utf-8") as f:
             json.dump([], f)
 
+        # ======================= ✅ 新增: 初始化 Token 和置信度累加器 ✅ =======================
+        self.total_prompt_tokens = 0
+        self.total_completion_tokens = 0
+        self.total_tokens = 0
+        self.step_confidences: List[float] = []
+        # =================================================================================
+
     def record_step(self, step_data: Dict[str, Any]):
         self.step_count += 1
         step_dir = os.path.join(self.log_dir, f"step_{self.step_count}")
         os.makedirs(step_dir, exist_ok=True)
+
+        # ======================= ✅ 新增: 累加 Token 和置信度 ✅ =======================
+        if "token_usage" in step_data and isinstance(step_data.get("token_usage"), dict):
+            self.total_prompt_tokens += step_data["token_usage"].get("prompt_tokens", 0)
+            self.total_completion_tokens += step_data["token_usage"].get("completion_tokens", 0)
+            self.total_tokens += step_data["token_usage"].get("total_tokens", 0)
+        
+        if "confidence_metrics" in step_data and isinstance(step_data.get("confidence_metrics"), dict):
+            self.step_confidences.append(step_data["confidence_metrics"].get("average_confidence", 0.0))
+        # =========================================================================
 
         # 准备要记录的步骤数据
         current_step_record = {
@@ -83,13 +100,19 @@ class InfoPoolManager:
                 "parsed_action": step_data["parsed_action"],
                 "action_success": step_data["action_success"],
             }
+            # --- 将 Token 和置信度信息加入 details 字典 ---
+            if "token_usage" in step_data:
+                details["token_usage"] = step_data["token_usage"]
+            if "confidence_metrics" in step_data:
+                details["confidence_metrics"] = step_data["confidence_metrics"]
+            # -----------------------------------------------
             with open(os.path.join(step_dir, "step_details.json"), "w", encoding="utf-8") as f:
                 json.dump(details, f, indent=4, ensure_ascii=False)
 
         except Exception as e:
             print(f"Error saving step artifacts for step {self.step_count}: {e}")
 
-    def finalize_run(self, status: str, summary: str, run_start_time: datetime, task: str, token_usage: Dict[str, int] = None):
+    def finalize_run(self, status: str, summary: str, run_start_time: datetime, task: str):
         end_time = datetime.datetime.now(datetime.timezone.utc)
         duration = end_time - run_start_time
 
@@ -102,11 +125,6 @@ class InfoPoolManager:
             print(f"Error writing final execution_trace.json: {e}")
 
         # --- 保存 summary.json (这部分逻辑保持不变) ---
-        if token_usage is None:
-            token_usage = {"prompt_tokens": 0, "completion_tokens": 0}
-             
-        total_tokens = token_usage.get("prompt_tokens", 0) + token_usage.get("completion_tokens", 0)
-         
         summary_data = {
             "task": task,
             "status": status,
@@ -115,11 +133,17 @@ class InfoPoolManager:
             "end_time_utc": end_time.isoformat(),
             "duration_seconds": duration.total_seconds(),
             "step_count": self.step_count,
+            # ======================= ✅ 使用内部累加的 Token 和置信度数据 ✅ =======================
             "token_usage": {
-                "prompt_tokens": token_usage.get("prompt_tokens", 0),
-                "completion_tokens": token_usage.get("completion_tokens", 0),
-                "total_tokens": total_tokens
+                "prompt_tokens": self.total_prompt_tokens,
+                "completion_tokens": self.total_completion_tokens,
+                "total_tokens": self.total_tokens
+            },
+            "confidence_metrics": {
+                "average_confidence_over_trajectory": 
+                    (sum(self.step_confidences) / len(self.step_confidences)) if self.step_confidences else 0.0
             }
+            # ===============================================================================
         }
         summary_path = os.path.join(self.log_dir, "summary.json")
         try:

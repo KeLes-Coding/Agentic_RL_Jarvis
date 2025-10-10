@@ -156,6 +156,8 @@ class TaskRunner:
         train_dataset = create_rl_dataset(config.data.train_files, config.data, tokenizer, processor)
         val_dataset = create_rl_dataset(config.data.val_files, config.data, tokenizer, processor)
         train_sampler = create_rl_sampler(config.data, train_dataset)
+        # ======================= 添加探针 #1 =======================
+        print("\n================> 1. 即将创建 RayPPOTrainer 实例...")
         trainer = RayPPOTrainer(
             config=config,
             tokenizer=tokenizer,
@@ -174,8 +176,22 @@ class TaskRunner:
             envs=envs,
             val_envs=val_envs,
         )
+        # ======================= 添加探针 #2 =======================
+        print("================> 2. RayPPOTrainer 实例创建成功.\n")
+
+
+        # ======================= 添加探针 #3 =======================
+        print("================> 3. 即将初始化 Workers (init_workers)...")
         trainer.init_workers()
+        # ======================= 添加探针 #4 =======================
+        print("================> 4. Workers 初始化成功.\n")
+
+
+        # ======================= 添加探针 #5 =======================
+        print("================> 5. 即将调用 trainer.fit() 开始训练...")
         trainer.fit()
+        # ======================= 添加探针 #6 =======================
+        print("================> 6. trainer.fit() 执行完毕.\n")
 
 
 def create_rl_dataset(data_paths, data_config, tokenizer, processor):

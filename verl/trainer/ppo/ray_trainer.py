@@ -1033,6 +1033,10 @@ class RayPPOTrainer:
 
         from verl.utils.tracking import Tracking
 
+        # ======================= 添加这行终极调试代码 =======================
+        print("!!!!!!!!!! 🚀 FIT METHOD HAS BEEN CALLED! 🚀 !!!!!!!!!!")
+        # ====================================================================
+
         logger = Tracking(
             project_name=self.config.trainer.project_name,
             experiment_name=self.config.trainer.experiment_name,
@@ -1300,6 +1304,49 @@ class RayPPOTrainer:
                         "training/epoch": epoch,
                     }
                 )
+
+                # ======================= BEGIN DEBUG PRINT =======================
+                print("\n--- 🧐 正在调试Token数量 ---")
+                try:
+                    # 使用 progress_bar.write() 可以安全地在 tqdm 进度条运行时打印信息
+                    progress_bar.write("\n" + "="*80)
+                    progress_bar.write("--- 🧐 正在调试Token数量 (Driver 进程) ---")
+
+                    # 检查 'response_mask' 是否存在，如果不存在，则先计算它
+                    if "response_mask" not in batch.batch:
+                        progress_bar.write("  - 'response_mask' 不存在，正在手动计算...")
+                        batch.batch["response_mask"] = compute_response_mask(batch)
+
+                    attention_mask = batch.batch["attention_mask"]
+                    response_mask = batch.batch["response_mask"]
+
+                    progress_bar.write(f"  - Batch中的可用键值: {list(batch.batch.keys())}")
+                    progress_bar.write(f"  - Attention Mask 的形状: {attention_mask.shape}")
+                    progress_bar.write(f"  - Response Mask 的形状: {response_mask.shape}")
+
+                    # 计算 prompt 和 response 的长度
+                    prompt_lengths = torch.sum(attention_mask, dim=-1) - torch.sum(response_mask, dim=-1)
+                    response_lengths = torch.sum(response_mask, dim=-1)
+
+                    # 计算并打印整个 batch 的 token 总数
+                    total_prompt_tokens = torch.sum(prompt_lengths).item()
+                    total_response_tokens = torch.sum(response_lengths).item()
+                    total_tokens = total_prompt_tokens + total_response_tokens
+
+                    progress_bar.write(f"\n  [结果] 📊")
+                    progress_bar.write(f"    - 输入 (Prompt) Token 总数: {total_prompt_tokens}")
+                    progress_bar.write(f"    - 输出 (Response) Token 总数: {total_response_tokens}")
+                    progress_bar.write(f"    - 总 Token 数量: {total_tokens}")
+                    progress_bar.write("--- ✅ 调试结束 ---")
+                    progress_bar.write("="*80 + "\n")
+
+                except Exception as e:
+                    import traceback
+                    progress_bar.write(f"\n!!!!!! 调试代码块发生严重错误: {e} !!!!!!\n")
+                    progress_bar.write(traceback.format_exc())
+                print("--- ✅ 调试结束 ---\n")
+                # ======================== END DEBUG PRINT ========================
+
                 # collect metrics
                 metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
                 metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))

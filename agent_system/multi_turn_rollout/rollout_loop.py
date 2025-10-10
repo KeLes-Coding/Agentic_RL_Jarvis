@@ -294,170 +294,221 @@ class TrajectoryCollector:
         return gen_batch_output
 
     def vanilla_multi_turn_loop(
-                self,
-                gen_batch: DataProto,
-                actor_rollout_wg,
-                envs: EnvironmentManagerBase,
-                ) -> DataProto:
-            """
-            为物理设备环境优化的轨迹收集循环。
-            """
-            obs, infos = envs.reset()
+            self,
+            gen_batch: DataProto,
+            actor_rollout_wg,
+            envs: EnvironmentManagerBase,
+            ) -> DataProto:
+        """
+        为物理设备环境优化的轨迹收集循环。
+        """
+        obs, infos = envs.reset()
 
-            lenght_obs = len(obs['text']) if obs['text'] is not None else len(obs['image'])
+        lenght_obs = len(obs['text']) if obs['text'] is not None else len(obs['image'])
 
-            # 对于物理环境，我们期望批次大小与环境数直接匹配。
-            # 不再使用 gen_batch.repeat()，因为它适用于可无限实例化的模拟环境。
-            assert len(gen_batch.batch) == lenght_obs, \
-                f"对于物理设备环境，初始数据批次大小 ({len(gen_batch.batch)}) 必须与检测到的设备数 ({lenght_obs}) 完全匹配。" \
-                "请检查你的 data.train_batch_size 和 data.val_batch_size 配置。"
+        # 对于物理环境，我们期望批次大小与环境数直接匹配。
+        # 不再使用 gen_batch.repeat()，因为它适用于可无限实例化的模拟环境。
+        assert len(gen_batch.batch) == lenght_obs, \
+            f"对于物理设备环境，初始数据批次大小 ({len(gen_batch.batch)}) 必须与检测到的设备数 ({lenght_obs}) 完全匹配。" \
+            "请检查你的 data.train_batch_size 和 data.val_batch_size 配置。"
 
-            try:
-                raw_prompts = gen_batch.non_tensor_batch['raw_prompt']
-                tasks_list = [item[0]['content'] for item in raw_prompts]
+        try:
+            raw_prompts = gen_batch.non_tensor_batch['raw_prompt']
+            tasks_list = [item[0]['content'] for item in raw_prompts]
 
-                if hasattr(envs, 'set_tasks') and hasattr(envs, '_initialize_loggers_for_new_run'):
-                    envs.set_tasks(tasks_list)
-                    envs._initialize_loggers_for_new_run()
-                    obs['text'] = envs.build_text_obs(obs['text'], tasks_list, init=True)
-                else:
-                    print("警告: 当前 env_manager 不支持任务设置或日志初始化。")
-            except (KeyError, IndexError, TypeError) as e:
-                print(f"严重警告: 无法从 gen_batch 中解析任务列表。错误: {e}")
-
-            batch_size = len(gen_batch.batch['input_ids'])
-            batch_output = None
-
-            if self.config.env.rollout.n > 0:
-                uid_batch = []
-                for i in range(batch_size):
-                    if i % self.config.env.rollout.n == 0:
-                        uid = str(uuid.uuid4())
-                    uid_batch.append(uid)
-                uid_batch = np.array(uid_batch, dtype=object)
+            if hasattr(envs, 'set_tasks') and hasattr(envs, '_initialize_loggers_for_new_run'):
+                envs.set_tasks(tasks_list)
+                envs._initialize_loggers_for_new_run()
+                obs['text'] = envs.build_text_obs(obs['text'], tasks_list, init=True)
             else:
-                uid = str(uuid.uuid4())
-                uid_batch = np.array([uid for _ in range(len(gen_batch.batch))], dtype=object)
+                print("警告: 当前 env_manager 不支持任务设置或日志初始化。")
+        except (KeyError, IndexError, TypeError) as e:
+            print(f"严重警告: 无法从 gen_batch 中解析任务列表。错误: {e}")
 
-            is_done = np.zeros(batch_size, dtype=bool)
-            traj_uid = np.array([str(uuid.uuid4()) for _ in range(batch_size)], dtype=object)
-            total_batch_list = [[] for _ in range(batch_size)]
-            total_infos = [[] for _ in range(batch_size)]
-            episode_lengths = np.zeros(batch_size, dtype=np.int32)
-            episode_rewards = np.zeros(batch_size, dtype=np.float32)
+        batch_size = len(gen_batch.batch['input_ids'])
+        batch_output = None
 
-            # 记录 reset 这一步（作为 step 0）
-            if hasattr(envs, 'info_pool_managers'):
-                for i in range(len(infos)):
-                    if i in envs.info_pool_managers:
-                        step_data = {
-                            "task": envs.tasks[i],
-                            "thought": "Episode started.",
-                            "parsed_action": "reset()",
-                            "action_success": True,
-                            "raw_obs_data": infos[i].get("raw_obs_data", {}),
-                            "compressed_screenshot_bytes": infos[i].get("compressed_screenshot_bytes"),
-                            "llm_prompt": "N/A",
-                            "raw_llm_response": "N/A"
-                        }
-                        envs.info_pool_managers[i].record_step(step_data)
-
-            # Trajectory collection loop
-            for _step in range(self.config.env.max_steps):
-                active_masks = np.logical_not(is_done)
-
-                batch = self.preprocess_batch(gen_batch=gen_batch, obs=obs)
-
-                print("\n" + "="*50)
-                print(f"--- 监控: 即将输入到 LLM 的完整 Prompt (Batch Item 0) (Step {_step+1}) ---")
-                full_prompt_for_llm = self.tokenizer.decode(batch.batch['input_ids'][0], skip_special_tokens=False)
-                print(full_prompt_for_llm)
-                print("="*50 + "\n")
-
-                batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
-                non_tensor_batch_keys_to_pop = ["raw_prompt_ids"]
-                if "multi_modal_data" in batch.non_tensor_batch:
-                    non_tensor_batch_keys_to_pop.append("multi_modal_data")
-                if "raw_prompt" in batch.non_tensor_batch:
-                    non_tensor_batch_keys_to_pop.append("raw_prompt")
-                if "tools_kwargs" in batch.non_tensor_batch:
-                    non_tensor_batch_keys_to_pop.append("tools_kwargs")
-                batch_input = batch.pop(
-                    batch_keys=batch_keys_to_pop,
-                    non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
-                )
-
-                batch_input.meta_info = gen_batch.meta_info
-                batch_output = actor_rollout_wg.generate_sequences(batch_input)
-                batch.non_tensor_batch['uid'] = uid_batch
-                batch.non_tensor_batch['traj_uid'] = traj_uid
-                batch = batch.union(batch_output)
-
-                text_actions = self.tokenizer.batch_decode(batch.batch['responses'], skip_special_tokens=True)
-
-                print("\n" + "*"*50)
-                print(f"--- 监控: LLM 的完整回复 (Step {_step+1}) ---")
-                for i, response in enumerate(text_actions):
-                    print(f"  [环境 {i}]: {response}")
-                print("*"*50 + "\n")
-
-                next_obs, rewards, dones, infos = envs.step(text_actions)
-
-                if len(rewards.shape) == 2:
-                    rewards = rewards.squeeze(1)
-                if len(dones.shape) == 2:
-                    dones = dones.squeeze(1)
-
-                if 'is_action_valid' in infos[0]:
-                    batch.non_tensor_batch['is_action_valid'] = np.array([info['is_action_valid'] for info in infos], dtype=bool)
-                else:
-                    batch.non_tensor_batch['is_action_valid'] = np.ones(batch_size, dtype=bool)
-
-                episode_rewards += torch_to_numpy(rewards) * torch_to_numpy(active_masks)
-                episode_lengths[active_masks] += 1
-
-                assert len(rewards) == batch_size, f"env should return rewards for all environments, got {len(rewards)} rewards for {batch_size} environments"
-                batch.non_tensor_batch['rewards'] = torch_to_numpy(rewards, is_object=True)
-                batch.non_tensor_batch['active_masks'] = torch_to_numpy(active_masks, is_object=True)
-
-                batch_list: list[dict] = to_list_of_dict(batch)
-                for i in range(batch_size):
-                    total_batch_list[i].append(batch_list[i])
-                    total_infos[i].append(infos[i])
-
-                is_done = np.logical_or(is_done, dones)
-                obs = next_obs
-                if is_done.all():
-                    break
-
-            # ========================= 新增代码段 [开始] =========================
-            # 确保因超时而结束的轨迹也被正确终结
+        if self.config.env.rollout.n > 0:
+            uid_batch = []
             for i in range(batch_size):
-                # 如果环境没有被标记为 'done'，说明它是因达到 max_steps 而超时的
-                if not is_done[i] and hasattr(envs, 'info_pool_managers') and i in envs.info_pool_managers:
-                    print(f"--- [rollout_loop.py] 正在为超时的环境 {i} 强制终结日志 ---")
-                    final_status = "TIMEOUT"
-                    summary_text = f"Task stopped due to reaching max steps ({self.config.env.max_steps})."
+                if i % self.config.env.rollout.n == 0:
+                    uid = str(uuid.uuid4())
+                uid_batch.append(uid)
+            uid_batch = np.array(uid_batch, dtype=object)
+        else:
+            uid = str(uuid.uuid4())
+            uid_batch = np.array([uid for _ in range(len(gen_batch.batch))], dtype=object)
 
-                    # 检查 info_pool_managers[i] 是否仍然存在，因为可能在之前的步骤中已被移除
-                    if i in envs.info_pool_managers:
-                        envs.info_pool_managers[i].finalize_run(
-                            status=final_status,
-                            summary=summary_text,
-                            run_start_time=envs.run_start_times[i],
-                            task=envs.tasks[i]
-                        )
-                        # 终结后从池中移除
-                        envs.info_pool_managers.pop(i, None)
-            # ========================= 新增代码段 [结束] =========================
+        is_done = np.zeros(batch_size, dtype=bool)
+        traj_uid = np.array([str(uuid.uuid4()) for _ in range(batch_size)], dtype=object)
+        total_batch_list = [[] for _ in range(batch_size)]
+        total_infos = [[] for _ in range(batch_size)]
+        episode_lengths = np.zeros(batch_size, dtype=np.int32)
+        episode_rewards = np.zeros(batch_size, dtype=np.float32)
 
-            success: Dict[str, np.ndarray] = envs.success_evaluator(
-                total_infos=total_infos,
-                total_batch_list=total_batch_list,
-                episode_rewards=episode_rewards,
-                episode_lengths=episode_lengths,
+        # 记录 reset 这一步（作为 step 0）
+        if hasattr(envs, 'info_pool_managers'):
+            for i in range(len(infos)):
+                if i in envs.info_pool_managers:
+                    step_data = {
+                        "task": envs.tasks[i],
+                        "thought": "Episode started.",
+                        "parsed_action": "reset()",
+                        "action_success": True,
+                        "raw_obs_data": infos[i].get("raw_obs_data", {}),
+                        "compressed_screenshot_bytes": infos[i].get("compressed_screenshot_bytes"),
+                        "llm_prompt": "N/A",
+                        "raw_llm_response": "N/A"
+                    }
+                    envs.info_pool_managers[i].record_step(step_data)
+
+        # Trajectory collection loop
+        for _step in range(self.config.env.max_steps):
+            active_masks = np.logical_not(is_done)
+
+            batch = self.preprocess_batch(gen_batch=gen_batch, obs=obs)
+
+            print("\n" + "="*50)
+            print(f"--- 监控: 即将输入到 LLM 的完整 Prompt (Batch Item 0) (Step {_step+1}) ---")
+            full_prompt_for_llm = self.tokenizer.decode(batch.batch['input_ids'][0], skip_special_tokens=False)
+            print(full_prompt_for_llm)
+            print("="*50 + "\n")
+
+            batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
+            non_tensor_batch_keys_to_pop = ["raw_prompt_ids"]
+            if "multi_modal_data" in batch.non_tensor_batch:
+                non_tensor_batch_keys_to_pop.append("multi_modal_data")
+            if "raw_prompt" in batch.non_tensor_batch:
+                non_tensor_batch_keys_to_pop.append("raw_prompt")
+            if "tools_kwargs" in batch.non_tensor_batch:
+                non_tensor_batch_keys_to_pop.append("tools_kwargs")
+            batch_input = batch.pop(
+                batch_keys=batch_keys_to_pop,
+                non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
             )
-            return total_batch_list, episode_rewards, episode_lengths, success, traj_uid
+
+            batch_input.meta_info = gen_batch.meta_info
+            batch_output = actor_rollout_wg.generate_sequences(batch_input)
+            batch.non_tensor_batch['uid'] = uid_batch
+            batch.non_tensor_batch['traj_uid'] = traj_uid
+            batch = batch.union(batch_output)
+
+            text_actions = self.tokenizer.batch_decode(batch.batch['responses'], skip_special_tokens=True)
+
+            print("\n" + "*"*50)
+            print(f"--- 监控: LLM 的完整回复 (Step {_step+1}) ---")
+            for i, response in enumerate(text_actions):
+                print(f"  [环境 {i}]: {response}")
+            print("*"*50 + "\n")
+
+            # ======================= ✅ 计算并暂存 Token 和置信度信息 ✅ =======================
+            try:
+                # 1. 计算 Token
+                input_token_counts = torch.sum(batch_input.batch["attention_mask"], dim=1)
+                full_token_counts = torch.sum(batch.batch["attention_mask"], dim=1)
+                output_token_counts = full_token_counts - input_token_counts
+
+                # 2. 计算置信度
+                log_probs = batch.batch['rollout_log_probs']
+                # 注意：这里的 mask 需要精确对应 `log_probs` 张量的形状
+                response_mask = batch.batch["attention_mask"][:, -log_probs.shape[1]:]
+                
+                # 屏蔽掉 padding token 的 log_probs
+                masked_log_probs = log_probs * response_mask
+                # 对每个样本的有效 log_probs 求和
+                sum_of_log_probs = torch.sum(masked_log_probs, dim=1)
+                # 计算每个样本的有效 token 数量
+                num_of_tokens = torch.sum(response_mask, dim=1)
+                # 避免除以零
+                num_of_tokens[num_of_tokens == 0] = 1
+                # 计算平均对数概率
+                average_log_probs = sum_of_log_probs / num_of_tokens
+                # 转换为平均概率（置信度）
+                average_confidence = torch.exp(average_log_probs)
+
+                # 3. 准备传递给 env_manager 的数据
+                token_usage_list = []
+                confidence_metrics_list = []
+                for i in range(batch_size):
+                    token_usage_list.append({
+                        "prompt_tokens": input_token_counts[i].item(),
+                        "completion_tokens": output_token_counts[i].item(),
+                        "total_tokens": full_token_counts[i].item(),
+                    })
+                    confidence_metrics_list.append({
+                        "average_log_probability": average_log_probs[i].item(),
+                        "average_confidence": average_confidence[i].item(),
+                    })
+                
+                # 4. 暂存数据
+                if hasattr(envs, "set_last_step_token_usage"):
+                    envs.set_last_step_token_usage(token_usage_list)
+                if hasattr(envs, "set_last_step_confidence"):
+                    envs.set_last_step_confidence(confidence_metrics_list)
+
+            except Exception as e:
+                import traceback
+                print(f"!!!!!! [Rollout Step: {_step+1}] 计算 Token 和置信度时出错: {e} !!!!!!")
+                print(traceback.format_exc())
+            # ==============================================================================
+
+            next_obs, rewards, dones, infos = envs.step(text_actions)
+
+            if len(rewards.shape) == 2:
+                rewards = rewards.squeeze(1)
+            if len(dones.shape) == 2:
+                dones = dones.squeeze(1)
+
+            if 'is_action_valid' in infos[0]:
+                batch.non_tensor_batch['is_action_valid'] = np.array([info['is_action_valid'] for info in infos], dtype=bool)
+            else:
+                batch.non_tensor_batch['is_action_valid'] = np.ones(batch_size, dtype=bool)
+
+            episode_rewards += torch_to_numpy(rewards) * torch_to_numpy(active_masks)
+            episode_lengths[active_masks] += 1
+
+            assert len(rewards) == batch_size, f"env should return rewards for all environments, got {len(rewards)} rewards for {batch_size} environments"
+            batch.non_tensor_batch['rewards'] = torch_to_numpy(rewards, is_object=True)
+            batch.non_tensor_batch['active_masks'] = torch_to_numpy(active_masks, is_object=True)
+
+            batch_list: list[dict] = to_list_of_dict(batch)
+            for i in range(batch_size):
+                total_batch_list[i].append(batch_list[i])
+                total_infos[i].append(infos[i])
+
+            is_done = np.logical_or(is_done, dones)
+            obs = next_obs
+            if is_done.all():
+                break
+
+        # ========================= 新增代码段 [开始] =========================
+        # 确保因超时而结束的轨迹也被正确终结
+        for i in range(batch_size):
+            # 如果环境没有被标记为 'done'，说明它是因达到 max_steps 而超时的
+            if not is_done[i] and hasattr(envs, 'info_pool_managers') and i in envs.info_pool_managers:
+                print(f"--- [rollout_loop.py] 正在为超时的环境 {i} 强制终结日志 ---")
+                final_status = "TIMEOUT"
+                summary_text = f"Task stopped due to reaching max steps ({self.config.env.max_steps})."
+
+                # 检查 info_pool_managers[i] 是否仍然存在，因为可能在之前的步骤中已被移除
+                if i in envs.info_pool_managers:
+                    envs.info_pool_managers[i].finalize_run(
+                        status=final_status,
+                        summary=summary_text,
+                        run_start_time=envs.run_start_times[i],
+                        task=envs.tasks[i]
+                    )
+                    # 终结后从池中移除
+                    envs.info_pool_managers.pop(i, None)
+        # ========================= 新增代码段 [结束] =========================
+
+        success: Dict[str, np.ndarray] = envs.success_evaluator(
+            total_infos=total_infos,
+            total_batch_list=total_batch_list,
+            episode_rewards=episode_rewards,
+            episode_lengths=episode_lengths,
+        )
+        return total_batch_list, episode_rewards, episode_lengths, success, traj_uid
     
     def dynamic_multi_turn_loop(
             self,
