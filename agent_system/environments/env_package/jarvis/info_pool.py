@@ -5,11 +5,46 @@ import json
 import datetime
 import io
 from typing import List, Dict, Any
+import yaml
+import openai
 
 try:
     from PIL import Image
 except ImportError:
     Image = None
+
+def _evaluate_with_llm(summary: str, ground_truth: str, llm_config: Dict[str, Any]) -> bool:
+    """
+    使用外部LLM评估任务摘要与参考答案。
+    """
+    try:
+        client = openai.OpenAI(
+            api_key=llm_config['key'],
+            base_url=llm_config['url'],
+        )
+
+        prompt = f"""
+请根据提供的参考答案，评估以下任务摘要是否成功地完成了最初的提示。
+仅回答 "True" 或 "False"。
+
+提示的参考答案: {ground_truth}
+任务摘要: {summary}
+"""
+
+        response = client.chat.completions.create(
+            model=llm_config['model'],
+            messages=[
+                {"role": "system", "content": "你是一个评估任务完成情况的助手。"},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0,
+        )
+        content = response.choices[0].message.content.strip()
+        return content.lower() == 'true'
+    except Exception as e:
+        print(f"LLM评估期间出错: {e}")
+        return False
+
 
 class InfoPoolManager:
     def __init__(self, log_dir: str):
@@ -91,7 +126,7 @@ class InfoPoolManager:
             simplified_layout = step_data["raw_obs_data"].get("simplified_elements_str", "")
             with open(os.path.join(step_dir, "simplified_layout.txt"), "w", encoding="utf-8") as f:
                 f.write(simplified_layout)
-                 
+                
             # 5. step_details.json
             details = {
                 "step_number": self.step_count,
@@ -112,9 +147,14 @@ class InfoPoolManager:
         except Exception as e:
             print(f"Error saving step artifacts for step {self.step_count}: {e}")
 
-    def finalize_run(self, status: str, summary: str, run_start_time: datetime, task: str):
+    def finalize_run(self, status: str, summary: str, run_start_time: datetime, task: str, ground_truth_answer: str = None, llm_config: Dict[str, Any] = None):
         end_time = datetime.datetime.now(datetime.timezone.utc)
         duration = end_time - run_start_time
+
+        task_completed = False
+        if status == "SUCCESS" and ground_truth_answer and llm_config:
+            task_completed = _evaluate_with_llm(summary, ground_truth_answer, llm_config)
+        # 对于 TIMEOUT 或其他失败, task_completed 保持 False
 
         # --- 修改：execution_trace.json 已经是最新状态，这里的写入作为最终确认 ---
         # 这一步也可以移除，但保留可以作为一种保障机制
@@ -129,6 +169,7 @@ class InfoPoolManager:
             "task": task,
             "status": status,
             "summary": summary,
+            "task_completed": task_completed,
             "start_time_utc": run_start_time.isoformat(),
             "end_time_utc": end_time.isoformat(),
             "duration_seconds": duration.total_seconds(),

@@ -137,3 +137,5 @@ swanlog/
 flash-attention/
 trajectory_logs/
 
+quick_test.py
+

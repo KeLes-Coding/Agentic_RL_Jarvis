@@ -67,6 +67,11 @@ class TrajectoryCollector:
         raw_prompt = gen_batch.non_tensor_batch['raw_prompt'][item]
         data_source = gen_batch.non_tensor_batch['data_source'][item]
         
+        # --- 新增: 提取 ground_truth_answer ---
+        # 使用 .get() 来安全地获取，如果键不存在，则提供一个默认值
+        ground_truth_answer = gen_batch.non_tensor_batch.get('ground_truth_answer', [""]*len(gen_batch.non_tensor_batch['raw_prompt']))[item]
+
+        
         # Get observation components
         obs_texts = obs.get('text', None)
         obs_images = obs.get('image', None)
@@ -135,11 +140,11 @@ class TrajectoryCollector:
             raw_prompt = prompt_with_chat_template
         
         input_ids, attention_mask = verl_F.tokenize_and_postprocess_data(prompt=prompt_with_chat_template,
-                                                                            tokenizer=self.tokenizer,
-                                                                            max_length=self.config.data.max_prompt_length,
-                                                                            pad_token_id=self.tokenizer.pad_token_id,
-                                                                            left_pad=True,
-                                                                            truncation=self.config.data.truncation,)
+                                                                         tokenizer=self.tokenizer,
+                                                                         max_length=self.config.data.max_prompt_length,
+                                                                         pad_token_id=self.tokenizer.pad_token_id,
+                                                                         left_pad=True,
+                                                                         truncation=self.config.data.truncation,)
         
         
 
@@ -175,7 +180,9 @@ class TrajectoryCollector:
             'raw_prompt_ids': raw_prompt_ids,
             'anchor_obs': _obs_anchor,
             'index': item,
-            'data_source': data_source
+            'data_source': data_source,
+            # --- 新增: 将 ground_truth_answer 添加到样本字典中 ---
+            'ground_truth_answer': ground_truth_answer,
         })
 
         if self.config.data.get('return_raw_chat', False):
@@ -286,7 +293,7 @@ class TrajectoryCollector:
                         data[key] = value
 
                     effective_batch.append(data)
-            
+                
         # Convert trajectory data to DataProto format
         gen_batch_output = DataProto.from_single_dict(
             data=collate_fn(effective_batch)
@@ -304,6 +311,27 @@ class TrajectoryCollector:
         """
         obs, infos = envs.reset()
 
+        # --- 新增：在这里打印 gen_batch.non_tensor_batch 的所有键 ---
+        print("\n" + "#"*80)
+        print("--- [rollout_loop.py] 检查 gen_batch.non_tensor_batch 中的可用键 ---")
+        if hasattr(gen_batch, 'non_tensor_batch') and gen_batch.non_tensor_batch is not None:
+            print(f"可用的键: {list(gen_batch.non_tensor_batch.keys())}")
+            # --- 新增：为了调试，打印每个键对应的值的类型和形状/长度 ---
+            for key, value in gen_batch.non_tensor_batch.items():
+                if isinstance(value, np.ndarray):
+                    print(f"  - 键 '{key}': 类型=numpy.ndarray, 形状={value.shape}")
+                elif isinstance(value, list):
+                    print(f"  - 键 '{key}': 类型=list, 长度={len(value)}")
+                    if len(value) > 0:
+                        print(f"    - 第一个元素的类型: {type(value[0])}")
+                else:
+                    print(f"  - 键 '{key}': 类型={type(value)}")
+
+        else:
+            print("gen_batch.non_tensor_batch 不存在或为空。")
+        print("#"*80 + "\n")
+
+
         lenght_obs = len(obs['text']) if obs['text'] is not None else len(obs['image'])
 
         # 对于物理环境，我们期望批次大小与环境数直接匹配。
@@ -314,16 +342,39 @@ class TrajectoryCollector:
 
         try:
             raw_prompts = gen_batch.non_tensor_batch['raw_prompt']
+            print("\n" + "-"*50)
+            print(gen_batch.non_tensor_batch.keys())
+            print(gen_batch.non_tensor_batch)
+            print(gen_batch.non_tensor_batch['raw_prompt'])
             tasks_list = [item[0]['content'] for item in raw_prompts]
+            
+            # --- 修改：从 gen_batch 中获取 ground_truth_answers ---
+            # 这里的 'ground_truth_answer' 键必须与数据加载时提供的一致
+            ground_truth_answers = gen_batch.non_tensor_batch['ground_truth_answer']
+
+
+            # --- 新增：打印任务和对应的 ground_truth_answer ---
+            print("--- [rollout_loop.py] 正在分发任务及其参考答案 ---")
+            for i, (task, answer) in enumerate(zip(tasks_list, ground_truth_answers)):
+                print(f"  [环境 {i}]")
+                print(f"    - 任务: {task}")
+                print(f"    - 参考答案: {answer}")
+            print("-------------------------------------------------")
+
 
             if hasattr(envs, 'set_tasks') and hasattr(envs, '_initialize_loggers_for_new_run'):
-                envs.set_tasks(tasks_list)
+                envs.set_tasks(tasks_list, ground_truth_answers)
                 envs._initialize_loggers_for_new_run()
                 obs['text'] = envs.build_text_obs(obs['text'], tasks_list, init=True)
             else:
                 print("警告: 当前 env_manager 不支持任务设置或日志初始化。")
-        except (KeyError, IndexError, TypeError) as e:
-            print(f"严重警告: 无法从 gen_batch 中解析任务列表。错误: {e}")
+        except KeyError as e:
+            print(f"严重警告: 无法从 gen_batch 中解析任务列表或参考答案。缺失的键: {e}")
+            print("请确保您的数据加载器 (Dataset/collate_fn) 正在将 'ground_truth_answer' 字段添加到批次中。")
+            # 在这里可以选择是抛出异常还是继续（如果可以的话）
+            raise e
+        except (IndexError, TypeError) as e:
+            print(f"严重警告: 解析任务列表时出错。错误: {e}")
 
         batch_size = len(gen_batch.batch['input_ids'])
         batch_output = None
@@ -496,7 +547,9 @@ class TrajectoryCollector:
                         status=final_status,
                         summary=summary_text,
                         run_start_time=envs.run_start_times[i],
-                        task=envs.tasks[i]
+                        task=envs.tasks[i],
+                        ground_truth_answer=envs.ground_truth_answers[i],
+                        llm_config=envs.llm_config
                     )
                     # 终结后从池中移除
                     envs.info_pool_managers.pop(i, None)

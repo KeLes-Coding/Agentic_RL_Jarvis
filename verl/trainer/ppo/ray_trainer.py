@@ -714,10 +714,11 @@ class RayPPOTrainer:
             sample_inputs.extend(input_texts)
 
             batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
-            batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
+            
+            # --- ✅ 关键修改：在这里添加 'ground_truth_answer' ---
             # 在 pop 之前，先检查 key 是否存在
             non_tensor_batch_keys_to_pop = [
-                key for key in ["raw_prompt_ids", "data_source", "multi_modal_data", "raw_prompt", "tools_kwargs"]
+                key for key in ["raw_prompt_ids", "data_source", "multi_modal_data", "raw_prompt", "tools_kwargs", "ground_truth_answer"]
                 if key in test_batch.non_tensor_batch
             ]
 
@@ -725,17 +726,6 @@ class RayPPOTrainer:
                 batch_keys=batch_keys_to_pop,
                 non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
             )
-            # non_tensor_batch_keys_to_pop = ["raw_prompt_ids", "data_source"]
-            # if "multi_modal_data" in test_batch.non_tensor_batch:
-            #     non_tensor_batch_keys_to_pop.append("multi_modal_data")
-            # if "raw_prompt" in test_batch.non_tensor_batch:
-            #     non_tensor_batch_keys_to_pop.append("raw_prompt")
-            # if "tools_kwargs" in test_batch.non_tensor_batch:
-            #     non_tensor_batch_keys_to_pop.append("tools_kwargs")
-            # test_gen_batch = test_batch.pop(
-            #     batch_keys=batch_keys_to_pop,
-            #     non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
-            # )
 
             test_gen_batch.meta_info = {
                 "eos_token_id": self.tokenizer.eos_token_id,
@@ -746,20 +736,7 @@ class RayPPOTrainer:
             }
             print(f"test_gen_batch meta info: {test_gen_batch.meta_info}")
 
-            # # pad to be divisible by dp_size
-            # test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, self.actor_rollout_wg.world_size)
-            # test_output_gen_batch_padded = self.actor_rollout_wg.generate_sequences(test_gen_batch_padded)
-
-            # # unpad
-            # test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
-
             ################ agent-environment loop ###############
-            # test_output_gen_batch = self.traj_collector.multi_turn_loop(
-            #                                         gen_batch=test_gen_batch,
-            #                                         actor_rollout_wg=self.actor_rollout_wg,
-            #                                         envs=self.val_envs,
-            #                                         is_train=False,
-            #                                         )
             # --- 修改开始 ---
             # 将大的验证批次分块处理
             num_val_envs = self.val_envs.num_envs
@@ -842,7 +819,7 @@ class RayPPOTrainer:
             metric_dict[f'val/{k}'] = v
 
         return metric_dict
-
+    
     def init_workers(self):
         """Initialize distributed training workers using Ray backend.
 
@@ -1074,6 +1051,8 @@ class RayPPOTrainer:
 
                 # pop those keys for generation
                 batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
+                
+                # --- ✅ 关键修改：在这里添加 'ground_truth_answer' ---
                 non_tensor_batch_keys_to_pop = ["raw_prompt_ids", "data_source"]
                 if "multi_modal_data" in batch.non_tensor_batch:
                     non_tensor_batch_keys_to_pop.append("multi_modal_data")
@@ -1081,6 +1060,9 @@ class RayPPOTrainer:
                     non_tensor_batch_keys_to_pop.append("raw_prompt")
                 if "tools_kwargs" in batch.non_tensor_batch:
                     non_tensor_batch_keys_to_pop.append("tools_kwargs")
+                if "ground_truth_answer" in batch.non_tensor_batch:
+                    non_tensor_batch_keys_to_pop.append("ground_truth_answer")
+
                 gen_batch = batch.pop(
                     batch_keys=batch_keys_to_pop,
                     non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
@@ -1091,13 +1073,6 @@ class RayPPOTrainer:
                 with _timer("step", timing_raw):
                     # generate a batch
                     with _timer("gen", timing_raw):
-                        # if not self.async_rollout_mode:
-                        #     gen_batch_output = self.actor_rollout_wg.generate_sequences(gen_batch)
-                        # else:
-                        #     self.async_rollout_manager.wake_up()
-                        #     gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch)
-                        #     self.async_rollout_manager.sleep()
-
                         ################ agent-environment loop ###############
                         gen_batch_output = self.traj_collector.multi_turn_loop(
                                                                 gen_batch=gen_batch,
@@ -1121,10 +1096,6 @@ class RayPPOTrainer:
 
                             del gen_baseline_batch, gen_baseline_output
 
-                    # batch.non_tensor_batch["uid"] = np.array([str(uuid.uuid4()) for _ in range(len(batch.batch))], dtype=object)
-                    # # repeat to align with repeated responses in rollout
-                    # batch = batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.n, interleave=True)
-                    # batch = batch.union(gen_batch_output)
                     del batch
                     batch = gen_batch_output
 

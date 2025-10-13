@@ -21,6 +21,7 @@ from functools import partial
 import os
 import datetime
 import re
+import yaml
 from agent_system.environments.prompts import *
 from agent_system.environments.base import EnvironmentManagerBase, to_numpy
 from agent_system.memory import SimpleMemory
@@ -532,6 +533,8 @@ class JarvisEnvironmentManager(EnvironmentManagerBase):
         super().__init__(envs, projection_f, config)
         self.num_envs = self.envs.num_envs
         self.tasks = []
+        self.ground_truth_answers: List[str] = []
+        self.llm_config = self._load_llm_config(config.env.jarvis.get("config_path", "agent_system/environments/env_package/jarvis/jarvis_v2/config.yaml"))
         
         # --- 修改：为整个训练运行创建一个唯一的顶级日志目录 ---
         log_root_dir = config.env.jarvis.get("log_dir", "trajectory_logs")
@@ -550,9 +553,24 @@ class JarvisEnvironmentManager(EnvironmentManagerBase):
         self.last_confidence: List[dict] = None
         # ===================================================================================
 
-    def set_tasks(self, tasks: List[str]):
-        """仅更新任务列表和当前活动的批次大小。"""
+    def _load_llm_config(self, config_path: str) -> Dict[str, Any]:
+        """从YAML文件加载LLM配置。"""
+        if not config_path or not os.path.exists(config_path):
+            print(f"警告: 找不到或未提供LLM配置文件路径: {config_path}。将跳过LLM评估。")
+            return None
+        try:
+            with open(config_path, 'r', encoding='utf-8') as f:
+                config_data = yaml.safe_load(f)
+                # 专门读取 'evaluation_llm' 部分
+                return config_data.get('evaluation_llm')
+        except Exception as e:
+            print(f"从 {config_path} 加载LLM配置时出错: {e}")
+            return None
+
+    def set_tasks(self, tasks: List[str], ground_truth_answers: List[str]):
+        """更新任务列表、参考答案和当前活动的批次大小。"""
         self.tasks = tasks
+        self.ground_truth_answers = ground_truth_answers
         self.active_batch_size = len(tasks)
         print(f"--- [env_manager.py] 接收到 {self.active_batch_size} 个任务 ---")
 
@@ -635,7 +653,9 @@ class JarvisEnvironmentManager(EnvironmentManagerBase):
                         status=final_status,
                         summary=summary_text,
                         run_start_time=self.run_start_times[i],
-                        task=self.tasks[i]
+                        task=self.tasks[i],
+                        ground_truth_answer=self.ground_truth_answers[i],
+                        llm_config=self.llm_config
                     )
                     # 清理完成的任务，避免重复终结
                     self.info_pool_managers.pop(i, None)

@@ -43,7 +43,15 @@ class JarvisMultiDeviceEnv:
         self.max_steps_per_episode = max_steps_per_episode
         self.episode_steps: Dict[str, int] = {s: 0 for s in self.device_serials}
 
-        self.compression_config = self.jarvis_config.get("agent", {}).get("image_compression", {})
+        agent_config = self.jarvis_config.get("agent", {})
+        self.compression_config = agent_config.get("image_compression", {})
+        
+        # --- 新增：从配置加载截断参数 ---
+        self.max_elements_per_obs = agent_config.get("max_elements_per_obs", 70)
+        self.max_str_len_per_obs = agent_config.get("max_str_len_per_obs", 10000)
+        print(f"=== UI观察截断已启用: max_elements={self.max_elements_per_obs}, max_str_len={self.max_str_len_per_obs} ===")
+
+
         if self.compression_config.get("enabled", False):
             print("===图像压缩已启用。===")
             if Image is None:
@@ -81,7 +89,11 @@ class JarvisMultiDeviceEnv:
         for serial in self.device_serials:
             self.episode_steps[serial] = 0
             self.actuators[serial].home()
-            obs_data = self.observers[serial].get_current_observation()
+            # --- 修改：传递截断参数 ---
+            obs_data = self.observers[serial].get_current_observation(
+                max_elements=self.max_elements_per_obs,
+                max_str_len=self.max_str_len_per_obs
+            )
             
             screenshots_bytes = obs_data.get("screenshot_bytes")
             if not isinstance(screenshots_bytes, list):
@@ -120,14 +132,22 @@ class JarvisMultiDeviceEnv:
 
         for i, serial in enumerate(self.device_serials):
             action_str = actions[i]
-            pre_action_obs_data = self.observers[serial].get_current_observation()
+            # --- 修改：传递截断参数 ---
+            pre_action_obs_data = self.observers[serial].get_current_observation(
+                max_elements=self.max_elements_per_obs,
+                max_str_len=self.max_str_len_per_obs
+            )
             elements = pre_action_obs_data.get("simplified_elements_list")
             
             status = self._dispatch_action(self.actuators[serial], serial, action_str, elements)
             action_success = (status == "SUCCESS")
             self.episode_steps[serial] += 1
             
-            post_action_obs_data = self.observers[serial].get_current_observation()
+            # --- 修改：传递截断参数 ---
+            post_action_obs_data = self.observers[serial].get_current_observation(
+                max_elements=self.max_elements_per_obs,
+                max_str_len=self.max_str_len_per_obs
+            )
             
             screenshots_bytes = post_action_obs_data.get("screenshot_bytes")
             if not isinstance(screenshots_bytes, list):
@@ -150,8 +170,6 @@ class JarvisMultiDeviceEnv:
 
             obs_images.append(final_image_array)
 
-            # --- 核心修改：构建带有详细错误反馈的观察文本 ---
-            # 捕获来自 projection.py 的格式错误
             feedback_prefix = ""
             format_reminder = (
                 "--- CORRECT FORMAT ---\n"
@@ -188,11 +206,10 @@ class JarvisMultiDeviceEnv:
             
             done = False
             reward = 0.0
-            # 只有用户主动发出的、非错误的 finish 才能结束任务
             if action_str.startswith("finish"):
                 reward = 1.0
                 done = True
-            elif not action_success: # 所有失败的动作都给予惩罚
+            elif not action_success:
                 reward = -0.1
             
             if self.episode_steps[serial] >= self.max_steps_per_episode:
@@ -216,6 +233,7 @@ class JarvisMultiDeviceEnv:
         return observations, np.array(rewards, dtype=np.float32), np.array(dones, dtype=bool), infos
 
     def _dispatch_action(self, actuator: Actuator, serial: str, action_str: str, elements: list) -> str:
+        # ... (此方法无需修改) ...
         print(f"--- [设备: {serial}] 正在分发动作: '{action_str}' ---")
         try:
             if action_str.startswith("format_error"):
@@ -260,6 +278,7 @@ class JarvisMultiDeviceEnv:
             error_message = f"EXECUTION_ERROR: {repr(e)}"
             print(f"--- [设备: {serial}] 动作 '{action_str}' 执行时出错: {error_message} ---")
             return error_message
+
 
 def build_jarvis_envs(jarvis_config_path: str, max_steps: int) -> JarvisMultiDeviceEnv:
     return JarvisMultiDeviceEnv(jarvis_config_path, max_steps)

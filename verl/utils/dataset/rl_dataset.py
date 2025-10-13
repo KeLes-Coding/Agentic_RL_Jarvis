@@ -182,9 +182,18 @@ class RLHFDataset(Dataset):
         """
         Note that we also return the raw_input_ids so that it can be combined with other chat template
         """
-        row_dict: dict = self.dataframe[item]
+        # 从HuggingFace dataset中获取原始数据行
+        original_row: dict = self.dataframe[item]
+
+        # ❗️ 关键修复：创建一个副本，以防后续操作修改原始字典。
+        #    `_build_messages` 会 pop 'prompt' 键，所以我们在副本上操作。
+        row_dict = original_row.copy()
+        
         messages = self._build_messages(row_dict)
         model_inputs = {}
+
+        # 最终要返回的样本，我们从这里开始构建
+        final_item = {}
 
         if self.processor is not None:
             from verl.utils.dataset.vision_utils import process_image, process_video
@@ -209,13 +218,11 @@ class RLHFDataset(Dataset):
 
             if "second_per_grid_ts" in model_inputs:
                 model_inputs.pop("second_per_grid_ts")
-
-            # There's a trap here, multi_modal_inputs has to be a dict, not BatchFeature
-            row_dict["multi_modal_data"] = multi_modal_data
-            row_dict["multi_modal_inputs"] = dict(model_inputs)
-
-            # second_per_grid_ts isn't used for training, just for mrope
-            row_dict["multi_modal_inputs"].pop("second_per_grid_ts", None)
+            
+            # ❗️ 关键修复：将多模态相关数据添加到 final_item
+            final_item["multi_modal_data"] = multi_modal_data
+            final_item["multi_modal_inputs"] = dict(model_inputs)
+            final_item["multi_modal_inputs"].pop("second_per_grid_ts", None)
 
         else:
             raw_prompt = self.tokenizer.apply_chat_template(messages, add_generation_prompt=True, tokenize=False)
@@ -249,9 +256,10 @@ class RLHFDataset(Dataset):
         else:
             position_ids = compute_position_id_with_mask(attention_mask)
 
-        row_dict["input_ids"] = input_ids[0]
-        row_dict["attention_mask"] = attention_mask[0]
-        row_dict["position_ids"] = position_ids[0]
+        # ❗️ 关键修复：将张量数据添加到 final_item
+        final_item["input_ids"] = input_ids[0]
+        final_item["attention_mask"] = attention_mask[0]
+        final_item["position_ids"] = position_ids[0]
 
         raw_prompt_ids = self.tokenizer.encode(raw_prompt, add_special_tokens=False)
         if len(raw_prompt_ids) > self.max_prompt_length:
@@ -266,24 +274,36 @@ class RLHFDataset(Dataset):
             elif self.truncation == "error":
                 raise RuntimeError(f"Prompt length {len(raw_prompt_ids)} is longer than {self.max_prompt_length}.")
 
-        row_dict["raw_prompt_ids"] = raw_prompt_ids
-        # encode prompts without chat template
-        if self.return_raw_chat:
-            row_dict["raw_prompt"] = messages
+        final_item["raw_prompt_ids"] = raw_prompt_ids
+        
+        # ❗️ 关键修复：从原始数据行 `original_row` 中安全地复制所有非张量元数据
+        for key, value in original_row.items():
+            if key not in final_item and not isinstance(value, (torch.Tensor, np.ndarray)):
+                 # 特别是 prompt，我们使用处理过的 messages
+                if key == self.prompt_key:
+                    if self.return_raw_chat:
+                        final_item["raw_prompt"] = messages
+                else:
+                    final_item[key] = value
 
         # get prompts with chat template
         if self.return_full_prompt:
-            row_dict["full_prompts"] = raw_prompt  # array of strings
+            final_item["full_prompts"] = raw_prompt  # array of strings
 
         # add index for each prompt
-        index = row_dict.get("extra_info", {}).get("index", 0)
-        tools_kwargs = row_dict.get("extra_info", {}).get("tools_kwargs", {})
-        need_tools_kwargs = row_dict.get("extra_info", {}).get("need_tools_kwargs", self.need_tools_kwargs)
+        index = original_row.get("extra_info", {}).get("index", 0)
+        tools_kwargs = original_row.get("extra_info", {}).get("tools_kwargs", {})
+        need_tools_kwargs = original_row.get("extra_info", {}).get("need_tools_kwargs", self.need_tools_kwargs)
         if need_tools_kwargs and not tools_kwargs:
-            logger.warning("tools_kwargs is empty for index {}, data source: {}", index, row_dict["data_source"])
-        row_dict["index"] = index
-        row_dict["tools_kwargs"] = tools_kwargs
-        return row_dict
+            logger.warning("tools_kwargs is empty for index {}, data source: {}", index, original_row["data_source"])
+        
+        # 确保 index 和 tools_kwargs 也被添加
+        final_item["index"] = index
+        final_item["tools_kwargs"] = tools_kwargs
+        
+        print("final_item keys:", final_item.keys())
+        print(f"Processed item {item}: index={final_item['index']}, input_ids shape={final_item['input_ids'].shape}")
+        return final_item
 
     def __getstate__(self):
         if not self.serialize_dataset:

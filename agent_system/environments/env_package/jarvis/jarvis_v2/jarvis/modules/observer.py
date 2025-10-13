@@ -1,3 +1,5 @@
+# agent_system/environments/env_package/jarvis/jarvis_v2/jarvis/modules/observer.py
+
 import subprocess
 import logging
 import re
@@ -143,11 +145,12 @@ class Observer:
 
         return is_vertically_visible and is_horizontally_visible
 
-    def _parse_and_simplify_xml(self, xml_content: str) -> List[Dict[str, Any]]:
+    def _parse_and_simplify_xml(self, xml_content: str, max_elements: int = 70) -> List[Dict[str, Any]]:
         """
         解析XML内容，提取可交互的UI元素，并进行简化。
         - 过滤掉视口外的元素。
         - 截断过长的文本。
+        - 限制返回的元素总数。
         """
         simplified_elements = []
         if not xml_content:
@@ -156,7 +159,11 @@ class Observer:
             root = ET.fromstring(xml_content)
             uid_counter = 1
             for node in root.iter():
-                # --- 修改点 1：首先检查元素是否在视口内 ---
+                # --- 新增：检查是否已达到元素数量上限 ---
+                if len(simplified_elements) >= max_elements:
+                    self.logger.warning(f"解析的UI元素数量已达到上限 {max_elements}，提前终止解析。")
+                    break
+
                 if not self._is_node_in_viewport(node):
                     continue
 
@@ -164,7 +171,6 @@ class Observer:
                     bounds_str = node.get("bounds")
                     bounds = self._parse_bounds(bounds_str)
 
-                    # --- 修改点 2：截断过长的文本 ---
                     text = node.get("text", "")
                     if len(text) > 200:
                         text = text[:200] + "..."
@@ -176,8 +182,8 @@ class Observer:
                     element_data = {
                         "uid": uid_counter,
                         "class": node.get("class"),
-                        "text": text,  # 使用可能被截断的文本
-                        "content_desc": content_desc,  # 使用可能被截断的文本
+                        "text": text,
+                        "content_desc": content_desc,
                         "resource_id": node.get("resource-id", ""),
                         "bounds": bounds,
                         "center": (
@@ -198,7 +204,7 @@ class Observer:
             )
         return simplified_elements
 
-    def get_current_observation(self) -> dict:
+    def get_current_observation(self, max_elements: int = 70, max_str_len: int = 10000) -> dict:
         """
         获取当前的完整观察数据，包括截图、XML和简化后的UI元素列表。
         """
@@ -206,8 +212,7 @@ class Observer:
         screenshot = self.get_screenshot_bytes()
         xml = self.get_layout_xml()
 
-        # 调用的是优化后的解析方法
-        simplified_elements = self._parse_and_simplify_xml(xml)
+        simplified_elements = self._parse_and_simplify_xml(xml, max_elements=max_elements)
 
         simplified_elements_str = ""
         for el in simplified_elements:
@@ -216,22 +221,12 @@ class Observer:
             desc_info = f"desc='{el['content_desc']}'" if el["content_desc"] else ""
             id_info = f"id='{el['resource_id']}'" if el["resource_id"] else ""
             all_parts.extend([part for part in [text_info, desc_info, id_info] if part])
-
-            # if el.get("password"):
-            #     all_parts.append("is_password")
-            # if el.get("checkable"):
-            #     all_parts.append("checkable")
-            #     all_parts.append("checked" if el.get("checked") else "unchecked")
-            # if el.get("selected"):
-            #     all_parts.append("selected")
-            # if el.get("clickable"):
-            #     all_parts.append("clickable")
-
-            # b = el.get("bounds")
-            # if b:
-            #     all_parts.append(f"bounds=[{b[0]},{b[1]}][{b[2]},{b[3]}]")
-
             simplified_elements_str += f"[{el['uid']}] {el['class'].split('.')[-1]} {{{', '.join(all_parts)}}}\n"
+
+        # --- 新增：对最终生成的字符串进行长度截断 ---
+        if len(simplified_elements_str) > max_str_len:
+            self.logger.warning(f"观察字符串总长度超过 {max_str_len}，将被截断。")
+            simplified_elements_str = simplified_elements_str[:max_str_len]
 
         return {
             "screenshot_bytes": screenshot,

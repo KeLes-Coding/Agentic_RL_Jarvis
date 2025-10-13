@@ -3,7 +3,7 @@ ENGINE=${1:-vllm}
 export VLLM_ATTENTION_BACKEND=XFORMERS
 export SWANLAB_API_KEY="oB8w36PCJxKeqwif2ijWz"
 
-export CUDA_VISIBLE_DEVICES="0,2"
+export CUDA_VISIBLE_DEVICES="1,2"
 
 train_data_size=2
 val_data_size=2
@@ -17,8 +17,8 @@ group_size=1
 
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
-    data.train_files=/home/zzh/Workspace/verl-agent/data/atomic_tasks_list_train.parquet \
-    data.val_files=/home/zzh/Workspace/verl-agent/data/atomic_tasks_list_val.parquet \
+    data.train_files=/home/zzh/Workspace/verl-agent/data/atomic_tasks_list_sample_train.parquet \
+    data.val_files=/home/zzh/Workspace/verl-agent/data/atomic_tasks_list_sample_val.parquet \
     data.train_batch_size=$train_data_size \
     data.val_batch_size=$val_data_size \
     data.max_prompt_length=4096 \
