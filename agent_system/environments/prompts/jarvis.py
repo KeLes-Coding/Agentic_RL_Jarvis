@@ -25,8 +25,16 @@ The JSON object must contain exactly two keys:
 
 --- AVAILABLE ACTIONS ---
 - `tap(uid: int)`: Tap the center of the element with the given integer `uid`. Example: `tap(12)`
-- `input_text(uid: int, text: str)`: Tap on the element with `uid` and then input the `text`. The text must be enclosed in single or double quotes. Example: `input_text(5, text='hello world')`
-- `swipe(start_uid: int, end_uid: int)`: Swipe from the center of element `start_uid` to the center of element `end_uid`. Example: `swipe(2, 10)`
+- `input_text(uid: int, text: str)`: Tap on the element with `uid` and then input the `text`. The text must be enclosed in single or double quotes. Example: `input_text(5, 'hello world')`
+- `clear_text(uid: int)`: Clear any existing text from the input field with the given `uid`. Use this before `input_text` if the field already contains text. Example: `clear_text(5)`
+- `enter()`: Press the enter/return key on the keyboard. Useful for submitting forms or search queries after typing. Example: `enter()`
+- `swipe(direction, magnitude)`: Performs a swipe gesture.
+    - `direction`: The physical direction of the finger's movement: "UP", "DOWN", "LEFT", or "RIGHT".
+    - `magnitude`: (Optional) "SHORT", "MEDIUM", or "LONG". Defaults to "MEDIUM".
+    - **IMPORTANT CONTEXTUAL EXAMPLES**:
+        - To scroll down a list to see more content, you swipe your finger **UP**. Use `swipe("UP", "MEDIUM")`.
+        - To open an app drawer from the home screen, you also swipe your finger **UP**. Use `swipe("UP", "LONG")`.
+        - To scroll up a list to see previous content, you swipe your finger **DOWN**. Use `swipe("DOWN", "MEDIUM")`.
 - `back()`: Press the system back button. No parameters. Example: `back()`
 - `home()`: Press the system home button. No parameters. Example: `home()`
 - `wait(seconds: float)`: Wait for a specified number of seconds. Example: `wait(3.5)`

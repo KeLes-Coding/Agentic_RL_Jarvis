@@ -88,6 +88,12 @@ class JarvisMultiDeviceEnv:
 
         for serial in self.device_serials:
             self.episode_steps[serial] = 0
+
+            # --- 新增：调用清理后台应用的方法 ---
+            # print(f"--- [设备: {serial}] 正在清理后台应用... ---")
+            # self.actuators[serial].clear_background_apps()
+            # --- 新增结束 ---
+
             self.actuators[serial].home()
             # --- 修改：传递截断参数 ---
             obs_data = self.observers[serial].get_current_observation(
@@ -171,6 +177,8 @@ class JarvisMultiDeviceEnv:
             obs_images.append(final_image_array)
 
             feedback_prefix = ""
+            
+            # --- 第 1 处修改：更新 format_reminder 中的 swipe 示例 ---
             format_reminder = (
                 "--- CORRECT FORMAT ---\n"
                 "You MUST respond in a strict, valid JSON format. Your entire output must be a single JSON object, without any markdown formatting, comments, or extra text.\n"
@@ -178,7 +186,15 @@ class JarvisMultiDeviceEnv:
                 "--- AVAILABLE ACTIONS ---\n"
                 "- `tap(uid: int)`: Example: `tap(12)`\n"
                 "- `input_text(uid: int, text: str)`: Example: `input_text(5, 'hello world')`\n"
-                "- `swipe(start_uid: int, end_uid: int)`: Example: `swipe(2, 10)`\n"
+                "- `clear_text(uid: int)`\n"
+                "- `enter()`\n"
+                "- `swipe(direction, magnitude)`: Performs a swipe gesture.\n"
+                    "\t- `direction`: The physical direction of the finger's movement: \"UP\", \"DOWN\", \"LEFT\", or \"RIGHT\".\n"
+                    "\t- `magnitude`: (Optional) \"SHORT\", \"MEDIUM\", or \"LONG\". Defaults to \"MEDIUM\".\n"
+                    "\t- **IMPORTANT CONTEXTUAL EXAMPLES**:\n"
+                        "\t\t- To scroll down a list to see more content, you swipe your finger **UP**. Use `swipe(\"UP\", \"MEDIUM\")`.\n"
+                        "\t\t- To open an app drawer from the home screen, you also swipe your finger **UP**. Use `swipe(\"UP\", \"LONG\")`.\n"
+                        "\t\t- To scroll up a list to see previous content, you swipe your finger **DOWN**. Use `swipe(\"DOWN\", \"MEDIUM\")`.\n"
                 "- `back()`: Example: `back()`\n"
                 "- `home()`: Example: `home()`\n"
                 "- `wait(seconds: float)`: Example: `wait(3.5)`\n"
@@ -233,7 +249,6 @@ class JarvisMultiDeviceEnv:
         return observations, np.array(rewards, dtype=np.float32), np.array(dones, dtype=bool), infos
 
     def _dispatch_action(self, actuator: Actuator, serial: str, action_str: str, elements: list) -> str:
-        # ... (此方法无需修改) ...
         print(f"--- [设备: {serial}] 正在分发动作: '{action_str}' ---")
         try:
             if action_str.startswith("format_error"):
@@ -249,7 +264,7 @@ class JarvisMultiDeviceEnv:
 
             params_str = action_str[len(original_action_name) + 1 : -1] if "(" in action_str else ""
             
-            if action_name in ["tap", "input_text", "swipe", "wait"] and not elements:
+            if action_name in ["tap", "input_text", "drag", "clear_text"] and not elements:
                 return "FAILURE_NO_ELEMENTS"
 
             def extract_uid(param_part):
@@ -258,16 +273,35 @@ class JarvisMultiDeviceEnv:
                     raise ValueError(f"Cannot find a valid integer UID in parameter '{param_part}'")
                 return int(numbers[0])
 
-            if action_name == "tap": result = actuator.tap(extract_uid(params_str), elements)
+            if action_name == "tap":
+                result = actuator.tap(extract_uid(params_str), elements)
             elif action_name == "input_text":
-                uid_part, text = params_str.split(",", 1)
-                result = actuator.input_text(extract_uid(uid_part), text.strip().strip("'\""), elements)
+                uid_part, text_part = params_str.split(",", 1)
+                text = text_part.strip()
+                if text.startswith("text="):
+                    text = text[len("text="):]
+                text = text.strip("'\"")
+                result = actuator.input_text(extract_uid(uid_part), text, elements)
             elif action_name == "swipe":
+                direction_part, magnitude_part = params_str.split(",", 1)
+                direction = direction_part.strip().strip("'\"")
+                magnitude = magnitude_part.strip().strip("'\"")
+                result = actuator.swipe(direction, magnitude)
+            elif action_name == "drag":
                 start_part, end_part = params_str.split(",", 1)
-                result = actuator.swipe(extract_uid(start_part), extract_uid(end_part), elements)
-            elif action_name == "back": result = actuator.back()
-            elif action_name == "home": result = actuator.home()
-            elif action_name == "wait": result = actuator.wait(float(params_str))
+                result = actuator.drag(extract_uid(start_part), extract_uid(end_part), elements)
+            # --- ✅ 新增动作解析 ✅ ---
+            elif action_name == "clear_text":
+                result = actuator.clear_text(extract_uid(params_str), elements)
+            elif action_name == "enter":
+                result = actuator.enter()
+            # --- ✅ 解析结束 ✅ ---
+            elif action_name == "back":
+                result = actuator.back()
+            elif action_name == "home":
+                result = actuator.home()
+            elif action_name == "wait":
+                result = actuator.wait(float(params_str))
             else:
                 return f"UNKNOWN_ACTION: '{action_name}' is not a valid action."
 
