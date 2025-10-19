@@ -3,9 +3,10 @@
 import yaml
 import numpy as np
 import io
-from typing import List, Dict, Tuple, Union
+from typing import List, Dict, Tuple, Union, Any
 import logging
 import re
+import openai
 
 try:
     from PIL import Image
@@ -15,6 +16,47 @@ except ImportError:
 from .jarvis_v2.jarvis.modules.observer import Observer
 from .jarvis_v2.jarvis.modules.actuator import Actuator
 from .jarvis_v2.agent_manager import discover_devices
+
+def _evaluate_with_llm(summary: str, ground_truth: str, llm_config: Dict[str, Any]) -> bool:
+    """
+    使用外部LLM评估任务摘要与参考答案。
+    """
+    # --- 增强健壮性：在调用API前检查输入 ---
+    if not summary or not ground_truth:
+        print("警告: LLM评估因为 summary 或 ground_truth 为空而被跳过。")
+        return False
+    if not llm_config or not all(k in llm_config for k in ['key', 'url', 'model']):
+        print("警告: LLM评估因为 llm_config 配置不完整而被跳过。")
+        return False
+        
+    try:
+        client = openai.OpenAI(
+            api_key=llm_config.get('key'),
+            base_url=llm_config.get('url'),
+        )
+
+        prompt = f"""
+请根据提供的参考答案，评估以下任务摘要是否成功地完成了最初的提示。
+仅回答 "True" 或 "False"。
+
+提示的参考答案: {ground_truth}
+任务摘要: {summary}
+"""
+
+        response = client.chat.completions.create(
+            model=llm_config['model'],
+            messages=[
+                {"role": "system", "content": "你是一个评估任务完成情况的助手。"},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0,
+        )
+        content = response.choices[0].message.content.strip()
+        return content.lower() == 'true'
+    except Exception as e:
+        print(f"LLM评估期间出错: {e}")
+        return False
+
 
 class JarvisMultiDeviceEnv:
     """
@@ -46,11 +88,16 @@ class JarvisMultiDeviceEnv:
         agent_config = self.jarvis_config.get("agent", {})
         self.compression_config = agent_config.get("image_compression", {})
         
-        # --- 新增：从配置加载截断参数 ---
         self.max_elements_per_obs = agent_config.get("max_elements_per_obs", 70)
         self.max_str_len_per_obs = agent_config.get("max_str_len_per_obs", 10000)
         print(f"=== UI观察截断已启用: max_elements={self.max_elements_per_obs}, max_str_len={self.max_str_len_per_obs} ===")
 
+        self.llm_config = self.jarvis_config.get("evaluation_llm", {})
+        self.tasks: Dict[str, Dict] = {s: {} for s in self.device_serials}
+        if self.llm_config:
+            print("=== LLM评估奖励已启用。===")
+        else:
+            print("警告: 在 Jarvis 配置中未找到 'llm' 配置，任务成功与否的奖励将无法计算。")
 
         if self.compression_config.get("enabled", False):
             print("===图像压缩已启用。===")
@@ -81,21 +128,20 @@ class JarvisMultiDeviceEnv:
             print(f"===图像压缩失败: {e}===")
             return image_bytes
 
-    def reset(self) -> Tuple[Dict[str, List], List[Dict]]:
+    def reset(self, tasks: List[Dict] = None) -> Tuple[Dict[str, List], List[Dict]]:
         obs_images = []
         obs_texts = []
         infos = []
 
-        for serial in self.device_serials:
+        for i, serial in enumerate(self.device_serials):
             self.episode_steps[serial] = 0
-
-            # --- 新增：调用清理后台应用的方法 ---
-            # print(f"--- [设备: {serial}] 正在清理后台应用... ---")
-            # self.actuators[serial].clear_background_apps()
-            # --- 新增结束 ---
+            
+            if tasks and i < len(tasks):
+                self.tasks[serial] = tasks[i]
+            else:
+                self.tasks[serial] = {}
 
             self.actuators[serial].home()
-            # --- 修改：传递截断参数 ---
             obs_data = self.observers[serial].get_current_observation(
                 max_elements=self.max_elements_per_obs,
                 max_str_len=self.max_str_len_per_obs
@@ -133,12 +179,118 @@ class JarvisMultiDeviceEnv:
             infos.append(info_dict)
         return {"image": obs_images, "text": obs_texts}, infos
 
+    # ======================= ✅ 新方法：封装 `finish` 动作的处理逻辑 ✅ =======================
+    def _handle_finish_action(self, action_str: str, serial: str) -> Tuple[float, bool]:
+        """
+        处理 finish 动作，包括解析、评估和奖励计算。
+        返回 (奖励, 任务是否完成) 的元组。
+        """
+        summary = ""
+        try:
+            # 1. 优先尝试用正则表达式精确提取
+            # re.DOTALL 允许 '.' 匹配换行符
+            match = re.search(r"summary=['\"](.*?)['\"]", action_str, re.DOTALL)
+            if match:
+                summary = match.group(1).strip()
+            else:
+                # 2. 如果正则失败，使用更宽松的回退方法提取括号内的内容
+                start_index = action_str.find('(')
+                end_index = action_str.rfind(')')
+                if start_index != -1 and end_index != -1 and start_index < end_index:
+                    potential_summary = action_str[start_index + 1:end_index].strip()
+                    # 尝试去除可能存在的 "summary=" 前缀
+                    if potential_summary.lower().strip().startswith("summary="):
+                        summary = potential_summary[len("summary="):].strip().strip("'\" ")
+                    else:
+                        # 如果没有 "summary=" 前缀，就认为整个括号内容都是摘要
+                        summary = potential_summary.strip("'\" ")
+            
+            if not summary:
+                print(f"--- [设备: {serial}] 错误: 无法从 'finish' 动作中解析出有效的 summary。 Action: '{action_str}' ---")
+                return 0.0, False
+
+            # 3. 获取当前任务的 ground_truth 和 llm_config
+            task_info = self.tasks.get(serial, {})
+            ground_truth = task_info.get("ground_truth_answer")
+            
+            # 4. 检查评估所需的所有信息是否都存在
+            if not ground_truth:
+                print(f"--- [设备: {serial}] 警告: 缺少 'ground_truth_answer'，无法进行LLM评估。奖励设为0。 ---")
+                return 0.0, False
+            if not self.llm_config:
+                print(f"--- [设备: {serial}] 警告: 缺少 'llm_config'，无法进行LLM评估。奖励设为0。 ---")
+                return 0.0, False
+
+            # 5. 使用带重试机制的LLM评估
+            task_completed = _evaluate_with_llm(summary, ground_truth, self.llm_config)
+            
+            # 6. 根据评估结果设置奖励
+            reward = 1.0 if task_completed else 0.0
+            print(f"--- [设备: {serial}] 'finish' 动作评估完成。Summary: '{summary}'. 任务是否成功: {task_completed}, 奖励: {reward} ---")
+            
+            return reward, task_completed
+
+        except Exception as e:
+            print(f"--- [设备: {serial}] 在 'finish' 动作处理期间发生严重错误: {e} ---")
+            return 0.0, False # 发生任何异常都返回失败状态和0奖励
+    # =======================================================================================
+
+    # ======================= ✅ 新增：动态生成针对性 Feedback 的方法 ✅ =======================
+    def _get_targeted_feedback(self, action_str: str, status: str) -> str:
+        """
+        根据失败的动作和状态，生成有针对性的反馈提示。
+        """
+        base_feedback = (
+            "SYSTEM FEEDBACK: Your last action was not successful.\n"
+            "Please follow the required JSON format: {\"thought\": \"your reasoning\", \"action\": \"your_action(...)\"}.\n"
+        )
+
+        action_examples = {
+            "tap": "e.g., `tap(12)` to tap the element with uid 12.",
+            "input_text": "e.g., `input_text(5, 'hello world')` to type 'hello world' into the element with uid 5.",
+            "clear_text": "e.g., `clear_text(8)` to clear text from the element with uid 8.",
+            "swipe": "e.g., `swipe(\"UP\", \"MEDIUM\")` to scroll down a list.",
+            "enter": "e.g., `enter()` to press the enter key.",
+            "back": "e.g., `back()` to go to the previous screen.",
+            "home": "e.g., `home()` to return to the home screen.",
+            "wait": "e.g., `wait(3.0)` to wait for 3 seconds.",
+            "finish": "e.g., `finish(summary='Task is complete.')` to end the episode with a summary."
+        }
+
+        # Case 1: JSON 格式错误
+        if action_str.startswith("format_error"):
+            reason = action_str[len("format_error(reason='"):-2]
+            return (
+                f"SYSTEM FEEDBACK: Your last output had a JSON format error.\n"
+                f"Error Details: {reason}\n"
+                "You MUST respond in a strict JSON format. Example:\n"
+                "{\"thought\": \"I need to tap the login button.\", \"action\": \"tap(21)\"}\n"
+                "Please correct your output and try again.\n\n"
+            )
+
+        # Case 2: 动作执行失败
+        action_name = action_str.split("(")[0].strip()
+        
+        feedback = (
+            f"SYSTEM FEEDBACK: Your previous action failed to execute.\n"
+            f"Action Sent: `{action_str}`\n"
+            f"Execution Status: {status}\n"
+        )
+        
+        # 提供针对性的示例
+        if action_name in action_examples:
+            feedback += f"Correct format for `{action_name}`: {action_examples[action_name]}\n"
+        
+        feedback += "Please analyze the error, check your action format and parameters, and try again.\n\n"
+        
+        return feedback
+    # ====================================================================================
+
     def step(self, actions: List[str]) -> Tuple[Dict[str, List], List[float], List[bool], List[Dict]]:
         obs_images, obs_texts, rewards, dones, infos = [], [], [], [], []
 
         for i, serial in enumerate(self.device_serials):
             action_str = actions[i]
-            # --- 修改：传递截断参数 ---
             pre_action_obs_data = self.observers[serial].get_current_observation(
                 max_elements=self.max_elements_per_obs,
                 max_str_len=self.max_str_len_per_obs
@@ -149,7 +301,6 @@ class JarvisMultiDeviceEnv:
             action_success = (status == "SUCCESS")
             self.episode_steps[serial] += 1
             
-            # --- 修改：传递截断参数 ---
             post_action_obs_data = self.observers[serial].get_current_observation(
                 max_elements=self.max_elements_per_obs,
                 max_str_len=self.max_str_len_per_obs
@@ -177,69 +328,49 @@ class JarvisMultiDeviceEnv:
             obs_images.append(final_image_array)
 
             feedback_prefix = ""
-            
-            # --- 第 1 处修改：更新 format_reminder 中的 swipe 示例 ---
-            format_reminder = (
-                "--- CORRECT FORMAT ---\n"
-                "You MUST respond in a strict, valid JSON format. Your entire output must be a single JSON object, without any markdown formatting, comments, or extra text.\n"
-                'The JSON object must contain exactly two keys:\n1. "thought": Your reasoning.\n2. "action": The action to perform.\n\n'
-                "--- AVAILABLE ACTIONS ---\n"
-                "- `tap(uid: int)`: Example: `tap(12)`\n"
-                "- `input_text(uid: int, text: str)`: Example: `input_text(5, 'hello world')`\n"
-                "- `clear_text(uid: int)`\n"
-                "- `enter()`\n"
-                "- `swipe(direction, magnitude)`: Performs a swipe gesture.\n"
-                    "\t- `direction`: The physical direction of the finger's movement: \"UP\", \"DOWN\", \"LEFT\", or \"RIGHT\".\n"
-                    "\t- `magnitude`: (Optional) \"SHORT\", \"MEDIUM\", or \"LONG\". Defaults to \"MEDIUM\".\n"
-                    "\t- **IMPORTANT CONTEXTUAL EXAMPLES**:\n"
-                        "\t\t- To scroll down a list to see more content, you swipe your finger **UP**. Use `swipe(\"UP\", \"MEDIUM\")`.\n"
-                        "\t\t- To open an app drawer from the home screen, you also swipe your finger **UP**. Use `swipe(\"UP\", \"LONG\")`.\n"
-                        "\t\t- To scroll up a list to see previous content, you swipe your finger **DOWN**. Use `swipe(\"DOWN\", \"MEDIUM\")`.\n"
-                "- `back()`: Example: `back()`\n"
-                "- `home()`: Example: `home()`\n"
-                "- `wait(seconds: float)`: Example: `wait(3.5)`\n"
-                "- `finish(summary: str)`: Example: `finish(summary='Task is complete.')`\n"
-            )
 
-            if action_str.startswith("format_error"):
-                reason = action_str[len("format_error(reason='"):-2]
-                feedback_prefix = (
-                    f"SYSTEM FEEDBACK: Your last output had a JSON format error.\n"
-                    f"Error Details: {reason}\n"
-                    f"{format_reminder}\nPlease correct your output and try again.\n\n"
-                )
-            elif not action_success:
-                feedback_prefix = (
-                    f"SYSTEM FEEDBACK: Your previous action failed to execute.\n"
-                    f"Action Sent: {action_str}\n"
-                    f"Execution Status: {status}\n"
-                    f"{format_reminder}\nPlease analyze the error, check your action format and parameters, and try again.\n\n"
-                )
+            # ======================= ✅ 修改：调用新的 feedback 生成方法 ✅ =======================
+            if action_str.startswith("format_error") or not action_success:
+                feedback_prefix = self._get_targeted_feedback(action_str, status)
+            # ===============================================================================
             
+            if action_str.startswith("swipe"):
+                swipe_reminder = (
+                    "\n--- SWIPE ACTION TIP ---\n"
+                    "Remember the rule for vertical scrolling:\n"
+                    "  - To see content BELOW (scroll down), use `swipe(\"UP\")`.\n"
+                    "  - To see content ABOVE (scroll up), use `swipe(\"DOWN\")`.\n"
+                )
+                feedback_prefix += swipe_reminder
+
             image_placeholders = "<image>\n"
             obs_text = post_action_obs_data.get("simplified_elements_str", "")
             obs_texts.append(f"{feedback_prefix}{image_placeholders}{obs_text}")
             
             done = False
             reward = 0.0
+            task_completed = False
+
             if action_str.startswith("finish"):
-                reward = 1.0
                 done = True
+                reward, task_completed = self._handle_finish_action(action_str, serial)
+            
             elif not action_success:
                 reward = -0.1
             
             if self.episode_steps[serial] >= self.max_steps_per_episode:
                 done = True
+                if not action_str.startswith("finish"):
+                    task_completed = False
             
             rewards.append(reward)
             dones.append(done)
             
-            task_won = done and (reward > 0)
-            
             info_dict = {
                 "device_serial": serial,
                 "action_success": action_success,
-                "won": task_won,
+                "won": task_completed,
+                "task_completed": task_completed,
                 "raw_obs_data": pre_action_obs_data,
                 "compressed_screenshot_bytes": self._compress_single_image(pre_action_obs_data.get("screenshot_bytes", b'')),
             }
@@ -290,12 +421,10 @@ class JarvisMultiDeviceEnv:
             elif action_name == "drag":
                 start_part, end_part = params_str.split(",", 1)
                 result = actuator.drag(extract_uid(start_part), extract_uid(end_part), elements)
-            # --- ✅ 新增动作解析 ✅ ---
             elif action_name == "clear_text":
                 result = actuator.clear_text(extract_uid(params_str), elements)
             elif action_name == "enter":
                 result = actuator.enter()
-            # --- ✅ 解析结束 ✅ ---
             elif action_name == "back":
                 result = actuator.back()
             elif action_name == "home":

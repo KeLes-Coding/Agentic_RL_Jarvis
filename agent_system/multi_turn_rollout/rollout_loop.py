@@ -309,28 +309,35 @@ class TrajectoryCollector:
         """
         为物理设备环境优化的轨迹收集循环。
         """
-        obs, infos = envs.reset()
+        # ======================= ✅ 1. 准备并传递任务信息给 reset 方法 ✅ =======================
+        tasks_for_this_batch = []
+        try:
+            # 确保 gen_batch.non_tensor_batch 及其键存在
+            if hasattr(gen_batch, 'non_tensor_batch') and gen_batch.non_tensor_batch and 'ground_truth_answer' in gen_batch.non_tensor_batch:
+                raw_prompts = gen_batch.non_tensor_batch['raw_prompt']
+                tasks_list = [item[0]['content'] for item in raw_prompts]
+                ground_truth_answers = gen_batch.non_tensor_batch['ground_truth_answer']
 
-        # --- 新增：在这里打印 gen_batch.non_tensor_batch 的所有键 ---
-        print("\n" + "#"*80)
-        print("--- [rollout_loop.py] 检查 gen_batch.non_tensor_batch 中的可用键 ---")
-        if hasattr(gen_batch, 'non_tensor_batch') and gen_batch.non_tensor_batch is not None:
-            print(f"可用的键: {list(gen_batch.non_tensor_batch.keys())}")
-            # --- 新增：为了调试，打印每个键对应的值的类型和形状/长度 ---
-            for key, value in gen_batch.non_tensor_batch.items():
-                if isinstance(value, np.ndarray):
-                    print(f"  - 键 '{key}': 类型=numpy.ndarray, 形状={value.shape}")
-                elif isinstance(value, list):
-                    print(f"  - 键 '{key}': 类型=list, 长度={len(value)}")
-                    if len(value) > 0:
-                        print(f"    - 第一个元素的类型: {type(value[0])}")
-                else:
-                    print(f"  - 键 '{key}': 类型={type(value)}")
+                for i in range(len(gen_batch)):
+                    # 为每个环境创建一个包含任务描述和参考答案的字典
+                    tasks_for_this_batch.append({
+                        "task": tasks_list[i],
+                        "ground_truth_answer": ground_truth_answers[i]
+                    })
+                print("--- [rollout_loop.py] 已成功准备任务和参考答案用于环境重置。 ---")
+            else:
+                print("警告: 在 gen_batch 中未找到 'ground_truth_answer' 或 'raw_prompt'。环境将以无任务信息的方式重置。")
+                tasks_for_this_batch = [{} for _ in range(len(gen_batch))]
 
-        else:
-            print("gen_batch.non_tensor_batch 不存在或为空。")
-        print("#"*80 + "\n")
-
+        except (KeyError, IndexError, TypeError) as e:
+            print(f"严重警告: 准备任务信息时出错: {e}")
+            # 如果出错，创建一个空列表以避免崩溃
+            tasks_for_this_batch = [{} for _ in range(len(gen_batch))]
+        
+        # 这个修改假设 envs (EnvironmentManager) 的 reset 方法已被更新，
+        # 可以接收 tasks 列表，并在内部处理日志初始化、prompt构建和底层环境的重置。
+        obs, infos = envs.reset(tasks=tasks_for_this_batch)
+        # ====================================================================================
 
         lenght_obs = len(obs['text']) if obs['text'] is not None else len(obs['image'])
 
@@ -339,42 +346,6 @@ class TrajectoryCollector:
         assert len(gen_batch.batch) == lenght_obs, \
             f"对于物理设备环境，初始数据批次大小 ({len(gen_batch.batch)}) 必须与检测到的设备数 ({lenght_obs}) 完全匹配。" \
             "请检查你的 data.train_batch_size 和 data.val_batch_size 配置。"
-
-        try:
-            raw_prompts = gen_batch.non_tensor_batch['raw_prompt']
-            print("\n" + "-"*50)
-            print(gen_batch.non_tensor_batch.keys())
-            print(gen_batch.non_tensor_batch)
-            print(gen_batch.non_tensor_batch['raw_prompt'])
-            tasks_list = [item[0]['content'] for item in raw_prompts]
-            
-            # --- 修改：从 gen_batch 中获取 ground_truth_answers ---
-            # 这里的 'ground_truth_answer' 键必须与数据加载时提供的一致
-            ground_truth_answers = gen_batch.non_tensor_batch['ground_truth_answer']
-
-
-            # --- 新增：打印任务和对应的 ground_truth_answer ---
-            print("--- [rollout_loop.py] 正在分发任务及其参考答案 ---")
-            for i, (task, answer) in enumerate(zip(tasks_list, ground_truth_answers)):
-                print(f"  [环境 {i}]")
-                print(f"    - 任务: {task}")
-                print(f"    - 参考答案: {answer}")
-            print("-------------------------------------------------")
-
-
-            if hasattr(envs, 'set_tasks') and hasattr(envs, '_initialize_loggers_for_new_run'):
-                envs.set_tasks(tasks_list, ground_truth_answers)
-                envs._initialize_loggers_for_new_run()
-                obs['text'] = envs.build_text_obs(obs['text'], tasks_list, init=True)
-            else:
-                print("警告: 当前 env_manager 不支持任务设置或日志初始化。")
-        except KeyError as e:
-            print(f"严重警告: 无法从 gen_batch 中解析任务列表或参考答案。缺失的键: {e}")
-            print("请确保您的数据加载器 (Dataset/collate_fn) 正在将 'ground_truth_answer' 字段添加到批次中。")
-            # 在这里可以选择是抛出异常还是继续（如果可以的话）
-            raise e
-        except (IndexError, TypeError) as e:
-            print(f"严重警告: 解析任务列表时出错。错误: {e}")
 
         batch_size = len(gen_batch.batch['input_ids'])
         batch_output = None
@@ -398,7 +369,8 @@ class TrajectoryCollector:
         episode_rewards = np.zeros(batch_size, dtype=np.float32)
 
         # 记录 reset 这一步（作为 step 0）
-        if hasattr(envs, 'info_pool_managers'):
+        # 注意：这里的 'task' 依赖于 envs 对象正确地存储了任务信息
+        if hasattr(envs, 'info_pool_managers') and hasattr(envs, 'tasks'):
             for i in range(len(infos)):
                 if i in envs.info_pool_managers:
                     step_data = {
@@ -426,6 +398,7 @@ class TrajectoryCollector:
             print("="*50 + "\n")
 
             batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
+            # --- ✅ 新增: 从将要 pop 的 keys 中移除 'ground_truth_answer'，确保它保留在 batch 中 ---
             non_tensor_batch_keys_to_pop = ["raw_prompt_ids"]
             if "multi_modal_data" in batch.non_tensor_batch:
                 non_tensor_batch_keys_to_pop.append("multi_modal_data")
@@ -532,28 +505,29 @@ class TrajectoryCollector:
             if is_done.all():
                 break
 
-        # ========================= 新增代码段 [开始] =========================
+        # ======================= ✅ 2. 修复超时的终结逻辑 ✅ =======================
         # 确保因超时而结束的轨迹也被正确终结
         for i in range(batch_size):
             # 如果环境没有被标记为 'done'，说明它是因达到 max_steps 而超时的
+            # 同时检查 info_pool_managers 是否存在且包含该环境的 manager
             if not is_done[i] and hasattr(envs, 'info_pool_managers') and i in envs.info_pool_managers:
                 print(f"--- [rollout_loop.py] 正在为超时的环境 {i} 强制终结日志 ---")
                 final_status = "TIMEOUT"
                 summary_text = f"Task stopped due to reaching max steps ({self.config.env.max_steps})."
 
-                # 检查 info_pool_managers[i] 是否仍然存在，因为可能在之前的步骤中已被移除
+                # 检查 info_pool_managers[i] 是否仍然存在
                 if i in envs.info_pool_managers:
+                    # 使用新的 finalize_run 签名，task_completed 明确设置为 False
                     envs.info_pool_managers[i].finalize_run(
                         status=final_status,
                         summary=summary_text,
                         run_start_time=envs.run_start_times[i],
                         task=envs.tasks[i],
-                        ground_truth_answer=envs.ground_truth_answers[i],
-                        llm_config=envs.llm_config
+                        task_completed=False 
                     )
                     # 终结后从池中移除
                     envs.info_pool_managers.pop(i, None)
-        # ========================= 新增代码段 [结束] =========================
+        # ========================================================================
 
         success: Dict[str, np.ndarray] = envs.success_evaluator(
             total_infos=total_infos,
@@ -606,13 +580,13 @@ class TrajectoryCollector:
                 envs=envs,
             )
             batch_list, episode_rewards, episode_lengths, success, traj_uid = filter_group_data(batch_list=batch_list,
-                                                                                                episode_rewards=episode_rewards, 
-                                                                                                episode_lengths=episode_lengths, 
-                                                                                                success=success, 
-                                                                                                traj_uid=traj_uid, 
-                                                                                                config=self.config,
-                                                                                                last_try=(try_count == max_try_count),
-                                                                                                )
+                                                                                                 episode_rewards=episode_rewards, 
+                                                                                                 episode_lengths=episode_lengths, 
+                                                                                                 success=success, 
+                                                                                                 traj_uid=traj_uid, 
+                                                                                                 config=self.config,
+                                                                                                 last_try=(try_count == max_try_count),
+                                                                                                 )
             
             total_batch_list += batch_list
             total_episode_rewards.append(episode_rewards)

@@ -7,7 +7,7 @@ export CUDA_VISIBLE_DEVICES="1,2"
 
 train_data_size=2
 val_data_size=2
-group_size=1
+group_size=4
 
 # We only use data preparation to indicate the modality and the data size.
 # python3 -m examples.data_preprocess.prepare \
@@ -21,7 +21,7 @@ python3 -m verl.trainer.main_ppo \
     data.val_files=/home/zzh/Workspace/verl-agent/data/atomic_tasks_list_sample_val.parquet \
     data.train_batch_size=$train_data_size \
     data.val_batch_size=$val_data_size \
-    data.max_prompt_length=6144 \
+    data.max_prompt_length=8192 \
     data.max_response_length=512 \
     data.filter_overlong_prompts=True \
     data.truncation='left' \
@@ -30,7 +30,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.model.path=/home/zzh/Workspace/modelscope/models/Qwen/Qwen2___5-VL-3B-Instruct \
     actor_rollout_ref.actor.optim.lr=2e-5 \
     actor_rollout_ref.model.use_remove_padding=True \
-    actor_rollout_ref.actor.ppo_mini_batch_size=2 \
+    actor_rollout_ref.actor.ppo_mini_batch_size=4 \
     actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
     actor_rollout_ref.actor.use_kl_loss=True \
     actor_rollout_ref.actor.kl_loss_coef=0.01 \
@@ -41,7 +41,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
     actor_rollout_ref.rollout.tensor_model_parallel_size=2 \
     actor_rollout_ref.rollout.name=$ENGINE \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.6 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.8 \
     actor_rollout_ref.rollout.enable_chunked_prefill=False \
     actor_rollout_ref.rollout.enforce_eager=False \
     actor_rollout_ref.rollout.free_cache_engine=False \
@@ -54,7 +54,7 @@ python3 -m verl.trainer.main_ppo \
     algorithm.use_kl_in_reward=False \
     env.env_name=jarvis \
     env.seed=0 \
-    env.max_steps=15 \
+    env.max_steps=20 \
     env.rollout.n=$group_size \
     env.jarvis.jarvis_config_path=agent_system/environments/env_package/jarvis/jarvis_v2/config.yaml \
     trainer.critic_warmup=0 \
@@ -64,8 +64,8 @@ python3 -m verl.trainer.main_ppo \
     trainer.n_gpus_per_node=2 \
     trainer.nnodes=1 \
     trainer.save_freq=5 \
-    trainer.test_freq=5 \
-    trainer.total_epochs=30 \
+    trainer.test_freq=1 \
+    trainer.total_epochs=10 \
     trainer.val_before_train=True \
     actor_rollout_ref.model.lora_rank=32 \
     actor_rollout_ref.model.lora_alpha=64 \

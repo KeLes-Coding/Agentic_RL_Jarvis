@@ -532,10 +532,12 @@ class JarvisEnvironmentManager(EnvironmentManagerBase):
         self.memory = SimpleMemory()
         super().__init__(envs, projection_f, config)
         self.num_envs = self.envs.num_envs
-        self.tasks = []
+        self.tasks: List[str] = []
         self.ground_truth_answers: List[str] = []
-        self.llm_config = self._load_llm_config(config.env.jarvis.get("config_path", "agent_system/environments/env_package/jarvis/jarvis_v2/config.yaml"))
         
+        # --- ✅ 修改: LLM config 现在由底层的 envs.py 读取和管理 ---
+        # self.llm_config = self._load_llm_config(...) # 这一行不再需要
+
         # --- 修改：为整个训练运行创建一个唯一的顶级日志目录 ---
         log_root_dir = config.env.jarvis.get("log_dir", "trajectory_logs")
         run_timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -546,33 +548,18 @@ class JarvisEnvironmentManager(EnvironmentManagerBase):
         self.info_pool_managers: Dict[int, InfoPoolManager] = {}
         self.run_start_times: Dict[int, datetime.datetime] = {}
         self.last_prompts: List[str] = [""] * self.num_envs
-        # active_batch_size 将由 set_tasks 动态设置
         self.active_batch_size = 0
+        
         # ======================= ✅ 添加用于暂存 Token 和置信度信息的变量 ✅ =======================
         self.last_token_usage: List[dict] = None
         self.last_confidence: List[dict] = None
         # ===================================================================================
 
-    def _load_llm_config(self, config_path: str) -> Dict[str, Any]:
-        """从YAML文件加载LLM配置。"""
-        if not config_path or not os.path.exists(config_path):
-            print(f"警告: 找不到或未提供LLM配置文件路径: {config_path}。将跳过LLM评估。")
-            return None
-        try:
-            with open(config_path, 'r', encoding='utf-8') as f:
-                config_data = yaml.safe_load(f)
-                # 专门读取 'evaluation_llm' 部分
-                return config_data.get('evaluation_llm')
-        except Exception as e:
-            print(f"从 {config_path} 加载LLM配置时出错: {e}")
-            return None
+    # --- 🗑️ 移除: 不再需要此方法，配置由底层 envs.py 管理 ---
+    # def _load_llm_config(...): ...
 
-    def set_tasks(self, tasks: List[str], ground_truth_answers: List[str]):
-        """更新任务列表、参考答案和当前活动的批次大小。"""
-        self.tasks = tasks
-        self.ground_truth_answers = ground_truth_answers
-        self.active_batch_size = len(tasks)
-        print(f"--- [env_manager.py] 接收到 {self.active_batch_size} 个任务 ---")
+    # --- 🗑️ 移除: set_tasks 的逻辑将被合并到 reset 方法中 ---
+    # def set_tasks(...): ...
 
     # ======================= ✅ 添加用于接收和暂存数据的新方法 ✅ =======================
     def set_last_step_token_usage(self, token_usage_list: List[dict]):
@@ -587,12 +574,11 @@ class JarvisEnvironmentManager(EnvironmentManagerBase):
     def _initialize_loggers_for_new_run(self):
         """为当前批次的所有环境初始化或重置日志记录器。"""
         print("--- [env_manager.py] 正在为新批次初始化日志记录器 ---")
-        # 清空旧的记录器实例
         self.info_pool_managers.clear()
         
         for i in range(self.active_batch_size):
             task = self.tasks[i]
-            timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S_%f') # 增加微秒以确保唯一性
+            timestamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S_%f')
             safe_task_name = re.sub(r'[^\w\-_\. ]', '_', task)[:50]
             run_dir_name = f"{timestamp}_env{i}_{safe_task_name}"
             full_path = os.path.join(self.log_dir, run_dir_name)
@@ -602,16 +588,34 @@ class JarvisEnvironmentManager(EnvironmentManagerBase):
             print(f"  [环境 {i}] 的日志目录: {full_path}")
         print("-------------------------------------------------")
 
-    def reset(self):
-        raw_obs, infos = self.envs.reset()
+    # ======================= ✅ 1. 修改 reset 方法以接收 tasks 参数 ✅ =======================
+    def reset(self, tasks: List[Dict] = None):
+        """
+        重置所有环境，并使用新的任务信息进行初始化。
+        """
+        if tasks:
+            self.tasks = [t.get('task', 'No task provided') for t in tasks]
+            self.ground_truth_answers = [t.get('ground_truth_answer', '') for t in tasks]
+            self.active_batch_size = len(tasks)
+            print(f"--- [env_manager.py] 接收到 {self.active_batch_size} 个任务并准备重置环境 ---")
+            
+            # 初始化日志记录器
+            self._initialize_loggers_for_new_run()
+        else:
+            # 如果没有提供任务（例如，在某些初始化阶段），则进行默认重置
+            self.tasks = ["Initializing..."] * self.num_envs
+            self.ground_truth_answers = [""] * self.num_envs
+            self.active_batch_size = self.num_envs
+
+        # 将 tasks 列表传递给底层的 JarvisMultiDeviceEnv
+        raw_obs, infos = self.envs.reset(tasks=tasks)
         self.memory.reset(batch_size=self.num_envs)
         
-        # 构建临时的 prompts，因为此时真实 tasks 可能还未设置
-        temp_tasks = self.tasks if self.tasks else ["Initializing..."] * self.num_envs
         batched_images = raw_obs['image']
-        full_text_obs = self.build_text_obs(raw_obs['text'], temp_tasks, init=True)
+        full_text_obs = self.build_text_obs(raw_obs['text'], self.tasks, init=True)
 
         return {'text': full_text_obs, 'image': batched_images, 'anchor': raw_obs['text']}, infos
+    # =====================================================================================
 
     def step(self, text_actions: List[str]):
         parsed_actions, valids, thoughts = self.projection_f(text_actions)
@@ -631,34 +635,47 @@ class JarvisEnvironmentManager(EnvironmentManagerBase):
                     "raw_llm_response": text_actions[i]
                 }
                 
-                # --- 注入 Token 信息 ---
                 if self.last_token_usage and i < len(self.last_token_usage):
                     step_data["token_usage"] = self.last_token_usage[i]
                 
-                # ======================= ✅ 在这里读取并注入置信度信息 ✅ =======================
                 if self.last_confidence and i < len(self.last_confidence):
                     step_data["confidence_metrics"] = self.last_confidence[i]
-                # =========================================================================
 
                 self.info_pool_managers[i].record_step(step_data)
 
+                # ======================= ✅ 2. 修改终结逻辑以匹配新签名 ✅ =======================
                 if dones[i]:
-                    final_status = "SUCCESS" if rewards[i] > 0 else "FAILURE"
-                    summary_text = "Task finished."
-                    if parsed_actions[i].startswith("finish"):
-                        match = re.search(r"summary=['\"](.*?)['\"]", parsed_actions[i])
-                        if match: summary_text = match.group(1)
+                    # 从 infos 中获取底册环境返回的 task_completed 状态
+                    task_completed = infos[i].get("task_completed", False)
+                    final_status = "SUCCESS" if task_completed else "FAILURE"
                     
+                    summary_text = "Task finished."
+                    # 尝试从原始动作中解析 summary
+                    if parsed_actions[i].startswith("finish"):
+                        match = re.search(r"summary=['\"](.*?)['\"]", parsed_actions[i], re.DOTALL)
+                        if match: 
+                            summary_text = match.group(1).strip()
+                        else: # 如果正则失败，使用备用方案
+                            start_index = parsed_actions[i].find('(')
+                            end_index = parsed_actions[i].rfind(')')
+                            if start_index != -1 and end_index > start_index:
+                                content = parsed_actions[i][start_index + 1:end_index].strip()
+                                if content.lower().startswith("summary="):
+                                    summary_text = content[len("summary="):].strip().strip("'\" ")
+                                else:
+                                    summary_text = content.strip("'\" ")
+
+                    # 使用 info_pool.py 中新的 finalize_run 签名
                     self.info_pool_managers[i].finalize_run(
                         status=final_status,
                         summary=summary_text,
                         run_start_time=self.run_start_times[i],
                         task=self.tasks[i],
-                        ground_truth_answer=self.ground_truth_answers[i],
-                        llm_config=self.llm_config
+                        task_completed=task_completed #直接传递评估结果
                     )
                     # 清理完成的任务，避免重复终结
                     self.info_pool_managers.pop(i, None)
+                # =============================================================================
 
         batched_images = next_raw_obs['image']
         self.memory.store({'thought': thoughts, 'action': parsed_actions})
