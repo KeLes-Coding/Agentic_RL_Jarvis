@@ -14,7 +14,6 @@ class Observer:
     Observer（观察者）模块负责从安卓设备获取信息。
     它通过ADB命令获取屏幕截图和UI布局（XML），并将其解析为Agent可以理解的格式。
     """
-
     def __init__(self, adb_path: str, device_serial: str):
         """
         初始化观察者。
@@ -172,12 +171,12 @@ class Observer:
                     bounds = self._parse_bounds(bounds_str)
 
                     text = node.get("text", "")
-                    if len(text) > 200:
-                        text = text[:200] + "..."
+                    if len(text) > 800:
+                        text = text[:800] + "..."
 
                     content_desc = node.get("content-desc", "")
-                    if len(content_desc) > 200:
-                        content_desc = content_desc[:200] + "..."
+                    if len(content_desc) > 800:
+                        content_desc = content_desc[:800] + "..."
 
                     element_data = {
                         "uid": uid_counter,

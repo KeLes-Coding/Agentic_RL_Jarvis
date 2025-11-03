@@ -7,6 +7,7 @@ from typing import List, Dict, Tuple, Union, Any
 import logging
 import re
 import openai
+import subprocess # <<< 新增：导入 subprocess 模块
 
 try:
     from PIL import Image
@@ -28,7 +29,7 @@ def _evaluate_with_llm(summary: str, ground_truth: str, llm_config: Dict[str, An
     if not llm_config or not all(k in llm_config for k in ['key', 'url', 'model']):
         print("警告: LLM评估因为 llm_config 配置不完整而被跳过。")
         return False
-        
+
     try:
         client = openai.OpenAI(
             api_key=llm_config.get('key'),
@@ -79,15 +80,16 @@ class JarvisMultiDeviceEnv:
         print(f"JarvisMultiDeviceEnv 初始化成功，管理 {self.num_envs} 台设备: {self.device_serials}")
 
         adb_path = self.jarvis_config.get("adb", {}).get("executable_path", "adb")
+        self.adb_path = adb_path # <<< 新增：存储 adb_path 供清理方法使用
         self.observers: Dict[str, Observer] = {s: Observer(adb_path, s) for s in self.device_serials}
         self.actuators: Dict[str, Actuator] = {s: Actuator(adb_path, s) for s in self.device_serials}
-        
+
         self.max_steps_per_episode = max_steps_per_episode
         self.episode_steps: Dict[str, int] = {s: 0 for s in self.device_serials}
 
         agent_config = self.jarvis_config.get("agent", {})
         self.compression_config = agent_config.get("image_compression", {})
-        
+
         self.max_elements_per_obs = agent_config.get("max_elements_per_obs", 70)
         self.max_str_len_per_obs = agent_config.get("max_str_len_per_obs", 10000)
         print(f"=== UI观察截断已启用: max_elements={self.max_elements_per_obs}, max_str_len={self.max_str_len_per_obs} ===")
@@ -115,7 +117,7 @@ class JarvisMultiDeviceEnv:
 
             if img.mode == 'RGBA':
                 img = img.convert('RGB')
-            
+
             original_width, original_height = img.size
             new_width = int(original_width * scale_factor)
             new_height = int(original_height * scale_factor)
@@ -128,25 +130,116 @@ class JarvisMultiDeviceEnv:
             print(f"===图像压缩失败: {e}===")
             return image_bytes
 
+    # ======================= ✅ 新增：清理后台应用的方法 ✅ =======================
+    def _clear_background_apps(self, serial: str):
+        """
+        清理指定设备上的所有非核心应用数据，将它们重置为初始状态。
+        此方法会强制停止应用，然后清除其所有数据（缓存和用户数据）。
+        会自动跳过一个预定义的安全核心系统应用列表。
+        """
+        print(f"--- [设备: {serial}] 开始全面清理应用数据... ---")
+        adb_command_base = [self.adb_path, "-s", serial, "shell"]
+
+        # 定义一个正则表达式列表，用于匹配不应被清理的核心/安全包名。
+        # 这包括系统UI、设置、启动器、ADB键盘、Google Play服务等关键组件。
+        SAFE_PACKAGES_REGEX = [
+            r"^com\.android\.adbkeyboard$",      # ADB Keyboard (根据原有逻辑保留)
+            r"^com\.android\.systemui$",         # 系统 UI
+            r"^com\.android\.settings$",         # 设置
+            r".*launcher.*",                     # 任何包含 "launcher" 的包名
+            r"^com\.google\.android\.gms$",      # Google Play 服务
+            r"^com\.android\.vending$",          # Google Play 商店 (Vending)
+            r"^android$",                        # 核心操作系统包
+        ]
+
+        # 1. 获取所有已安装的包名，而不仅仅是第三方包
+        try:
+            list_packages_cmd = adb_command_base + ["pm", "list", "packages"]
+            result = subprocess.run(list_packages_cmd, capture_output=True, text=True, check=True, encoding='utf-8')
+            packages_output = result.stdout.strip()
+            all_packages = [line.split(":")[-1] for line in packages_output.splitlines() if line.startswith("package:")]
+        except subprocess.CalledProcessError as e:
+            print(f"--- [设备: {serial}] 错误: 获取所有包列表失败 - {e.stderr} ---")
+            return
+        except Exception as e:
+            print(f"--- [设备: {serial}] 错误: 解析包列表时发生意外错误 - {e} ---")
+            return
+
+        if not all_packages:
+            print(f"--- [设备: {serial}] 未找到任何应用包，跳过清理。 ---")
+            return
+
+        cleared_count = 0
+        skipped_count = 0
+
+        for package_name in all_packages:
+            if not package_name:
+                continue
+
+            # 2. 检查包是否在安全列表中，如果在则跳过
+            is_safe = any(re.search(pattern, package_name) for pattern in SAFE_PACKAGES_REGEX)
+            if is_safe:
+                skipped_count += 1
+                continue
+
+            # 3. 执行强制停止和数据清理
+            # 首先强制停止应用，确保它没有在运行
+            try:
+                force_stop_cmd = adb_command_base + ["am", "force-stop", package_name]
+                subprocess.run(force_stop_cmd, capture_output=True, check=True, timeout=10)
+            except Exception:
+                # 强制停止失败通常不是严重问题（例如，应用可能已经停止），所以忽略异常
+                pass
+
+            # 然后清理应用的所有数据（包括缓存），实现重置效果
+            try:
+                clear_data_cmd = adb_command_base + ["pm", "clear", package_name]
+                subprocess.run(clear_data_cmd, capture_output=True, text=True, check=True, timeout=20)
+                # print(f"--- [设备: {serial}] 成功清理应用: {package_name} ---") # 可以取消注释以进行详细调试
+                cleared_count += 1
+            except subprocess.CalledProcessError as e:
+                # 记录清理失败的警告，这可能因为权限问题或应用是不可变的
+                print(f"--- [设备: {serial}] 警告: 清理应用 {package_name} 数据时出现问题 - {e.stderr.strip()} ---")
+            except subprocess.TimeoutExpired:
+                print(f"--- [设备: {serial}] 错误: 清理应用 {package_name} 数据时超时。 ---")
+            except Exception as e:
+                print(f"--- [设备: {serial}] 错误: 清理应用 {package_name} 数据时发生意外错误 - {e} ---")
+
+        print(f"--- [设备: {serial}] 应用数据清理完成。清理数量: {cleared_count}, 跳过 (核心/安全) 数量: {skipped_count} ---")
+    # ===========================================================================
+    
+
+
     def reset(self, tasks: List[Dict] = None) -> Tuple[Dict[str, List], List[Dict]]:
         obs_images = []
         obs_texts = []
         infos = []
 
         for i, serial in enumerate(self.device_serials):
+            # ======================= ✅ 修改：在 reset 开始时调用清理方法 ✅ =======================
+            self._clear_background_apps(serial)
+            # ===============================================================================
+
             self.episode_steps[serial] = 0
-            
+
             if tasks and i < len(tasks):
                 self.tasks[serial] = tasks[i]
             else:
                 self.tasks[serial] = {}
 
-            self.actuators[serial].home()
+            self.actuators[serial].home() # 清理后返回主屏幕
+            
+            # 短暂等待确保界面稳定
+            try:
+                self.actuators[serial].wait(1.0) # 等待1秒
+            except Exception as e:
+                print(f"--- [设备: {serial}] 在reset的等待期间发生错误: {e} ---")
+
             obs_data = self.observers[serial].get_current_observation(
                 max_elements=self.max_elements_per_obs,
                 max_str_len=self.max_str_len_per_obs
             )
-            
+
             screenshots_bytes = obs_data.get("screenshot_bytes")
             if not isinstance(screenshots_bytes, list):
                 screenshots_bytes = [screenshots_bytes] if screenshots_bytes else []
@@ -204,7 +297,7 @@ class JarvisMultiDeviceEnv:
                     else:
                         # 如果没有 "summary=" 前缀，就认为整个括号内容都是摘要
                         summary = potential_summary.strip("'\" ")
-            
+
             if not summary:
                 print(f"--- [设备: {serial}] 错误: 无法从 'finish' 动作中解析出有效的 summary。 Action: '{action_str}' ---")
                 return 0.0, False
@@ -212,7 +305,7 @@ class JarvisMultiDeviceEnv:
             # 3. 获取当前任务的 ground_truth 和 llm_config
             task_info = self.tasks.get(serial, {})
             ground_truth = task_info.get("ground_truth_answer")
-            
+
             # 4. 检查评估所需的所有信息是否都存在
             if not ground_truth:
                 print(f"--- [设备: {serial}] 警告: 缺少 'ground_truth_answer'，无法进行LLM评估。奖励设为0。 ---")
@@ -223,11 +316,11 @@ class JarvisMultiDeviceEnv:
 
             # 5. 使用带重试机制的LLM评估
             task_completed = _evaluate_with_llm(summary, ground_truth, self.llm_config)
-            
+
             # 6. 根据评估结果设置奖励
             reward = 1.0 if task_completed else 0.0
             print(f"--- [设备: {serial}] 'finish' 动作评估完成。Summary: '{summary}'. 任务是否成功: {task_completed}, 奖励: {reward} ---")
-            
+
             return reward, task_completed
 
         except Exception as e:
@@ -270,19 +363,19 @@ class JarvisMultiDeviceEnv:
 
         # Case 2: 动作执行失败
         action_name = action_str.split("(")[0].strip()
-        
+
         feedback = (
             f"SYSTEM FEEDBACK: Your previous action failed to execute.\n"
             f"Action Sent: `{action_str}`\n"
             f"Execution Status: {status}\n"
         )
-        
+
         # 提供针对性的示例
         if action_name in action_examples:
             feedback += f"Correct format for `{action_name}`: {action_examples[action_name]}\n"
-        
+
         feedback += "Please analyze the error, check your action format and parameters, and try again.\n\n"
-        
+
         return feedback
     # ====================================================================================
 
@@ -296,16 +389,16 @@ class JarvisMultiDeviceEnv:
                 max_str_len=self.max_str_len_per_obs
             )
             elements = pre_action_obs_data.get("simplified_elements_list")
-            
+
             status = self._dispatch_action(self.actuators[serial], serial, action_str, elements)
             action_success = (status == "SUCCESS")
             self.episode_steps[serial] += 1
-            
+
             post_action_obs_data = self.observers[serial].get_current_observation(
                 max_elements=self.max_elements_per_obs,
                 max_str_len=self.max_str_len_per_obs
             )
-            
+
             screenshots_bytes = post_action_obs_data.get("screenshot_bytes")
             if not isinstance(screenshots_bytes, list):
                 screenshots_bytes = [screenshots_bytes] if screenshots_bytes else []
@@ -333,7 +426,7 @@ class JarvisMultiDeviceEnv:
             if action_str.startswith("format_error") or not action_success:
                 feedback_prefix = self._get_targeted_feedback(action_str, status)
             # ===============================================================================
-            
+
             if action_str.startswith("swipe"):
                 swipe_reminder = (
                     "\n--- SWIPE ACTION TIP ---\n"
@@ -346,7 +439,7 @@ class JarvisMultiDeviceEnv:
             image_placeholders = "<image>\n"
             obs_text = post_action_obs_data.get("simplified_elements_str", "")
             obs_texts.append(f"{feedback_prefix}{image_placeholders}{obs_text}")
-            
+
             done = False
             reward = 0.0
             task_completed = False
@@ -354,18 +447,18 @@ class JarvisMultiDeviceEnv:
             if action_str.startswith("finish"):
                 done = True
                 reward, task_completed = self._handle_finish_action(action_str, serial)
-            
+
             elif not action_success:
                 reward = -0.1
-            
+
             if self.episode_steps[serial] >= self.max_steps_per_episode:
                 done = True
                 if not action_str.startswith("finish"):
                     task_completed = False
-            
+
             rewards.append(reward)
             dones.append(done)
-            
+
             info_dict = {
                 "device_serial": serial,
                 "action_success": action_success,
@@ -375,7 +468,7 @@ class JarvisMultiDeviceEnv:
                 "compressed_screenshot_bytes": self._compress_single_image(pre_action_obs_data.get("screenshot_bytes", b'')),
             }
             infos.append(info_dict)
-            
+
         observations = {"image": obs_images, "text": obs_texts}
         return observations, np.array(rewards, dtype=np.float32), np.array(dones, dtype=bool), infos
 
@@ -394,7 +487,7 @@ class JarvisMultiDeviceEnv:
                 action_name = "tap"
 
             params_str = action_str[len(original_action_name) + 1 : -1] if "(" in action_str else ""
-            
+
             if action_name in ["tap", "input_text", "drag", "clear_text"] and not elements:
                 return "FAILURE_NO_ELEMENTS"
 

@@ -5,8 +5,10 @@ export SWANLAB_API_KEY="oB8w36PCJxKeqwif2ijWz"
 
 export CUDA_VISIBLE_DEVICES="1,2"
 
-train_data_size=2
-val_data_size=2
+# 关键改动：将 train_data_size 设置为 1
+# 这将确保每个训练批次只包含一个任务
+train_data_size=4
+val_data_size=4
 group_size=4
 
 # We only use data preparation to indicate the modality and the data size.
@@ -17,8 +19,8 @@ group_size=4
 
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
-    data.train_files=/home/zzh/Workspace/verl-agent/data/atomic_tasks_list_sample_train.parquet \
-    data.val_files=/home/zzh/Workspace/verl-agent/data/atomic_tasks_list_sample_val.parquet \
+    data.train_files=/home/zzh/Workspace/verl-agent/data/atomic_tasks_list_wiki_train.parquet \
+    data.val_files=/home/zzh/Workspace/verl-agent/data/atomic_tasks_list_wiki_val.parquet \
     data.train_batch_size=$train_data_size \
     data.val_batch_size=$val_data_size \
     data.max_prompt_length=8192 \
@@ -64,7 +66,7 @@ python3 -m verl.trainer.main_ppo \
     trainer.n_gpus_per_node=2 \
     trainer.nnodes=1 \
     trainer.save_freq=5 \
-    trainer.test_freq=1 \
+    trainer.test_freq=5 \
     trainer.total_epochs=10 \
     trainer.val_before_train=True \
     actor_rollout_ref.model.lora_rank=32 \
