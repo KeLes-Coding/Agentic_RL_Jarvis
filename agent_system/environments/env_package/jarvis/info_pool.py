@@ -13,7 +13,7 @@ try:
     from PIL import Image
 except ImportError:
     Image = None
-
+    
 # ======================= ✅ 1. 移除评估函数 ✅ =======================
 # _evaluate_with_llm 函数已被移动到 envs.py
 # =====================================================================
@@ -106,6 +106,7 @@ class InfoPoolManager:
                 "task": step_data["task"],
                 "thought": step_data["thought"],
                 "parsed_action": step_data["parsed_action"],
+                "action_type": step_data.get("action_type", "unknown"), # <--- ✅ [CCAPO] 新增
                 "action_success": step_data["action_success"],
             }
             # --- 将 Token 和置信度信息加入 details 字典 ---
@@ -113,7 +114,17 @@ class InfoPoolManager:
                 details["token_usage"] = step_data["token_usage"]
             if "confidence_metrics" in step_data:
                 details["confidence_metrics"] = step_data["confidence_metrics"]
-            # -----------------------------------------------
+            
+            # --- ✅ [CCAPO] 将 log_probs (作为列表) 加入 details 字典 ---
+            if "rollout_log_probs" in step_data:
+                try:
+                    # 将 torch.Tensor 转换为 list 
+                    details["rollout_log_probs"] = step_data["rollout_log_probs"].cpu().tolist()
+                except Exception as e:
+                    print(f"Warning: could not serialize rollout_log_probs. {e}")
+                    details["rollout_log_probs"] = "Error: Not serializable"
+            # --------------------------------------------------------
+            
             with open(os.path.join(step_dir, "step_details.json"), "w", encoding="utf-8") as f:
                 json.dump(details, f, indent=4, ensure_ascii=False)
 
@@ -164,3 +175,5 @@ class InfoPoolManager:
                 json.dump(summary_data, f, indent=4, ensure_ascii=False)
         except Exception as e:
             print(f"Error writing summary.json: {e}")
+        
+        return summary_data # <--- ✅ [CCAPO] 返回 summary_data

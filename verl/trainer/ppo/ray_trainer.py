@@ -62,6 +62,12 @@ from verl.utils.tracking import ValidationGenerationsLogger
 from verl.workers.rollout.async_server import AsyncLLMServerManager
 from gigpo import core_gigpo
 
+# --- ✅ [CCAPO] 新增 Imports ---
+from agent_system.reward_manager.stdb import SuccessTrajectoryDatabase
+from verl.utils.dataset.rl_dataset import collate_fn
+from agent_system.multi_turn_rollout.utils import to_list_of_dict
+# --- 结束 ---
+
 from agent_system.multi_turn_rollout import TrajectoryCollector, adjust_batch
 
 WorkerType = Type[Worker]
@@ -94,6 +100,7 @@ class AdvantageEstimator(str, Enum):
     RLOO = "rloo"
     GRPO_PASSK = "grpo_passk"
     GiGPO = 'gigpo'
+    CCAPO = 'ccapo' # <--- ✅ [CCAPO] 新增
 
 
 @dataclass
@@ -440,8 +447,22 @@ class RayPPOTrainer:
         if config.algorithm.use_kl_in_reward:
             self.kl_ctrl_in_reward = core_algos.get_kl_controller(config.algorithm.kl_ctrl)
 
+        # --- ✅ [CCAPO] 修改：设置 use_critic 和 STDB ---
+        self.stdb = None
         if self.config.algorithm.adv_estimator == AdvantageEstimator.GAE:
             self.use_critic = True
+        elif self.config.algorithm.adv_estimator == AdvantageEstimator.CCAPO:
+            self.use_critic = False # CCAPO 根据策略计算优势，不依赖 V(s)
+            stdb_path = self.config.algorithm.ccapo.stdb_save_path
+            # 确保 stdb 路径是绝对的，或相对于 checkpoint 目录
+            if not os.path.isabs(stdb_path):
+                stdb_path = os.path.join(self.config.trainer.default_local_dir, stdb_path)
+            
+            print(f"[CCAPO] 初始化 STDB，索引将保存到: {stdb_path}")
+            self.stdb = SuccessTrajectoryDatabase(
+                save_path=stdb_path,
+                top_k=self.config.algorithm.ccapo.stdb_top_k
+            )
         elif self.config.algorithm.adv_estimator in [
             AdvantageEstimator.GRPO,
             AdvantageEstimator.GRPO_PASSK,
@@ -454,7 +475,8 @@ class RayPPOTrainer:
             self.use_critic = False
         else:
             raise NotImplementedError
-
+        # --- 结束修改 ---
+        
         self._validate_config()
         self._create_dataloader(train_dataset, val_dataset, collate_fn, train_sampler)
 
@@ -925,6 +947,12 @@ class RayPPOTrainer:
             critic_remote_path = None if self.config.trainer.default_hdfs_dir is None else os.path.join(self.config.trainer.default_hdfs_dir, f"global_step_{self.global_steps}", "critic")
             self.critic_wg.save_checkpoint(critic_local_path, critic_remote_path, self.global_steps, max_ckpt_to_keep=max_critic_ckpt_to_keep)
 
+        # --- ✅ [CCAPO] 新增：保存 STDB ---
+        if self.stdb:
+            print(f"Saving STDB index to {self.stdb.save_path}...")
+            self.stdb.save()
+        # --- 结束 ---
+
         # save dataloader
         dataloader_local_path = os.path.join(local_global_step_folder, "data.pt")
         dataloader_state_dict = self.train_dataloader.state_dict()
@@ -1062,6 +1090,9 @@ class RayPPOTrainer:
                     non_tensor_batch_keys_to_pop.append("tools_kwargs")
                 if "ground_truth_answer" in batch.non_tensor_batch:
                     non_tensor_batch_keys_to_pop.append("ground_truth_answer")
+                
+                # --- ✅ [CCAPO] 'prompt_vector' 和 'index' 不能 pop ---
+                # 幸运的是，它们默认不会被 pop
 
                 gen_batch = batch.pop(
                     batch_keys=batch_keys_to_pop,
@@ -1180,7 +1211,8 @@ class RayPPOTrainer:
                             values = self.critic_wg.compute_values(batch)
                             batch = batch.union(values)
 
-                    with _timer("adv", timing_raw):
+                    # --- ✅ [CCAPO] 重构 Advantage 和 Update 步骤 ---
+                    with _timer("adv_and_update", timing_raw):
                         # we combine with rule-based rm
                         reward_extra_infos_dict: dict[str, list]
                         if self.config.reward_model.launch_reward_fn_async:
@@ -1205,40 +1237,72 @@ class RayPPOTrainer:
                         else:
                             batch.batch["token_level_rewards"] = batch.batch["token_level_scores"]
 
-                        # compute advantages, executed on the driver process
 
-                        norm_adv_by_std_in_grpo = self.config.algorithm.get("norm_adv_by_std_in_grpo", True)  # GRPO adv normalization factor
+                        # --- ✅ [CCAPO] 核心逻辑分支 ---
+                        if self.config.algorithm.adv_estimator == AdvantageEstimator.CCAPO:
+                            # --- CCAPO LOGIC ---
+                            G_online_batch = batch # 'batch' a.k.a G_online
+                            
+                            # 1. Get G_buffer from STDB
+                            with _timer("stdb_get", timing_raw):
+                                online_steps_list = to_list_of_dict(G_online_batch)
+                                buffer_steps_list = self.stdb.get_buffer_trajectories(online_steps_list)
+                                if buffer_steps_list:
+                                    buffer_batch = DataProto.from_single_dict(collate_fn(buffer_steps_list))
+                                else:
+                                    buffer_batch = None
+                            
+                            # 2. Update Actor (CCAPO does not use a critic)
+                            if self.config.trainer.critic_warmup <= self.global_steps:
+                                with _timer("update_actor_ccapo", timing_raw):
+                                    G_online_batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
+                                    
+                                    # Send both batches to the actor worker
+                                    actor_output = self.actor_rollout_wg.update_actor_ccapo(G_online_batch, buffer_batch)
+                                
+                                actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
+                                metrics.update(actor_output_metrics)
+                                
+                                # 3. Update STDB
+                                if 'online_trajs_for_stdb' in actor_output.meta_info:
+                                    with _timer("stdb_add", timing_raw):
+                                        self.stdb.add_online_trajectories(actor_output.meta_info['online_trajs_for_stdb'])
 
-                        batch = compute_advantage(
-                            batch,
-                            adv_estimator=self.config.algorithm.adv_estimator,
-                            gamma=self.config.algorithm.gamma,
-                            lam=self.config.algorithm.lam,
-                            num_repeat=self.config.actor_rollout_ref.rollout.n,
-                            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
-                            multi_turn=self.config.actor_rollout_ref.rollout.multi_turn.enable,
-                            use_pf_ppo=self.config.algorithm.use_pf_ppo,
-                            pf_ppo_reweight_method=self.config.algorithm.pf_ppo.reweight_method,
-                            pf_ppo_weight_pow=self.config.algorithm.pf_ppo.weight_pow,
-                            step_advantage_w=self.config.algorithm.gigpo.step_advantage_w,
-                            gigpo_mode=self.config.algorithm.gigpo.mode,
-                        )
+                        else:
+                            # --- Existing GAE/GRPO/GiGPO Logic ---
+                            with _timer("adv", timing_raw):
+                                norm_adv_by_std_in_grpo = self.config.algorithm.get("norm_adv_by_std_in_grpo", True)  # GRPO adv normalization factor
+                                batch = compute_advantage(
+                                    batch,
+                                    adv_estimator=self.config.algorithm.adv_estimator,
+                                    gamma=self.config.algorithm.gamma,
+                                    lam=self.config.algorithm.lam,
+                                    num_repeat=self.config.actor_rollout_ref.rollout.n,
+                                    norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+                                    multi_turn=self.config.actor_rollout_ref.rollout.multi_turn.enable,
+                                    use_pf_ppo=self.config.algorithm.use_pf_ppo,
+                                    pf_ppo_reweight_method=self.config.algorithm.pf_ppo.reweight_method,
+                                    pf_ppo_weight_pow=self.config.algorithm.pf_ppo.weight_pow,
+                                    step_advantage_w=self.config.algorithm.gigpo.step_advantage_w,
+                                    gigpo_mode=self.config.algorithm.gigpo.mode,
+                                )
 
-                    # update critic
-                    if self.use_critic:
-                        with _timer("update_critic", timing_raw):
-                            critic_output = self.critic_wg.update_critic(batch)
-                        critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
-                        metrics.update(critic_output_metrics)
+                            # update critic
+                            if self.use_critic:
+                                with _timer("update_critic", timing_raw):
+                                    critic_output = self.critic_wg.update_critic(batch)
+                                critic_output_metrics = reduce_metrics(critic_output.meta_info["metrics"])
+                                metrics.update(critic_output_metrics)
 
-                    # implement critic warmup
-                    if self.config.trainer.critic_warmup <= self.global_steps:
-                        # update actor
-                        with _timer("update_actor", timing_raw):
-                            batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
-                            actor_output = self.actor_rollout_wg.update_actor(batch)
-                        actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
-                        metrics.update(actor_output_metrics)
+                            # implement critic warmup
+                            if self.config.trainer.critic_warmup <= self.global_steps:
+                                # update actor
+                                with _timer("update_actor", timing_raw):
+                                    batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
+                                    actor_output = self.actor_rollout_wg.update_actor(batch)
+                                actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
+                                metrics.update(actor_output_metrics)
+                        # --- 结束 CCAPO 逻辑分支 ---
 
                     # Log rollout generations if enabled
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)

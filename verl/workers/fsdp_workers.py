@@ -27,6 +27,13 @@ from codetiming import Timer
 from omegaconf import DictConfig, open_dict
 from torch.distributed.device_mesh import init_device_mesh
 
+# --- ✅ [CCAPO] 新增 Imports ---
+from sentence_transformers import SentenceTransformer
+from verl.utils.dataset.rl_dataset import collate_fn
+from agent_system.multi_turn_rollout.utils import to_list_of_dict
+from agent_system.reward_manager import ccapo_algos
+# --- 结束 ---
+
 import verl.utils.torch_functional as verl_F
 from verl.utils.py_functional import convert_to_regular_types
 from verl import DataProto
@@ -592,6 +599,97 @@ class ActorRolloutRefWorker(Worker):
                 processing_class=self.processor if self.processor is not None else self.tokenizer,
                 checkpoint_contents=self.config.actor.checkpoint.contents,
             )
+
+        # --- ✅ [CCAPO] 新增：初始化 SentenceTransformer ---
+        self.embedding_model = None
+        # worker 的 self.config 是 config.actor_rollout_ref
+        # 我们假设 ccapo 的配置被添加到了 worker config 的 'algorithm.ccapo'
+        if self.config.get("algorithm", {}).get("adv_estimator") == "ccapo":
+            try:
+                model_name = self.config.algorithm.ccapo.embedding_model_name
+                logger.info(f"[CCAPO] Loading SentenceTransformer model: {model_name}")
+                self.embedding_model = SentenceTransformer(model_name)
+                # 将模型移动到当前 worker 的 GPU
+                self.embedding_model.to(get_torch_device().current_device())
+                logger.info(f"[CCAPO] SentenceTransformer model loaded to device.")
+            except AttributeError:
+                 logger.error("[CCAPO] 'algorithm.ccapo.embedding_model_name' not found. Make sure 'algorithm.ccapo' is defined under 'actor_rollout_ref' in your YAML.")
+                 raise
+            except Exception as e:
+                logger.error(f"[CCAPO] Failed to load SentenceTransformer model: {e}")
+                raise e
+        # --- 结束 ---
+
+    # --- ✅ [CCAPO] 新增：CCAPO 更新方法 ---
+    @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
+    def update_actor_ccapo(self, G_online_batch: DataProto, G_buffer_batch: DataProto):
+        """
+        [CCAPO] 执行 CCAPO 策略更新。
+        这是由 ray_trainer 调用的 RPC 端点。
+        """
+        # 1. 确保模型/优化器在 GPU 上
+        assert self._is_actor
+        if self._is_offload_param:
+            load_fsdp_model_to_gpu(self.actor_module_fsdp)
+        if self._is_offload_optimizer:
+            load_fsdp_optimizer(optimizer=self.actor_optimizer, device_id=get_torch_device().current_device())
+
+        # 2. 将数据移至设备
+        G_online_batch = G_online_batch.to(get_torch_device().current_device())
+        if G_buffer_batch:
+            G_buffer_batch = G_buffer_batch.to(get_torch_device().current_device())
+        
+        # 3. 检查 embedding_model
+        if self.embedding_model is None:
+            raise RuntimeError("[CCAPO] adv_estimator is 'ccapo' but embedding_model was not loaded. Check config.")
+
+        # 4. 执行更新
+        with self.ulysses_sharding_manager:
+            G_online_batch = self.ulysses_sharding_manager.preprocess_data(data=G_online_batch)
+            if G_buffer_batch:
+                G_buffer_batch = self.ulysses_sharding_manager.preprocess_data(data=G_buffer_batch)
+
+            with Timer(name="update_policy_ccapo", logger=None) as timer:
+                # 我们需要将 ccapo 的特定配置传递下去
+                # 假设它在 self.config.algorithm.ccapo
+                ccapo_config = self.config.algorithm.ccapo
+                
+                metrics, trajs_for_stdb = self.actor.update_policy_ccapo(
+                    G_online_batch=G_online_batch,
+                    G_buffer_batch=G_buffer_batch,
+                    embedding_model=self.embedding_model,
+                    ccapo_config=ccapo_config
+                )
+            
+            delta_time = timer.last
+            # (注意: FLOPs 计算现在只基于 G_online)
+            global_num_tokens = G_online_batch.meta_info["global_token_num"]
+            estimated_flops, promised_flops = self.flops_counter.estimate_flops(global_num_tokens, delta_time)
+            metrics["perf/mfu/actor"] = estimated_flops * self.config.actor.ppo_epochs / promised_flops / self.world_size
+            metrics["perf/max_memory_allocated_gb"] = get_torch_device().max_memory_allocated() / (1024**3)
+            metrics["perf/max_memory_reserved_gb"] = get_torch_device().max_memory_reserved() / (1024**3)
+            metrics["perf/cpu_memory_used_gb"] = psutil.virtual_memory().used / (1024**3)
+
+            lr = self.actor_lr_scheduler.get_last_lr()[0]
+            metrics["actor/lr"] = lr
+            self.actor_lr_scheduler.step()
+
+            # 5. 准备输出
+            output = DataProto(meta_info={"metrics": metrics, "online_trajs_for_stdb": trajs_for_stdb})
+            
+            output = self.ulysses_sharding_manager.postprocess_data(data=output)
+            output = output.to("cpu")
+
+        # 6. Offload (if configured)
+        if self._is_offload_param:
+            offload_fsdp_model_to_cpu(self.actor_module_fsdp)
+            log_gpu_memory_usage("After offload actor model during update_actor_ccapo", logger=logger)
+        if self._is_offload_optimizer:
+            offload_fsdp_optimizer(optimizer=self.actor_optimizer)
+            log_gpu_memory_usage("After offload actor optimizer during update_actor_ccapo", logger=logger)
+
+        return output
+    # --- 结束 CCAPO 方法 ---
 
     @register(dispatch_mode=Dispatch.DP_COMPUTE_PROTO)
     def update_actor(self, data: DataProto):

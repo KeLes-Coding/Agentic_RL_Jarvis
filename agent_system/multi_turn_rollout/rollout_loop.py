@@ -240,6 +240,7 @@ class TrajectoryCollector:
     def gather_rollout_data(
             self,
             total_batch_list: List[List[Dict]],
+            total_infos: List[List[Dict]], # <--- ✅ [CCAPO] 接收 total_infos
             episode_rewards: np.ndarray,
             episode_lengths: np.ndarray,
             success: Dict[str, np.ndarray],
@@ -249,7 +250,8 @@ class TrajectoryCollector:
         Collect and organize trajectory data, handling batch size adjustments to meet parallel training requirements.
         
         Parameters:
-            total_batch_list (List[List[Dict]): List of trajectory data for each environment
+            total_batch_list (List[List[Dict]]): List of trajectory data for each environment
+            total_infos (List[List[Dict]]): List of info dicts from env.step()
             episode_rewards (np.ndarray): Total rewards for each environment
             episode_lengths (np.ndarray): Total steps for each environment
             success (Dict[str, np.ndarray]): Success samples for each environment
@@ -274,10 +276,60 @@ class TrajectoryCollector:
         
         effective_batch = []
         for bs in range(batch_size):
-            # sum the rewards for each data in total_batch_list[bs]
-            for data in total_batch_list[bs]:
+            
+            # --- ✅ [CCAPO] Phase 1. 轨迹级别(Macro)数据聚合 ---
+            
+            # 1.1. 从最后一步的 info 中提取 trajectory summary
+            final_summary = {}
+            if total_infos[bs]:
+                final_summary = total_infos[bs][-1].get('final_summary', {})
+            
+            # 1.2. 提取 $R_\tau$ 所需的轨迹级数据
+            # R_success
+            traj_task_completed = final_summary.get('task_completed', False)
+            # P_steps
+            traj_total_steps = episode_lengths[bs] # 这是 TotalSteps_tau
+            # P_token
+            traj_total_tokens = final_summary.get('token_usage', {}).get('total_tokens', 0)
+
+            # 1.3. 预计算 $N_{success}(\tau)$ (Sec 5.1.2.1, 5.1.3.1)
+            traj_n_success_steps = 0
+            for step_info in total_infos[bs]:
+                if step_info.get('action_success', False):
+                    traj_n_success_steps += 1
+            
+            # --- ✅ [CCAPO] Phase 2. 步骤级别(Micro)数据聚合 ---
+            step_index_in_traj = 0
+            for i, data in enumerate(total_batch_list[bs]):
                 assert traj_uid[bs] == data['traj_uid'], "data is not from the same trajectory"
                 if data['active_masks']:
+                    
+                    # 2.1. 附加轨迹级(Macro)信息到每一步
+                    data['traj_task_completed'] = traj_task_completed
+                    data['traj_total_steps'] = traj_total_steps
+                    data['traj_total_tokens'] = traj_total_tokens
+                    data['traj_n_success_steps'] = traj_n_success_steps
+                    
+                    # 2.2. 附加步骤级(Micro)信息 (来自 infos)
+                    step_info = total_infos[bs][i] if i < len(total_infos[bs]) else {}
+                    
+                    data['step_index'] = step_index_in_traj # $t$
+                    data['thought'] = step_info.get('thought', '') # (Sec 5.2)
+                    data['parsed_action'] = step_info.get('parsed_action', '') # (Sec 5.2)
+                    data['action_type'] = step_info.get('action_type', '') # (Sec 5.1.1)
+                    data['action_success'] = step_info.get('action_success', False) # (Sec 5.1.2.1, 5.1.3.1)
+                    data['step_token_usage'] = step_info.get('token_usage', {}) # (Sec 5.1.3.2)
+                    data['step_confidence'] = step_info.get('confidence_metrics', {}).get('average_confidence', 0.0)
+                    data['log_dir_path'] = step_info.get('log_dir_path', '') # <--- ✅ [CCAPO] 新增
+                    
+                    # 2.3. 附加原始的 `rollout` 数据 (用于 IS 和 VF)
+                    # `data['rollout_log_probs']` 已经由 `to_list_of_dict(batch)` 自动添加
+                    # `data['values']` (如果存在) 也已自动添加
+                    # `data['prompt_vector']` 也会被 `to_list_of_dict` 自动添加 (来自 gen_batch)
+                    
+                    step_index_in_traj += 1
+
+                    # --- 保留VERL原有数据 ---
                     # episode_rewards
                     data['episode_rewards'] = episode_rewards[bs]
                     data['episode_rewards_mean'] = episode_rewards_mean
@@ -425,7 +477,7 @@ class TrajectoryCollector:
                 print(f"  [环境 {i}]: {response}")
             print("*"*50 + "\n")
 
-            # ======================= ✅ 计算并暂存 Token 和置信度信息 ✅ =======================
+            # ======================= ✅ [CCAPO] 计算并暂存 Token、置信度、对数概率 ✅ =======================
             try:
                 # 1. 计算 Token
                 input_token_counts = torch.sum(batch_input.batch["attention_mask"], dim=1)
@@ -453,6 +505,7 @@ class TrajectoryCollector:
                 # 3. 准备传递给 env_manager 的数据
                 token_usage_list = []
                 confidence_metrics_list = []
+                log_probs_list = [] # <--- ✅ [CCAPO] 新增
                 for i in range(batch_size):
                     token_usage_list.append({
                         "prompt_tokens": input_token_counts[i].item(),
@@ -463,12 +516,17 @@ class TrajectoryCollector:
                         "average_log_probability": average_log_probs[i].item(),
                         "average_confidence": average_confidence[i].item(),
                     })
+                    # <--- ✅ [CCAPO] 收集每个样本的 log_probs 张量 (Sec 6.1)
+                    log_probs_list.append(log_probs[i])
                 
                 # 4. 暂存数据
                 if hasattr(envs, "set_last_step_token_usage"):
                     envs.set_last_step_token_usage(token_usage_list)
                 if hasattr(envs, "set_last_step_confidence"):
                     envs.set_last_step_confidence(confidence_metrics_list)
+                # <--- ✅ [CCAPO] 暂存 log_probs
+                if hasattr(envs, "set_last_step_log_probs"):
+                    envs.set_last_step_log_probs(log_probs_list)
 
             except Exception as e:
                 import traceback
@@ -498,7 +556,7 @@ class TrajectoryCollector:
             batch_list: list[dict] = to_list_of_dict(batch)
             for i in range(batch_size):
                 total_batch_list[i].append(batch_list[i])
-                total_infos[i].append(infos[i])
+                total_infos[i].append(infos[i]) # <--- ✅ [CCAPO] 必须收集 infos
 
             is_done = np.logical_or(is_done, dones)
             obs = next_obs
@@ -518,13 +576,18 @@ class TrajectoryCollector:
                 # 检查 info_pool_managers[i] 是否仍然存在
                 if i in envs.info_pool_managers:
                     # 使用新的 finalize_run 签名，task_completed 明确设置为 False
-                    envs.info_pool_managers[i].finalize_run(
+                    # ✅ [CCAPO] 捕获 finalize_run 的返回
+                    final_summary = envs.info_pool_managers[i].finalize_run(
                         status=final_status,
                         summary=summary_text,
                         run_start_time=envs.run_start_times[i],
                         task=envs.tasks[i],
                         task_completed=False 
                     )
+                    # ✅ [CCAPO] 将 final_summary 存入最后一步的 info
+                    if total_infos[i]:
+                        total_infos[i][-1]['final_summary'] = final_summary
+                    
                     # 终结后从池中移除
                     envs.info_pool_managers.pop(i, None)
         # ========================================================================
@@ -535,7 +598,7 @@ class TrajectoryCollector:
             episode_rewards=episode_rewards,
             episode_lengths=episode_lengths,
         )
-        return total_batch_list, episode_rewards, episode_lengths, success, traj_uid
+        return total_batch_list, total_infos, episode_rewards, episode_lengths, success, traj_uid # <--- ✅ [CCAPO] 返回 total_infos
     
     def dynamic_multi_turn_loop(
             self,
@@ -555,12 +618,14 @@ class TrajectoryCollector:
 
         Returns:
             total_batch_list (List[Dict]): Complete set of rollout steps.
+            total_infos (List[List[Dict]]): List of info dicts from env.step()
             total_episode_rewards (np.ndarray): Accumulated rewards.
             total_episode_lengths (np.ndarray): Lengths per episode.
             total_success (Dict[str, np.ndarray]): Success metrics.
             total_traj_uid (np.ndarray): Trajectory IDs.
         """
         total_batch_list = []
+        total_infos = [] # <--- ✅ [CCAPO] 收集 total_infos
         total_episode_rewards = []
         total_episode_lengths = []
         total_success = []
@@ -574,7 +639,7 @@ class TrajectoryCollector:
                 print(f"valid num={len(total_batch_list)} < target num={self.config.data.train_batch_size * self.config.env.rollout.n}. Keep generating... ({try_count}/{max_try_count})")
             try_count += 1
 
-            batch_list, episode_rewards, episode_lengths, success, traj_uid = self.vanilla_multi_turn_loop(
+            batch_list, infos, episode_rewards, episode_lengths, success, traj_uid = self.vanilla_multi_turn_loop( # <--- ✅ [CCAPO] 接收 infos
                 gen_batch=gen_batch,
                 actor_rollout_wg=actor_rollout_wg,
                 envs=envs,
@@ -589,6 +654,7 @@ class TrajectoryCollector:
                                                                                                  )
             
             total_batch_list += batch_list
+            total_infos += infos # <--- ✅ [CCAPO] 聚合 infos
             total_episode_rewards.append(episode_rewards)
             total_episode_lengths.append(episode_lengths)
             total_success.append(success)
@@ -599,7 +665,7 @@ class TrajectoryCollector:
         total_success = {key: np.concatenate([success[key] for success in total_success], axis=0) for key in total_success[0].keys()}
         total_traj_uid = np.concatenate(total_traj_uid, axis=0)
 
-        return total_batch_list, total_episode_rewards, total_episode_lengths, total_success, total_traj_uid
+        return total_batch_list, total_infos, total_episode_rewards, total_episode_lengths, total_success, total_traj_uid # <--- ✅ [CCAPO] 返回 total_infos
 
     def multi_turn_loop(
             self,
@@ -623,7 +689,7 @@ class TrajectoryCollector:
         # Initial observations from the environment
         if self.config.algorithm.filter_groups.enable and is_train:
             # Dynamic Sampling (for DAPO and Dynamic GiGPO)
-            total_batch_list, total_episode_rewards, total_episode_lengths, total_success, total_traj_uid = \
+            total_batch_list, total_infos, total_episode_rewards, total_episode_lengths, total_success, total_traj_uid = \
                 self.dynamic_multi_turn_loop(
                 gen_batch=gen_batch,
                 actor_rollout_wg=actor_rollout_wg,
@@ -631,7 +697,7 @@ class TrajectoryCollector:
             )
         else:
             # Vanilla Sampling   
-            total_batch_list, total_episode_rewards, total_episode_lengths, total_success, total_traj_uid = \
+            total_batch_list, total_infos, total_episode_rewards, total_episode_lengths, total_success, total_traj_uid = \
                 self.vanilla_multi_turn_loop(
                 gen_batch=gen_batch,
                 actor_rollout_wg=actor_rollout_wg,
@@ -645,6 +711,7 @@ class TrajectoryCollector:
         # Create trajectory data
         gen_batch_output: DataProto = self.gather_rollout_data(
             total_batch_list=total_batch_list,
+            total_infos=total_infos, # <--- ✅ [CCAPO] 传递 total_infos
             episode_rewards=total_episode_rewards,
             episode_lengths=total_episode_lengths,
             success=total_success,

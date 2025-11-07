@@ -31,6 +31,14 @@ from transformers import PreTrainedTokenizer, ProcessorMixin
 import verl.utils.torch_functional as verl_F
 from verl.utils.model import compute_position_id_with_mask
 
+# ❗️ 新增：导入 sentence_transformers，并处理导入失败
+try:
+    from sentence_transformers import SentenceTransformer
+    _SENTENCE_TRANSFORMERS_AVAILABLE = True
+except ImportError:
+    SentenceTransformer = None
+    _SENTENCE_TRANSFORMERS_AVAILABLE = False
+
 logger = logging.getLogger(__name__)
 
 
@@ -74,6 +82,7 @@ class RLHFDataset(Dataset):
     - Optionally handles images/videos via a ProcessorMixin.
     - Filters prompts over a max length.
     - Supports resuming from checkpoints.
+    - ❗️ (新增) Optionally vectorizes prompts for similarity search.
 
     Args:
         data_files (str or list): Path(s) to Parquet file(s).
@@ -115,6 +124,28 @@ class RLHFDataset(Dataset):
         self.need_tools_kwargs = config.get("need_tools_kwargs", False)
         self.filter_prompts = config.get("filter_prompts", True)
         self.serialize_dataset = False
+
+        # ❗️ 新增：初始化 prompt 向量化器
+        self.vectorize_prompts = True  # 默认开启
+        self.vectorizer_model_name = "all-MiniLM-L6-v2" # 默认一个轻量级模型
+        self.vectorizer = None
+        
+        if self.vectorize_prompts:
+            if _SENTENCE_TRANSFORMERS_AVAILABLE:
+                try:
+                    # all-MiniLM-L6-v2 是一个常用的轻量级句向量模型
+                    self.vectorizer = SentenceTransformer(self.vectorizer_model_name) 
+                    logger.info(f"成功初始化 Prompt 向量化器: {self.vectorizer_model_name}")
+                except Exception as e:
+                    logger.error(f"加载 SentenceTransformer 模型 '{self.vectorizer_model_name}' 失败: {e}")
+                    self.vectorize_prompts = False
+            else:
+                logger.error(
+                    "未找到 'sentence-transformers' 库。"
+                    "请通过 `pip install sentence-transformers` 安装以启用 prompt 向量化。"
+                )
+                self.vectorize_prompts = False # 自动禁用该功能
+
         self._download()
         self._read_files_and_tokenize()
 
@@ -186,14 +217,34 @@ class RLHFDataset(Dataset):
         original_row: dict = self.dataframe[item]
 
         # ❗️ 关键修复：创建一个副本，以防后续操作修改原始字典。
-        #    `_build_messages` 会 pop 'prompt' 键，所以我们在副本上操作。
         row_dict = original_row.copy()
         
-        messages = self._build_messages(row_dict)
-        model_inputs = {}
-
         # 最终要返回的样本，我们从这里开始构建
         final_item = {}
+
+        # ❗️ [CCAPO 修正]：在此处，从 original_row 向量化核心任务
+        if self.vectorizer is not None:
+            try:
+                # 根据你的 parquet 样本: prompt 是 [{'content': '...', 'role': 'user'}]
+                # 我们提取第一个 'content' 作为任务字符串
+                task_content_string = original_row[self.prompt_key][0]['content']
+                prompt_vector = self.vectorizer.encode(task_content_string, convert_to_tensor=True)
+                final_item["prompt_vector"] = prompt_vector
+            except Exception as e:
+                logger.warning(f"Failed to vectorize prompt for item {item} (task: {original_row[self.prompt_key]}): {e}")
+                # ❗️ [FIX] 创建一个零向量而不是 None，以确保 collate_fn 正常工作
+                try:
+                    dim = self.vectorizer.get_sentence_embedding_dimension()
+                    final_item["prompt_vector"] = torch.zeros(dim, dtype=torch.float32)
+                except Exception as e2:
+                    logger.error(f"无法获取向量器维度: {e2}. 将 prompt_vector 设置为 None.")
+                    # 最终回退（如果维度都拿不到），但这在 collate_fn 中仍可能失败
+                    final_item["prompt_vector"] = None
+        
+        # (如果 self.vectorizer is None, 则 final_item 中不会有 "prompt_vector" 键)
+
+        messages = self._build_messages(row_dict)
+        model_inputs = {}
 
         if self.processor is not None:
             from verl.utils.dataset.vision_utils import process_image, process_video
@@ -301,8 +352,8 @@ class RLHFDataset(Dataset):
         final_item["index"] = index
         final_item["tools_kwargs"] = tools_kwargs
         
-        print("final_item keys:", final_item.keys())
-        print(f"Processed item {item}: index={final_item['index']}, input_ids shape={final_item['input_ids'].shape}")
+        # print("final_item keys:", final_item.keys())
+        # print(f"Processed item {item}: index={final_item['index']}, input_ids shape={final_item['input_ids'].shape}")
         return final_item
 
     def __getstate__(self):
@@ -311,6 +362,30 @@ class RLHFDataset(Dataset):
 
             if "dataframe" in state:
                 del state["dataframe"]
+            
+            # ❗️ 新增：防止 vectorizer 实例被序列化
+            if "vectorizer" in state:
+                del state["vectorizer"]
+                
             return state
 
         return self.__dict__.copy()
+
+    # ❗️ 新增：__setstate__ 用于在反序列化时重新加载 vectorizer
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        # 重新初始化 vectorizer
+        if self.vectorize_prompts:
+            try:
+                from sentence_transformers import SentenceTransformer
+                self.vectorizer = SentenceTransformer(self.vectorizer_model_name)
+                logger.info(f"成功从 state 重新初始化 Prompt 向量化器: {self.vectorizer_model_name}")
+            except ImportError:
+                logger.error(
+                    "未找到 'sentence-transformers' 库。"
+                    "请通过 `pip install sentence-transformers` 安装以启用 prompt 向量化。"
+                )
+                self.vectorizer = None
+                self.vectorize_prompts = False
+        else:
+            self.vectorizer = None

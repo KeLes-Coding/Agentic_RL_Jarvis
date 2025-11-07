@@ -252,6 +252,30 @@ algorithm:
   filter_groups: # DAPO from https://arxiv.org/abs/2503.14476
     enable: False
     max_num_gen_batches: 10
+  # --- ✅ [CCAPO] 新增：添加 CCAPO 专属配置 ---
+  ccapo:
+    # R_tau (Sec 4)
+    alpha: 0.2                  # P_steps 权重
+    gamma_token: 0.1            # P_token 权重 (注意：原 'gamma' 冲突，重命名为 gamma_token)
+    max_steps: 50               # 必须与 env.max_steps 匹配
+    max_tokens: 8192            # 轨迹的最大 token 限制
+    min_reasonable_steps: 3     # P_shortcut 阈值
+    lambda_shortcut: 0.5        # P_shortcut 惩罚
+    
+    # R_step (Sec 5)
+    w_out: 1.0                  # Q_economy output token 权重
+    w_in: 0.02                  # Q_economy input token 权重
+    alpha_step: 0.2             # Q_step 权重
+    w_match: 1.0                # R_match (失败轨迹) 权重
+    similarity_threshold: 0.9   # R_match 余弦相似度阈值
+    
+    # A_final (Sec 1)
+    omega: 1.0                  # 微观优势 A_step 的权重
+    
+    # STDB (Sec 2)
+    stdb_top_k: 8
+    stdb_save_path: "stdb_index.pt" # 将保存在 trainer.default_local_dir
+    embedding_model_name: "all-MiniLM-L6-v2" # SentenceTransformer 模型
 
 trainer:
   balance_batch: True

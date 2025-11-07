@@ -553,6 +553,7 @@ class JarvisEnvironmentManager(EnvironmentManagerBase):
         # ======================= ✅ 添加用于暂存 Token 和置信度信息的变量 ✅ =======================
         self.last_token_usage: List[dict] = None
         self.last_confidence: List[dict] = None
+        self.last_log_probs: List[torch.Tensor] = None # <--- ✅ [CCAPO] 新增
         # ===================================================================================
 
     # --- 🗑️ 移除: 不再需要此方法，配置由底层 envs.py 管理 ---
@@ -569,6 +570,10 @@ class JarvisEnvironmentManager(EnvironmentManagerBase):
     def set_last_step_confidence(self, confidence_list: List[dict]):
         """从外部（rollout_loop）接收并暂存当前步骤的置信度信息。"""
         self.last_confidence = confidence_list
+
+    def set_last_step_log_probs(self, log_probs_list: List[torch.Tensor]): # <--- ✅ [CCAPO] 新增
+        """从外部（rollout_loop）接收并暂存当前步骤的对数概率。"""
+        self.last_log_probs = log_probs_list
     # ================================================================================
 
     def _initialize_loggers_for_new_run(self):
@@ -623,16 +628,25 @@ class JarvisEnvironmentManager(EnvironmentManagerBase):
 
         # 只处理活动环境的数据
         for i in range(self.active_batch_size):
+            
+            # --- ✅ [CCAPO] 1. 解析 action_type (Sec 5.1.2) ---
+            action_type = "unknown"
+            if "(" in parsed_actions[i]:
+                action_type = parsed_actions[i].split("(", 1)[0].strip()
+            
+            # --- ✅ [CCAPO] 2. 准备要记录和传递的完整 step_data ---
             if i in self.info_pool_managers:
                 step_data = {
                     "task": self.tasks[i],
                     "thought": thoughts[i],
                     "parsed_action": parsed_actions[i],
+                    "action_type": action_type, # <--- ✅ [CCAPO] 新增
                     "action_success": infos[i].get("action_success", False),
                     "raw_obs_data": infos[i].get("raw_obs_data", {}),
                     "compressed_screenshot_bytes": infos[i].get("compressed_screenshot_bytes"),
                     "llm_prompt": self.last_prompts[i],
-                    "raw_llm_response": text_actions[i]
+                    "raw_llm_response": text_actions[i],
+                    "log_dir_path": self.info_pool_managers[i].log_dir # <--- ✅ [CCAPO] 新增
                 }
                 
                 if self.last_token_usage and i < len(self.last_token_usage):
@@ -640,8 +654,22 @@ class JarvisEnvironmentManager(EnvironmentManagerBase):
                 
                 if self.last_confidence and i < len(self.last_confidence):
                     step_data["confidence_metrics"] = self.last_confidence[i]
+                
+                if self.last_log_probs and i < len(self.last_log_probs): # <--- ✅ [CCAPO] 新增
+                    step_data["rollout_log_probs"] = self.last_log_probs[i]
 
                 self.info_pool_managers[i].record_step(step_data)
+
+                # --- ✅ [CCAPO] 3. 将所有微观数据复制到 infos 字典中 ---
+                #    (以便 gather_rollout_data 稍后可以访问它们)
+                infos[i]['thought'] = step_data['thought']
+                infos[i]['parsed_action'] = step_data['parsed_action']
+                infos[i]['action_type'] = step_data['action_type']
+                # 'action_success' 已经由 self.envs.step() 放入 infos[i]
+                infos[i]['token_usage'] = step_data.get('token_usage', {})
+                infos[i]['confidence_metrics'] = step_data.get('confidence_metrics', {})
+                infos[i]['log_dir_path'] = step_data['log_dir_path'] # <--- ✅ [CCAPO] 新增
+                # rollout_log_probs 不需要放入 infos,因为它已经在 batch_list 中
 
                 # ======================= ✅ 2. 修改终结逻辑以匹配新签名 ✅ =======================
                 if dones[i]:
@@ -666,13 +694,16 @@ class JarvisEnvironmentManager(EnvironmentManagerBase):
                                     summary_text = content.strip("'\" ")
 
                     # 使用 info_pool.py 中新的 finalize_run 签名
-                    self.info_pool_managers[i].finalize_run(
+                    final_summary = self.info_pool_managers[i].finalize_run( # <--- ✅ [CCAPO] 捕获返回
                         status=final_status,
                         summary=summary_text,
                         run_start_time=self.run_start_times[i],
                         task=self.tasks[i],
                         task_completed=task_completed #直接传递评估结果
                     )
+                    
+                    infos[i]['final_summary'] = final_summary # <--- ✅ [CCAPO] 存入 info
+                    
                     # 清理完成的任务，避免重复终结
                     self.info_pool_managers.pop(i, None)
                 # =============================================================================

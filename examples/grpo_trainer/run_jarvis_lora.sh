@@ -18,7 +18,7 @@ group_size=4
 #     --val_data_size $val_data_size
 
 python3 -m verl.trainer.main_ppo \
-    algorithm.adv_estimator=grpo \
+    algorithm.adv_estimator=ccapo \
     data.train_files=/home/zzh/Workspace/verl-agent/data/atomic_tasks_list_wiki_train.parquet \
     data.val_files=/home/zzh/Workspace/verl-agent/data/atomic_tasks_list_wiki_val.parquet \
     data.train_batch_size=$train_data_size \
