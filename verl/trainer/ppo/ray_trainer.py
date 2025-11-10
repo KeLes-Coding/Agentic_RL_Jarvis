@@ -419,6 +419,16 @@ class RayPPOTrainer:
         self.tokenizer = tokenizer
         self.processor = processor
         self.config = config
+
+        # --- ✅ [CCAPO 修正] ---
+        # ActorRolloutRefWorker 需要访问根配置中的 'algorithm' 块
+        # 才能为 CCAPO 正确初始化 embedding_model。
+        # 我们在这里将其合并到 worker 的配置作用域中。
+        from omegaconf import open_dict
+        with open_dict(self.config):
+            if "algorithm" in self.config:
+                self.config.actor_rollout_ref.algorithm = self.config.algorithm
+
         self.reward_fn = reward_fn
         self.val_reward_fn = val_reward_fn
         self.envs = envs
@@ -486,7 +496,14 @@ class RayPPOTrainer:
         n_gpus = config.trainer.n_gpus_per_node * config.trainer.nnodes
 
         # 1. Check total batch size for data correctness
-        real_train_batch_size = config.data.train_batch_size * config.actor_rollout_ref.rollout.n
+        # --- ✅ [GRPO/CCAPO 修正 v3] ---
+        # 修复 'verl+env' 模式下的断言冲突：
+        # 'main_ppo.py' 强制 actor_rollout_ref.rollout.n == 1,
+        # 但此处的检查需要用 env.rollout.n 来计算真实的批次大小。
+        is_env_mode = config.env.get("env_name", None) is not None
+        group_size_n = config.env.rollout.get("n", 1) if is_env_mode else config.actor_rollout_ref.rollout.get("n", 1)
+        real_train_batch_size = config.data.train_batch_size * group_size_n
+        # --- 结束修正 ---
         assert real_train_batch_size % n_gpus == 0, f"real_train_batch_size ({real_train_batch_size}) must be divisible by total n_gpus ({n_gpus})."
 
         # A helper function to check "micro_batch_size" vs "micro_batch_size_per_gpu"
@@ -1077,6 +1094,15 @@ class RayPPOTrainer:
                 timing_raw = {}
                 batch: DataProto = DataProto.from_single_dict(batch_dict)
 
+                # --- ✅ [GRPO/CCAPO Fix] ---
+                # 根据 main_ppo.py 的断言, 'verl+env' 模式下
+                # 组大小（GRPO/CCAPO的'n'）由 'env.rollout.n' 控制.
+                # 我们在这里手动重复 batch，因为 traj_collector 似乎不自动处理。
+                repeat_times = self.config.env.rollout.get("n", 1)
+                if repeat_times > 1:
+                    batch = batch.repeat(repeat_times=repeat_times, interleave=True)
+                # --- 结束 Fix ---
+
                 # pop those keys for generation
                 batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
                 
@@ -1247,10 +1273,15 @@ class RayPPOTrainer:
                             with _timer("stdb_get", timing_raw):
                                 online_steps_list = to_list_of_dict(G_online_batch)
                                 buffer_steps_list = self.stdb.get_buffer_trajectories(online_steps_list)
+                                
+                                # --- ❗️ [CCAPO FIX] 修正此处的逻辑 ---
                                 if buffer_steps_list:
                                     buffer_batch = DataProto.from_single_dict(collate_fn(buffer_steps_list))
                                 else:
-                                    buffer_batch = None
+                                    # ✅ [CCAPO FIX] Create an empty DataProto instead of None.
+                                    # The decorator expects a DataProto object.
+                                    buffer_batch = DataProto.from_single_dict(data={})
+                                # --- 结束修正 ---
                             
                             # 2. Update Actor (CCAPO does not use a critic)
                             if self.config.trainer.critic_warmup <= self.global_steps:
@@ -1262,6 +1293,27 @@ class RayPPOTrainer:
                                 
                                 actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                                 metrics.update(actor_output_metrics)
+
+                                # 手动记录 Episode 统计数据
+                                # (这些数据存在于 'batch' 对象中，该对象由 'gen_batch_output' 在第 1230 行赋值)
+                                try:
+                                    if "episode_rewards" in batch.non_tensor_batch:
+                                        metrics["training/episode_rewards"] = np.mean(batch.non_tensor_batch["episode_rewards"])
+                                    if "episode_lengths" in batch.non_tensor_batch:
+                                        metrics["training/episode_lengths"] = np.mean(batch.non_tensor_batch["episode_lengths"])
+                                    if "success_rate" in batch.non_tensor_batch:
+                                        metrics["training/success_rate"] = np.mean(batch.non_tensor_batch["success_rate"])
+                                    
+                                    # 记录由 reward_fn 返回的任何其他 'reward/' 键
+                                    if batch.non_tensor_batch:
+                                        for k, v in batch.non_tensor_batch.items():
+                                            if k.startswith('reward/'):
+                                                try:
+                                                    metrics[f"training/{k}"] = np.mean(v)
+                                                except:
+                                                    pass # 忽略无法计算均值的数据
+                                except Exception as e:
+                                    print(f"Warning: [CCAPO] 手动记录 metrics 时出错: {e}")
                                 
                                 # 3. Update STDB
                                 if 'online_trajs_for_stdb' in actor_output.meta_info:
@@ -1303,6 +1355,8 @@ class RayPPOTrainer:
                                 actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                                 metrics.update(actor_output_metrics)
                         # --- 结束 CCAPO 逻辑分支 ---
+
+                            metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
 
                     # Log rollout generations if enabled
                     rollout_data_dir = self.config.trainer.get("rollout_data_dir", None)
@@ -1383,7 +1437,7 @@ class RayPPOTrainer:
                 # ======================== END DEBUG PRINT ========================
 
                 # collect metrics
-                metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
+                # metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
                 metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
                 # TODO: implement actual tflpo and theoretical tflpo
                 n_gpus = self.resource_pool_manager.get_n_gpus()

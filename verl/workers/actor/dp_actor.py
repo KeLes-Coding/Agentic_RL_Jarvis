@@ -1,21 +1,4 @@
-# Copyright 2024 Bytedance Ltd. and/or its affiliates
-# Copyright 2023-2024 SGLang Team
-# Copyright 2025 ModelBest Inc. and/or its affiliates
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-"""
-Single Process Actor
-"""
+# verl/workers/actor/dp_actor.py
 
 import itertools
 import logging
@@ -485,6 +468,36 @@ class DataParallelPPOActor(BasePPOActor):
         else:
             G_buffer_batch_final = None
 
+        # 修正: 'advantages' 是一个 np.ndarray(dtype=object)，因为它可能包含 None。
+        # 我们必须手动迭代，将 None 转换
+        try:
+            if G_online_batch_final and 'advantages' in G_online_batch_final.non_tensor_batch:
+                # 1. 弹出 object 数组
+                adv_np_array_online = G_online_batch_final.non_tensor_batch.pop('advantages')
+                
+                # 2. 手动迭代，将 None 替换为 0.0，其他转换为 float
+                adv_list_online = [float(adv) if adv is not None else 0.0 for adv in adv_np_array_online]
+                
+                # 3. 从干净的 float 列表创建张量
+                G_online_batch_final.batch['advantages'] = torch.tensor(
+                    adv_list_online, 
+                    dtype=torch.float32, 
+                    device=G_online_batch_final.batch.device # 确保在同一设备上
+                )
+                
+            if G_buffer_batch_final and 'advantages' in G_buffer_batch_final.non_tensor_batch:
+                # 对 G_buffer 执行相同操作
+                adv_np_array_buffer = G_buffer_batch_final.non_tensor_batch.pop('advantages')
+                adv_list_buffer = [float(adv) if adv is not None else 0.0 for adv in adv_np_array_buffer]
+                G_buffer_batch_final.batch['advantages'] = torch.tensor(
+                    adv_list_buffer,
+                    dtype=torch.float32,
+                    device=G_buffer_batch_final.batch.device # 确保在同一设备上
+                )
+        except Exception as e:
+            logger.error(f"[CCAPO] 转换 'advantages' 键时出错: {e}") 
+            raise e
+
         # --- 4. 准备 PPO 更新 (Sec 7) ---
         temperature = G_online_batch.meta_info.get("temperature", 1.0)
         multi_turn = G_online_batch.meta_info.get("multi_turn", False)
@@ -496,118 +509,152 @@ class DataParallelPPOActor(BasePPOActor):
         loss_agg_mode = self.config.loss_agg_mode
 
         metrics = {}
+        
+        # --- ✅ [CCAPO] 记录详细信号 ---
+        try:
+            metrics_to_log = ccapo_algos.collections.defaultdict(list)
+            # 我们只记录 G_online 的信号，以匹配 PPO 损失
+            for step in online_steps_final: 
+                metrics_to_log['R_tau'].append(step.get('R_tau', 0.0))
+                metrics_to_log['A_traj'].append(step.get('A_traj', 0.0))
+                metrics_to_log['R_step'].append(step.get('R_step', 0.0))
+                metrics_to_log['A_step'].append(step.get('A_step', 0.0))
+                metrics_to_log['R_format_novelty'].append(step.get('R_format_novelty', 0.0))
+                metrics_to_log['advantages'].append(step.get('advantages', 0.0)) # 记录最终优势
+            
+            for key, values in metrics_to_log.items():
+                if values:
+                    metrics[f'ccapo/online_{key}_mean'] = ccapo_algos.np.mean(values)
+                    metrics[f'ccapo/online_{key}_std'] = ccapo_algos.np.std(values)
+
+            # (可选) 记录 G_buffer 信号
+            if buffer_steps_final:
+                buffer_metrics_to_log = ccapo_algos.collections.defaultdict(list)
+                for step in buffer_steps_final:
+                    buffer_metrics_to_log['R_step'].append(step.get('R_step', 0.0))
+                    buffer_metrics_to_log['A_step'].append(step.get('A_step', 0.0))
+                    buffer_metrics_to_log['R_format_novelty'].append(step.get('R_format_novelty', 0.0))
+                    buffer_metrics_to_log['advantages'].append(step.get('advantages', 0.0))
+                
+                for key, values in buffer_metrics_to_log.items():
+                    if values:
+                        metrics[f'ccapo/buffer_{key}_mean'] = ccapo_algos.np.mean(values)
+        except Exception as e:
+            logger.warning(f"[CCAPO] 无法记录详细信号: {e}")
+        # --- 结束记录 ---
 
         # --- 5. PPO 循环 ---
         for epoch in range(self.config.ppo_epochs):
-            # (注意: 我们的实现假设 PPO epochs > 1 时，在整个 G_calc 上重复训练)
-            
+
             self.actor_optimizer.zero_grad()
+
+            # --- START: 修正后的微批次和梯度累积逻辑 ---
+
+            # 1. 确定微批次大小
+            ppo_micro_batch_size_per_gpu = self.config.ppo_micro_batch_size_per_gpu
+            if not ppo_micro_batch_size_per_gpu:
+                logger.warning("[CCAPO] ppo_micro_batch_size_per_gpu 未设置, 默认为 1。")
+                ppo_micro_batch_size_per_gpu = 1
             
-            total_loss = 0.0
+            # (注意: 我们假设不使用 use_dynamic_bsz，因为您的配置中未启用)
+
+            # 2. 准备所有要处理的数据
+            batches_to_process = []
+            if G_online_batch_final and G_online_batch_final.batch.batch_size[0] > 0:
+                batches_to_process.append(
+                    (G_online_batch_final.batch, (1.0 - lambda_sr), "online")
+                )
             
-            # --- 5.1 计算 L_online ---
-            if G_online_batch_final and G_online_batch_final.batch_size > 0:
-                # 前向传播 G_online
-                entropy_online, log_prob_online = self._forward_micro_batch(
-                    micro_batch=G_online_batch_final.batch, # 假设整个 batch 是一个 micro_batch
-                    temperature=temperature,
-                    calculate_entropy=(entropy_coeff != 0.0)
-                )
-                
-                # 获取 response_mask
-                response_length_online = G_online_batch_final.batch["responses"].size(1)
-                if multi_turn and "loss_mask" in G_online_batch_final.batch:
-                    response_mask_online = G_online_batch_final.batch["loss_mask"][:, -response_length_online:]
-                else:
-                    response_mask_online = G_online_batch_final.batch["attention_mask"][:, -response_length_online:]
-
-                pg_loss_online, pg_clipfrac_online, ppo_kl_online, pg_clipfrac_lower_online = compute_policy_loss(
-                    old_log_prob=G_online_batch_final.batch["rollout_log_probs"], # 这是 pi_theta_old
-                    log_prob=log_prob_online,
-                    advantages=G_online_batch_final.batch["advantages"], # A_final
-                    response_mask=response_mask_online,
-                    cliprange=clip_ratio,
-                    cliprange_low=clip_ratio_low,
-                    cliprange_high=clip_ratio_high,
-                    clip_ratio_c=clip_ratio_c,
-                    loss_agg_mode=loss_agg_mode,
-                )
-                
-                policy_loss_online = pg_loss_online
-                if entropy_coeff != 0.0 and entropy_online is not None:
-                    entropy_loss_online = agg_loss(loss_mat=entropy_online, loss_mask=response_mask_online, loss_agg_mode=loss_agg_mode)
-                    policy_loss_online = policy_loss_online - entropy_loss_online * entropy_coeff
-                    if epoch == 0: # 只记录一次
-                        append_to_dict(metrics, {"actor/entropy_loss_online": entropy_loss_online.detach().item()})
-
-                total_loss += (1.0 - lambda_sr) * policy_loss_online
-                
-                if epoch == 0: # 只在第一次 epoch 记录
-                    append_to_dict(metrics, {
-                        "actor/pg_loss_online": pg_loss_online.detach().item(),
-                        "actor/pg_clipfrac_online": pg_clipfrac_online.detach().item(),
-                        "actor/ppo_kl_online": ppo_kl_online.detach().item(),
-                    })
-
-            # --- 5.2 计算 L_buffer ---
-            if G_buffer_batch_final and G_buffer_batch_final.batch_size > 0:
-                # 前向传播 G_buffer
-                entropy_buffer, log_prob_buffer = self._forward_micro_batch(
-                    micro_batch=G_buffer_batch_final.batch,
-                    temperature=temperature,
-                    calculate_entropy=(entropy_coeff != 0.0)
-                )
-                
-                # 获取 response_mask
-                response_length_buffer = G_buffer_batch_final.batch["responses"].size(1)
-                if multi_turn and "loss_mask" in G_buffer_batch_final.batch:
-                    response_mask_buffer = G_buffer_batch_final.batch["loss_mask"][:, -response_length_buffer:]
-                else:
-                    response_mask_buffer = G_buffer_batch_final.batch["attention_mask"][:, -response_length_buffer:]
-
-                pg_loss_buffer, pg_clipfrac_buffer, ppo_kl_buffer, pg_clipfrac_lower_buffer = compute_policy_loss(
-                    old_log_prob=G_buffer_batch_final.batch["rollout_log_probs"], # 这是 pi_theta_stored
-                    log_prob=log_prob_buffer,
-                    advantages=G_buffer_batch_final.batch["advantages"], # A_final
-                    response_mask=response_mask_buffer,
-                    cliprange=clip_ratio,
-                    cliprange_low=clip_ratio_low,
-                    cliprange_high=clip_ratio_high,
-                    clip_ratio_c=clip_ratio_c,
-                    loss_agg_mode=loss_agg_mode,
+            if G_buffer_batch_final and G_buffer_batch_final.batch.batch_size[0] > 0:
+                 batches_to_process.append(
+                    (G_buffer_batch_final.batch, lambda_sr, "buffer")
                 )
 
-                policy_loss_buffer = pg_loss_buffer
-                if entropy_coeff != 0.0 and entropy_buffer is not None:
-                    entropy_loss_buffer = agg_loss(loss_mat=entropy_buffer, loss_mask=response_mask_buffer, loss_agg_mode=loss_agg_mode)
-                    policy_loss_buffer = policy_loss_buffer - entropy_loss_buffer * entropy_coeff
-                    if epoch == 0: # 只记录一次
-                        append_to_dict(metrics, {"actor/entropy_loss_buffer": entropy_loss_buffer.detach().item()})
+            if not batches_to_process:
+                logger.warning("[CCAPO] 没有数据可供更新。跳过此 epoch。")
+                continue
 
-                total_loss += lambda_sr * policy_loss_buffer
-                
-                if epoch == 0: # 只在第一次 epoch 记录
-                    append_to_dict(metrics, {
-                        "actor/pg_loss_buffer": pg_loss_buffer.detach().item(),
-                        "actor/pg_clipfrac_buffer": pg_clipfrac_buffer.detach().item(),
-                        "actor/ppo_kl_buffer": ppo_kl_buffer.detach().item(),
-                    })
+            # 3. 计算总的梯度累积步数
+            total_micro_batches = sum(
+                (batch_data.batch_size[0] + ppo_micro_batch_size_per_gpu - 1) // ppo_micro_batch_size_per_gpu
+                for batch_data, _, _ in batches_to_process
+            )
 
-            # --- 5.3 反向传播和优化 ---
-            if isinstance(total_loss, torch.Tensor):
-                total_loss.backward()
-                grad_norm = self._optimizer_step()
+            if total_micro_batches == 0:
+                continue
+
+            total_loss_accumulator = 0.0 # 用于日志记录
+
+            # 4. 循环处理 G_online 和 G_buffer
+            for batch_data, loss_weight, name in batches_to_process:
                 
-                if epoch == 0: # 只在第一次 epoch 记录
-                    append_to_dict(metrics, {
-                        "actor/total_loss": total_loss.detach().item(),
-                        "actor/lambda_sr": lambda_sr,
-                        "actor/grad_norm": grad_norm.detach().item()
-                    })
-            else:
-                logger.warning("[CCAPO] No loss computed (total_loss=0.0). Skipping optimizer step.")
-                if epoch == 0:
-                    append_to_dict(metrics, {"actor/total_loss": 0.0, "actor/lambda_sr": lambda_sr})
+                # 5. 将每个批次分割成微批次
+                micro_batches = batch_data.split(ppo_micro_batch_size_per_gpu)
+
+                for micro_batch in micro_batches:
+                    # micro_batch 现在是一个 TensorDict
+
+                    # 将当前微批次中的所有张量移动到 GPU
+                    micro_batch = micro_batch.to(get_torch_device().current_device())
+
+                    entropy, log_prob = self._forward_micro_batch(
+                        micro_batch=micro_batch,
+                        temperature=temperature,
+                        calculate_entropy=(entropy_coeff != 0.0)
+                    )
+                    
+                    response_length = micro_batch["responses"].size(1)
+                    if multi_turn and "loss_mask" in micro_batch:
+                        response_mask = micro_batch["loss_mask"][:, -response_length:]
+                    else:
+                        response_mask = micro_batch["attention_mask"][:, -response_length:]
+
+                    pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = compute_policy_loss(
+                        old_log_prob=micro_batch["rollout_log_probs"],
+                        log_prob=log_prob,
+                        advantages=micro_batch["advantages"],
+                        response_mask=response_mask,
+                        cliprange=clip_ratio,
+                        cliprange_low=clip_ratio_low,
+                        cliprange_high=clip_ratio_high,
+                        clip_ratio_c=clip_ratio_c,
+                        loss_agg_mode=loss_agg_mode,
+                    )
+
+                    policy_loss = pg_loss
+                    if entropy_coeff != 0.0 and entropy is not None:
+                        entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
+                        policy_loss = policy_loss - entropy_loss * entropy_coeff
+                        if epoch == 0: # 只记录一次
+                            append_to_dict(metrics, {f"actor/entropy_loss_{name}": entropy_loss.detach().item()})
+
+                    # 6. 缩放损失：应用 CCAPO 权重 (lambda_sr) 和梯度累积缩放
+                    scaled_loss = (loss_weight * policy_loss) / total_micro_batches
+                    
+                    # 7. 反向传播（累积梯度）
+                    scaled_loss.backward()
+
+                    total_loss_accumulator += policy_loss.detach().item() * loss_weight # 记录未缩放的损失
+                    
+                    if epoch == 0: # 只在第一次 epoch 记录
+                        append_to_dict(metrics, {
+                            f"actor/pg_loss_{name}": pg_loss.detach().item(),
+                            f"actor/pg_clipfrac_{name}": pg_clipfrac.detach().item(),
+                            f"actor/ppo_kl_{name}": ppo_kl.detach().item(),
+                        })
+
+            # --- 5.3 优化 ---
+            # 在处理完所有微批次（online 和 buffer）后，执行一次优化器步骤
+            grad_norm = self._optimizer_step()
+            
+            if epoch == 0: # 只在第一次 epoch 记录
+                append_to_dict(metrics, {
+                    "actor/total_loss": total_loss_accumulator, # 记录总损失
+                    "actor/lambda_sr": lambda_sr,
+                    "actor/grad_norm": grad_norm.detach().item()
+                })
+            
+            # --- END: 修正后的逻辑 ---
 
         # --- 6. 准备 STDB 更新数据 ---
         # `g_online_steps` 已经被 `compute_ccapo_advantages` 原地修改，包含了 R_tau

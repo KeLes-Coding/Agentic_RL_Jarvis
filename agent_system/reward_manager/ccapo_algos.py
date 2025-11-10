@@ -41,7 +41,7 @@ def _calculate_R_tau(g_calc_trajs: Dict[str, List[Dict[str, Any]]], config):
         total_tokens = first_step['traj_total_tokens']
         
         P_steps = config.alpha * (total_steps / config.max_steps)
-        P_token = config.gamma * (total_tokens / config.max_tokens)
+        P_token = config.gamma_token * (total_tokens / config.max_tokens)
         
         P_shortcut = 0.0
         if R_success > 0 and total_steps < config.min_reasonable_steps:
@@ -68,6 +68,41 @@ def _calculate_A_traj(g_calc_steps: List[Dict[str, Any]]):
     
     for step in g_calc_steps:
         step['A_traj'] = (step.get('R_tau', mean_R_tau) - mean_R_tau) / std_R_tau
+
+# --- ✅ [CCAPO] 新增: Sec 5.1.4: R_format_novelty ---
+def _calculate_R_format_novelty(g_calc_steps: List[Dict[str, Any]], config):
+    """
+    计算 R_format_novelty (包括奖励和惩罚)
+    并用 w_N 加权后，将其作为 'R_step' 的初始值写入每个步骤。
+    """
+    # 1. (全局) 计算 G_calc 中所有成功动作的计数
+    ActionSuccessCount = collections.defaultdict(int)
+    for step in g_calc_steps:
+        if step.get('action_success', False):
+            action_type = step.get('action_type')
+            if action_type:
+                ActionSuccessCount[action_type] += 1
+    
+    # 2. 遍历所有步骤，计算 R_format_novelty 并初始化 R_step
+    for step in g_calc_steps:
+        action_status = step.get('action_status', '')
+        action_type = step.get('action_type')
+        
+        R_format = 0.0
+        if action_status.startswith('FORMAT_ERROR'):
+            # 格式错误惩罚 (e.g., -1.0)
+            R_format = config.penalty_format_error
+        elif action_status.startswith('FAILURE'):
+            # 执行失败惩罚 (e.g., -0.5)
+            R_format = config.penalty_failure
+        elif step.get('action_success', False) and action_type:
+            # 成功动作的新颖度奖励
+            count = ActionSuccessCount[action_type]
+            R_format = config.base_bonus / (count**0.5 + 1e-6)
+        
+        step['R_format_novelty'] = R_format
+        # 使用 w_N 加权，并将其作为 R_step 的初始值
+        step['R_step'] = config.w_N * R_format
 
 # --- Sec 5.1: 微观步骤奖励 (成功轨迹) ---
 def _calculate_R_step_success(g_calc_steps: List[Dict[str, Any]], g_calc_trajs: Dict[str, List[Dict[str, Any]]], config):
@@ -113,6 +148,9 @@ def _calculate_R_step_success(g_calc_steps: List[Dict[str, Any]], g_calc_trajs: 
                     stats[key]["total_trajs"].add(traj_uid)
                     if step['traj_task_completed']:
                         stats[key]["success_trajs"].add(traj_uid)
+            else:
+                # 确保每个 step 都有 'b_stage' 键以保证数据对齐
+                step['b_stage'] = 'N/A'
 
     # 2. 计算 I_action
     I_action_cache = {}
@@ -133,7 +171,7 @@ def _calculate_R_step_success(g_calc_steps: List[Dict[str, Any]], g_calc_trajs: 
             continue # 失败轨迹在 R_step_fail 中处理
         
         if not step.get('action_success', False):
-            step['R_step'] = 0.0 # R_format_novelty 暂为 0
+            # R_step 已在 _calculate_R_format_novelty 中被初始化
             continue
         
         # Q_step (Sec 5.1.3.1)
@@ -145,7 +183,8 @@ def _calculate_R_step_success(g_calc_steps: List[Dict[str, Any]], g_calc_trajs: 
         key = (step.get('action_type'), step.get('b_stage'))
         i_action = I_action_cache.get(key, 0.0) # 默认为 0
         
-        step['R_step'] = i_action * q_efficiency # R_format_novelty 暂为 0
+        # --- ✅ [CCAPO] 修改: 使用 += 累加, R_step 已被 R_format_novelty 初始化 ---
+        step['R_step'] += i_action * q_efficiency
 
 # --- Sec 5.2: 微观步骤奖励 (失败轨迹) ---
 def _calculate_R_step_fail(g_calc_steps: List[Dict[str, Any]], g_buffer_steps: List[Dict[str, Any]], embedding_model, config):
@@ -158,7 +197,8 @@ def _calculate_R_step_fail(g_calc_steps: List[Dict[str, Any]], g_buffer_steps: L
     idx_counter = 0
     for step in g_buffer_steps:
         # G_buffer 都是成功轨迹，且 R_step (S(a_j*)) 已经计算
-        score = step.get('R_step', 0.0)
+        # ✅ [CCAPO] 修改: 我们需要 R_step 减去 R_format_novelty, 只保留 I_action * Q_efficiency 部分
+        score = step.get('R_step', 0.0) - (config.w_N * step.get('R_format_novelty', 0.0))
         action = step.get('parsed_action')
         thought = step.get('thought')
         
@@ -173,9 +213,7 @@ def _calculate_R_step_fail(g_calc_steps: List[Dict[str, Any]], g_buffer_steps: L
     if not stdb_thoughts_to_embed:
         # STDB 为空，无法匹配
         logger.warning("[CCAPO] STDB 为空或无有效 (thought, action) 对。跳过 R_step_fail 计算。")
-        for step in g_calc_steps:
-            if not step['traj_task_completed']:
-                step['R_step'] = 0.0
+        # ✅ [CCAPO] 修改: R_step 已被初始化，此处无需操作
         return
         
     stdb_embeddings = embedding_model.encode(stdb_thoughts_to_embed, convert_to_tensor=True)
@@ -198,7 +236,7 @@ def _calculate_R_step_fail(g_calc_steps: List[Dict[str, Any]], g_buffer_steps: L
         thought = step.get('thought')
         
         if not action or not thought or action not in stdb_step_scores:
-            step['R_step'] = 0.0 # 无法匹配
+            # ✅ [CCAPO] 修改: R_step 已被初始化，此处无需操作
             continue
         
         fail_steps_to_embed.append(thought)
@@ -218,7 +256,7 @@ def _calculate_R_step_fail(g_calc_steps: List[Dict[str, Any]], g_buffer_steps: L
         
         action_matches = stdb_step_scores[action]
         if not any('embedding' in m for m in action_matches):
-            step['R_step'] = 0.0
+            # ✅ [CCAPO] 修改: R_step 已被初始化，此处无需操作
             continue
             
         compare_embeddings = torch.stack([m['embedding'] for m in action_matches if 'embedding' in m]).to(emb_t.device)
@@ -234,7 +272,8 @@ def _calculate_R_step_fail(g_calc_steps: List[Dict[str, Any]], g_buffer_steps: L
             # 取匹配项中的最高分
             max_score = torch.max(scores[matches]).item()
             
-        step['R_step'] = config.w_match * max_score
+        # --- ✅ [CCAPO] 修改: 使用 += 累加, R_step 已被 R_format_novelty 初始化 ---
+        step['R_step'] += config.w_match * max_score
 
 # --- Sec 5: 微观步骤优势 A_step ---
 def _calculate_A_step(g_calc_steps: List[Dict[str, Any]]):
@@ -277,6 +316,9 @@ def compute_ccapo_advantages(g_calc_steps: List[Dict[str, Any]], g_online_steps:
     _calculate_A_traj(g_calc_steps)
     
     # 2. Sec 5: R_step 和 A_step
+    # --- ✅ [CCAPO] 修改: 先计算 R_format_novelty 并初始化 R_step ---
+    _calculate_R_format_novelty(g_calc_steps, config)
+    # --- R_step_success 和 R_step_fail 现在将累加到 R_step ---
     _calculate_R_step_success(g_calc_steps, g_calc_trajs, config)
     _calculate_R_step_fail(g_calc_steps, g_buffer_steps, embedding_model, config)
     _calculate_A_step(g_calc_steps)

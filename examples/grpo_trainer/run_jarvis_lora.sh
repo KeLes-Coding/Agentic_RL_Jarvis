@@ -4,10 +4,31 @@ export VLLM_ATTENTION_BACKEND=XFORMERS
 export SWANLAB_API_KEY="oB8w36PCJxKeqwif2ijWz"
 
 export CUDA_VISIBLE_DEVICES="1,2"
+GPUS_TO_LOCK="1 2"
+
+# 脚本退出时恢复GPU模式的函数
+function cleanup {
+    echo "脚本结束，恢复GPU为默认模式..."
+    for GPU_ID in $GPUS_TO_LOCK; do
+        # 因为配置了sudoers，这里不再需要密码
+        sudo nvidia-smi -i $GPU_ID -c DEFAULT
+    done
+    echo "恢复完成。"
+}
+
+trap cleanup EXIT INT TERM
+
+echo "为GPU ${GPUS_TO_LOCK} 设置独占模式..."
+for GPU_ID in $GPUS_TO_LOCK; do
+    # 因为配置了sudoers，这里不再需要密码
+    sudo nvidia-smi -i $GPU_ID -pm 1
+    sudo nvidia-smi -i $GPU_ID -c EXCLUSIVE_PROCESS
+done
+echo "设置完成。"
 
 # 关键改动：将 train_data_size 设置为 1
 # 这将确保每个训练批次只包含一个任务
-train_data_size=4
+train_data_size=1
 val_data_size=4
 group_size=4
 
@@ -17,6 +38,7 @@ group_size=4
 #     --train_data_size $train_data_size \
 #     --val_data_size $val_data_size
 
+echo "开始执行训练任务..."
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=ccapo \
     data.train_files=/home/zzh/Workspace/verl-agent/data/atomic_tasks_list_wiki_train.parquet \
@@ -68,7 +90,7 @@ python3 -m verl.trainer.main_ppo \
     trainer.save_freq=5 \
     trainer.test_freq=5 \
     trainer.total_epochs=10 \
-    trainer.val_before_train=True \
+    trainer.val_before_train=False \
     actor_rollout_ref.model.lora_rank=32 \
     actor_rollout_ref.model.lora_alpha=64 \
     critic.model.lora_rank=32 \
@@ -77,3 +99,5 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.model.target_modules=all-linear \
     actor_rollout_ref.rollout.max_num_batched_tokens=32768 \
     $@
+
+echo "训练任务执行完毕。"
