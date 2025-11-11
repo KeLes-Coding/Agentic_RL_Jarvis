@@ -28,30 +28,71 @@ def _group_steps_by_traj(steps_list: List[Dict[str, Any]]) -> Dict[str, List[Dic
         trajs[traj_uid].sort(key=lambda s: s.get('step_index', 0))
     return trajs
 
+# --- ✅ [CCAPO V2] 新增: 辅助函数：标准化 (Z-Score) ---
+def _standardize(values: List[float]) -> List[float]:
+    """Z-score standardization (mathcal{Z}(X))"""
+    if not values:
+        return []
+    mean = np.mean(values)
+    std = np.std(values) + 1e-6
+    # 防止 std 接近 0 导致 nan/inf
+    if std < 1e-6:
+        return [0.0] * len(values)
+    return [(v - mean) / std for v in values]
+
 # --- Sec 4: 宏观轨迹奖励 R_tau ---
 def _calculate_R_tau(g_calc_trajs: Dict[str, List[Dict[str, Any]]], config):
-    """计算 R_tau 并将其写回每个步骤"""
+    """
+    计算 R_tau, R_core 并将其写回每个步骤
+    (✅ [CCAPO V2] 修改: 采用 R_core 和效率乘数)
+    """
     for traj_uid, steps in g_calc_trajs.items():
         if not steps: continue
         first_step = steps[0]
         
         R_success = 1.0 if first_step['traj_task_completed'] else -1.0
-        
         total_steps = first_step['traj_total_steps']
         total_tokens = first_step['traj_total_tokens']
         
-        P_steps = config.alpha * (total_steps / config.max_steps)
-        P_token = config.gamma_token * (total_tokens / config.max_tokens)
+        # --- ✅ [CCAPO V2] 新版逻辑 (Sec 4) ---
+        is_shortcut = (R_success > 0 and total_steps < config.min_reasonable_steps)
         
-        P_shortcut = 0.0
-        if R_success > 0 and total_steps < config.min_reasonable_steps:
-            P_shortcut = config.lambda_shortcut
+        R_core = 0.0
+        if R_success <= 0:
+            R_core = -1.0  # 任务失败
+        elif not is_shortcut:
+            R_core = 1.0   # 有效成功
+        # else: 作弊成功 (IsShortcut=True), R_core = 0.0 (默认)
         
-        # R_format_novelty 暂时忽略，如需添加在此处
-        R_tau = R_success - P_steps - P_token - P_shortcut
+        R_tau = R_core # 默认值 (失败或作弊)
+        
+        if R_core == 1.0:
+            # 只有有效成功才考虑效率
+            # M_steps = (1.0 - total_steps / config.max_steps)
+            # print(f"Traj {traj_uid}: total_steps={total_steps}, M_steps={M_steps}")
+            # M_token = (1.0 - total_tokens / config.max_tokens)
+            # print(f"Traj {traj_uid}: total_tokens={total_tokens}, M_token={M_token}")
+            # # 确保效率乘数不为负
+            # M_steps = max(0.0, M_steps)
+            # print(f"Traj {traj_uid}: Clipped M_steps={M_steps}")
+            # M_token = max(0.0, M_token)
+            # print(f"Traj {traj_uid}: Clipped M_token={M_token}")
+
+            m_steps_ratio = total_steps / config.max_steps
+            m_token_ratio = total_tokens / config.max_tokens
+
+            M_steps = (max(0.0, 1.0 - m_steps_ratio))**0.5
+            print(f"Traj {traj_uid}: total_steps={total_steps}, m_steps_ratio={m_steps_ratio:.2f}, M_steps={M_steps:.4f} (sqrt scaled)")
+            M_token = (max(0.0, 1.0 - m_token_ratio))**0.5
+            print(f"Traj {traj_uid}: total_tokens={total_tokens}, m_token_ratio={m_token_ratio:.2f}, M_token={M_token:.4f} (sqrt scaled)")
+        
+            R_tau = R_core * M_steps * M_token
+        # --- 新版 CCAPO 逻辑结束 ---
         
         for step in steps:
             step['R_tau'] = R_tau
+            step['R_core'] = R_core # 存储 R_core 供 R_step 使用
+            print(f"Traj {traj_uid} Step {step.get('step_index', 0)}: R_tau={R_tau}, R_core={R_core}")
 
 # --- Sec 4: 宏观轨迹优势 A_traj ---
 def _calculate_A_traj(g_calc_steps: List[Dict[str, Any]]):
@@ -69,11 +110,33 @@ def _calculate_A_traj(g_calc_steps: List[Dict[str, Any]]):
     for step in g_calc_steps:
         step['A_traj'] = (step.get('R_tau', mean_R_tau) - mean_R_tau) / std_R_tau
 
-# --- ✅ [CCAPO] 新增: Sec 5.1.4: R_format_novelty ---
-def _calculate_R_format_novelty(g_calc_steps: List[Dict[str, Any]], config):
+# --- Sec 5: R_format_novelty ---
+# --- Sec 5: R_format_penalty (V3: 解耦) ---
+def _calculate_R_format_penalty(g_calc_steps: List[Dict[str, Any]], config):
     """
-    计算 R_format_novelty (包括奖励和惩罚)
-    并用 w_N 加权后，将其作为 'R_step' 的初始值写入每个步骤。
+    计算 R_format_penalty (硬惩罚)
+    并将其作为 'R_format_penalty' 键写入每个步骤。
+    (✅ [CCAPO V3] 新增: 将惩罚与新颖度解耦)
+    """
+    for step in g_calc_steps:
+        action_status = step.get('action_status', '')
+        R_format_penalty = 0.0
+        
+        if action_status.startswith('FORMAT_ERROR'):
+            R_format_penalty = config.penalty_format_error
+            print(f"Step {step.get('step_index', 0)}: FORMAT_ERROR detected, applying penalty {R_format_penalty}")
+        elif action_status.startswith('FAILURE'):
+            R_format_penalty = config.penalty_failure
+            print(f"Step {step.get('step_index', 0)}: FAILURE detected, applying penalty {R_format_penalty}")
+            
+        step['R_format_penalty'] = R_format_penalty
+
+# --- Sec 5: R_novelty_bonus (V3: 解耦) ---
+def _calculate_R_novelty_bonus(g_calc_steps: List[Dict[str, Any]], config):
+    """
+    计算 R_novelty_bonus (仅针对成功动作)
+    并将其作为 'R_novelty_bonus' 键写入每个步骤。
+    (✅ [CCAPO V3] 修改: 从 _calculate_R_format_novelty 拆分)
     """
     # 1. (全局) 计算 G_calc 中所有成功动作的计数
     ActionSuccessCount = collections.defaultdict(int)
@@ -82,31 +145,27 @@ def _calculate_R_format_novelty(g_calc_steps: List[Dict[str, Any]], config):
             action_type = step.get('action_type')
             if action_type:
                 ActionSuccessCount[action_type] += 1
+                print(f"Counting success for action '{action_type}': total now {ActionSuccessCount[action_type]}")
     
-    # 2. 遍历所有步骤，计算 R_format_novelty 并初始化 R_step
+    # 2. 遍历所有步骤，计算 R_novelty_bonus
     for step in g_calc_steps:
-        action_status = step.get('action_status', '')
-        action_type = step.get('action_type')
+        R_novelty = 0.0
+        # 仅当动作成功时才计算新颖度奖励
+        if step.get('action_success', False):
+            action_type = step.get('action_type')
+            if action_type:
+                count = ActionSuccessCount[action_type]
+                R_novelty = config.base_bonus / (count**0.5 + 1e-6)
+                print(f"Calculating R_novelty_bonus for action '{action_type}' with count {count}: {R_novelty}")
         
-        R_format = 0.0
-        if action_status.startswith('FORMAT_ERROR'):
-            # 格式错误惩罚 (e.g., -1.0)
-            R_format = config.penalty_format_error
-        elif action_status.startswith('FAILURE'):
-            # 执行失败惩罚 (e.g., -0.5)
-            R_format = config.penalty_failure
-        elif step.get('action_success', False) and action_type:
-            # 成功动作的新颖度奖励
-            count = ActionSuccessCount[action_type]
-            R_format = config.base_bonus / (count**0.5 + 1e-6)
-        
-        step['R_format_novelty'] = R_format
-        # 使用 w_N 加权，并将其作为 R_step 的初始值
-        step['R_step'] = config.w_N * R_format
+        step['R_novelty_bonus'] = R_novelty
 
 # --- Sec 5.1: 微观步骤奖励 (成功轨迹) ---
 def _calculate_R_step_success(g_calc_steps: List[Dict[str, Any]], g_calc_trajs: Dict[str, List[Dict[str, Any]]], config):
-    
+    """
+    计算 R_step 的“核心”原始分量 (R_core_raw)
+    (✅ [CCAPO V2] 修改：不再计算 R_step，只存储 R_core_raw 供后续标准化)
+    """
     # --- Sec 5.1.3.2: Q_economy ---
     all_token_costs = []
     for step in g_calc_steps:
@@ -123,7 +182,8 @@ def _calculate_R_step_success(g_calc_steps: List[Dict[str, Any]], g_calc_trajs: 
     # --- Sec 5.1.2: I_action (S_necessity, S_utility) ---
     stats = collections.defaultdict(lambda: {"total_steps": 0, "success_trajs": set(), "total_trajs": set()})
     total_trajs_in_calc = len(g_calc_trajs)
-    successful_trajs_in_calc = set(uid for uid, s in g_calc_trajs.items() if s[0]['traj_task_completed'])
+    # --- ✅ [CCAPO V2] 修改: 根据 R_core == 1.0 判断有效成功 ---
+    successful_trajs_in_calc = set(uid for uid, s in g_calc_trajs.items() if s[0].get('R_core') == 1.0)
     P_success_global = len(successful_trajs_in_calc) / (total_trajs_in_calc + 1e-6)
 
     # 1. 计算 b_stage 并收集统计数据
@@ -146,10 +206,10 @@ def _calculate_R_step_success(g_calc_steps: List[Dict[str, Any]], g_calc_trajs: 
                     key = (action_type, stage)
                     stats[key]["total_steps"] += 1
                     stats[key]["total_trajs"].add(traj_uid)
-                    if step['traj_task_completed']:
+                    # --- ✅ [CCAPO V2] 修改: 根据 R_core == 1.0 判断有效成功 ---
+                    if step.get('R_core') == 1.0:
                         stats[key]["success_trajs"].add(traj_uid)
             else:
-                # 确保每个 step 都有 'b_stage' 键以保证数据对齐
                 step['b_stage'] = 'N/A'
 
     # 2. 计算 I_action
@@ -165,13 +225,14 @@ def _calculate_R_step_success(g_calc_steps: List[Dict[str, Any]], g_calc_trajs: 
         
         I_action_cache[key] = S_necessity * S_utility
 
-    # --- Sec 5.1.3 & 5.1: 组合 R_step_success ---
+    # --- Sec 5.1.3 & 5.1: 仅计算 R_core_raw ---
     for step in g_calc_steps:
-        if not step['traj_task_completed']:
-            continue # 失败轨迹在 R_step_fail 中处理
+        # --- ✅ [CCAPO V2] 修改: 只处理 R_core == 1.0 的步骤 ---
+        if step.get('R_core') != 1.0:
+            continue 
         
         if not step.get('action_success', False):
-            # R_step 已在 _calculate_R_format_novelty 中被初始化
+            step['R_core_raw'] = 0.0 # 动作失败，核心奖励为0
             continue
         
         # Q_step (Sec 5.1.3.1)
@@ -181,13 +242,18 @@ def _calculate_R_step_success(g_calc_steps: List[Dict[str, Any]], g_calc_trajs: 
         q_efficiency = q_step * step['Q_economy']
         
         key = (step.get('action_type'), step.get('b_stage'))
-        i_action = I_action_cache.get(key, 0.0) # 默认为 0
+        i_action = I_action_cache.get(key, 0.0) 
         
-        # --- ✅ [CCAPO] 修改: 使用 += 累加, R_step 已被 R_format_novelty 初始化 ---
-        step['R_step'] += i_action * q_efficiency
+        # --- ✅ [CCAPO V2] 修改: 只存储 R_core_raw ---
+        step['R_core_raw'] = i_action * q_efficiency
+        # (移除 R_step 的计算)
 
 # --- Sec 5.2: 微观步骤奖励 (失败轨迹) ---
 def _calculate_R_step_fail(g_calc_steps: List[Dict[str, Any]], g_buffer_steps: List[Dict[str, Any]], embedding_model, config):
+    """
+    计算 R_step 的“匹配”原始分量 (R_match_raw)
+    (✅ [CCAPO V2] 修改：使用 R_step (S(a_j*)) 作为匹配源，不使用 w_match, 仅存储 R_match_raw)
+    """
     
     # --- 1. 预计算 STDB (G_buffer) 步骤的分数和嵌入 ---
     stdb_step_scores = collections.defaultdict(list)
@@ -196,13 +262,16 @@ def _calculate_R_step_fail(g_calc_steps: List[Dict[str, Any]], g_buffer_steps: L
 
     idx_counter = 0
     for step in g_buffer_steps:
-        # G_buffer 都是成功轨迹，且 R_step (S(a_j*)) 已经计算
-        # ✅ [CCAPO] 修改: 我们需要 R_step 减去 R_format_novelty, 只保留 I_action * Q_efficiency 部分
-        score = step.get('R_step', 0.0) - (config.w_N * step.get('R_format_novelty', 0.0))
+        # G_buffer 都是成功轨迹 (R_core == 1.0)
+        # --- ✅ [CCAPO V2] 修改: S(a_j*) = R_step_success(a_j*)
+        # 此时 R_step 已由 R_step_success (Z_core + w_N*Z_novelty) 填充
+        score = step.get('R_step', 0.0) 
         action = step.get('parsed_action')
         thought = step.get('thought')
         
-        if not action or not thought:
+        if not action or not thought or step.get('R_core') != 1.0:
+            # R_step_fail 只应匹配有效的成功步骤
+            # (R_step 在 R_core != 1.0 时可能未定义或为 0)
             continue
             
         stdb_step_scores[action].append({'score': score})
@@ -211,9 +280,7 @@ def _calculate_R_step_fail(g_calc_steps: List[Dict[str, Any]], g_buffer_steps: L
         idx_counter += 1
 
     if not stdb_thoughts_to_embed:
-        # STDB 为空，无法匹配
-        logger.warning("[CCAPO] STDB 为空或无有效 (thought, action) 对。跳过 R_step_fail 计算。")
-        # ✅ [CCAPO] 修改: R_step 已被初始化，此处无需操作
+        logger.warning("[CCAPO V2] STDB (G_buffer) 为空或无有效 (thought, action) 对。跳过 R_match_raw 计算。")
         return
         
     stdb_embeddings = embedding_model.encode(stdb_thoughts_to_embed, convert_to_tensor=True)
@@ -229,14 +296,14 @@ def _calculate_R_step_fail(g_calc_steps: List[Dict[str, Any]], g_buffer_steps: L
     idx_counter = 0
     
     for step in g_calc_steps:
-        if step.get('is_buffer_data', False) or step['traj_task_completed']:
-            continue # 已在 success 中处理,或本身是buffer数据
+        # --- ✅ [CCAPO V2] 修改: 只处理 R_core == -1.0 的步骤 ---
+        if step.get('R_core') != -1.0:
+            continue
         
         action = step.get('parsed_action')
         thought = step.get('thought')
         
         if not action or not thought or action not in stdb_step_scores:
-            # ✅ [CCAPO] 修改: R_step 已被初始化，此处无需操作
             continue
         
         fail_steps_to_embed.append(thought)
@@ -244,8 +311,8 @@ def _calculate_R_step_fail(g_calc_steps: List[Dict[str, Any]], g_buffer_steps: L
         idx_counter += 1
         
     if not fail_steps_to_embed:
-        logger.debug("[CCAPO] 没有需要匹配的失败步骤。")
-        return # 没有需要匹配的失败步骤
+        logger.debug("[CCAPO V2] 没有需要匹配的失败步骤。")
+        return
         
     fail_embeddings = embedding_model.encode(fail_steps_to_embed, convert_to_tensor=True)
 
@@ -256,28 +323,26 @@ def _calculate_R_step_fail(g_calc_steps: List[Dict[str, Any]], g_buffer_steps: L
         
         action_matches = stdb_step_scores[action]
         if not any('embedding' in m for m in action_matches):
-            # ✅ [CCAPO] 修改: R_step 已被初始化，此处无需操作
             continue
             
         compare_embeddings = torch.stack([m['embedding'] for m in action_matches if 'embedding' in m]).to(emb_t.device)
         scores = torch.tensor([m['score'] for m in action_matches if 'embedding' in m], device=emb_t.device)
         
-        # 计算余弦相似度
-        cos_sims = util.cos_sim(emb_t, compare_embeddings)[0] # shape: (num_matches,)
+        cos_sims = util.cos_sim(emb_t, compare_embeddings)[0]
         
         max_score = 0.0
-        # 找到所有 > threshold 的匹配
         matches = torch.where(cos_sims > config.similarity_threshold)[0]
         if len(matches) > 0:
-            # 取匹配项中的最高分
             max_score = torch.max(scores[matches]).item()
             
-        # --- ✅ [CCAPO] 修改: 使用 += 累加, R_step 已被 R_format_novelty 初始化 ---
-        step['R_step'] += config.w_match * max_score
+        # --- ✅ [CCAPO V2] 修改: 存储 R_match_raw, 移除 w_match ---
+        step['R_match_raw'] = max_score
+        # (移除 R_step 的计算)
 
 # --- Sec 5: 微观步骤优势 A_step ---
 def _calculate_A_step(g_calc_steps: List[Dict[str, Any]]):
     """计算 A_step 并将其写回每个步骤"""
+    # (此函数无需修改, 它正确地标准化了最终的 R_step)
     all_R_step = [step['R_step'] for step in g_calc_steps if 'R_step' in step]
     if not all_R_step:
         for step in g_calc_steps: step['A_step'] = 0.0
@@ -292,51 +357,109 @@ def _calculate_A_step(g_calc_steps: List[Dict[str, Any]]):
 # --- 主函数 ---
 def compute_ccapo_advantages(g_calc_steps: List[Dict[str, Any]], g_online_steps: List[Dict[str, Any]], embedding_model, config):
     """
-    计算 CCAPO 奖励和优势的主函数。
+    计算 CCAPO 奖励和优势的主函数。 (✅ [CCAPO V3] 修改: 解耦格式惩罚)
     修改 g_calc_steps 列表，为其添加 'R_tau', 'A_traj', 'R_step', 'A_step', 'advantages'。
-    
-    Args:
-        g_calc_steps (List[Dict]): G_online U G_buffer 的所有步骤
-        g_online_steps (List[Dict]): G_online 的所有步骤 (用于计算 SR)
-        embedding_model: 用于计算相似度的 SentenceTransformer
-        config: 包含所有超参数的配置对象 (e.g., config.algorithm.ccapo)
-        
-    Returns:
-        Tuple[List[Dict], float]:
-            - g_calc_steps_with_adv: 带有 'advantages' 键的 G_calc 步骤
-            - success_rate: G_online 的成功率 (lambda_SR)
     """
-    logger.info(f"[CCAPO] 开始计算优势。G_calc 步骤数: {len(g_calc_steps)}, G_online 步骤数: {len(g_online_steps)}")
+    logger.info(f"[CCAPO V3] 开始计算优势。G_calc 步骤数: {len(g_calc_steps)}, G_online 步骤数: {len(g_online_steps)}")
     
     g_calc_trajs = _group_steps_by_traj(g_calc_steps)
     g_buffer_steps = [s for s in g_calc_steps if s.get('is_buffer_data', False)]
     
-    # 1. Sec 4: R_tau 和 A_traj
+    # --- 1. Sec 4: R_tau, R_core 和 A_traj ---
     _calculate_R_tau(g_calc_trajs, config)
     _calculate_A_traj(g_calc_steps)
     
-    # 2. Sec 5: R_step 和 A_step
-    # --- ✅ [CCAPO] 修改: 先计算 R_format_novelty 并初始化 R_step ---
-    _calculate_R_format_novelty(g_calc_steps, config)
-    # --- R_step_success 和 R_step_fail 现在将累加到 R_step ---
-    _calculate_R_step_success(g_calc_steps, g_calc_trajs, config)
-    _calculate_R_step_fail(g_calc_steps, g_buffer_steps, embedding_model, config)
-    _calculate_A_step(g_calc_steps)
-    
-    # 3. Sec 1: A_final
-    for step in g_calc_steps:
-        step['advantages'] = step.get('A_traj', 0.0) + config.omega * step.get('A_step', 0.0)
-    
-    # 4. 计算 SR (用于 L_CCAPO)
+    # --- 2. Sec 7: 计算 SR (lambda_SR) 和 w_N ---
     online_trajs = _group_steps_by_traj(g_online_steps)
     online_trajs_count = len(online_trajs)
     online_success_count = 0
     for traj_uid, steps in online_trajs.items():
-        if steps and steps[0]['traj_task_completed']:
+        # --- ✅ [CCAPO V2] 修改: 根据 R_core == 1.0 判断有效成功 ---
+        if steps and steps[0].get('R_core') == 1.0:
             online_success_count += 1
-                
+            
     success_rate = online_success_count / (online_trajs_count + 1e-6)
+    w_N = 1.0 - success_rate # 动态 w_N
     
-    logger.info(f"[CCAPO] 优势计算完成。lambda_SR (成功率): {success_rate:.4f}")
+    logger.info(f"[CCAPO V3] lambda_SR (有效成功率): {success_rate:.4f}, w_N: {w_N:.4f}")
+
+    # --- ✅ [CCAPO V3] 关键修正：初始化原始分量键 ---
+    # 确保 R_core_raw 和 R_match_raw 在 *所有* 步骤中都存在，以防止 collate_fn 错误
+    for step in g_calc_steps:
+        step['R_core_raw'] = 0.0
+        step['R_match_raw'] = 0.0
+    # --- 修正结束 ---
+
+    # --- 3. Sec 5: R_step (原始组件) ---
+    
+    # 3.1 R_format_penalty (所有步骤) - ✅ [CCAPO V3] 变更
+    _calculate_R_format_penalty(g_calc_steps, config)
+    
+    # 3.2 R_novelty_bonus (仅成功动作) - ✅ [CCAPO V3] 变更
+    _calculate_R_novelty_bonus(g_calc_steps, config)
+    
+    # 3.3 R_core_raw (仅 R_core == 1.0 步骤)
+    # (此函数现在将 *覆盖* 上面设置的 0.0)
+    _calculate_R_step_success(g_calc_steps, g_calc_trajs, config)
+
+    # --- 4. Sec 5: Z-Score 标准化 (除 R_format_penalty 和 R_match_raw) ---
+    
+    # 4.1 Z_novelty (所有步骤) - ✅ [CCAPO V3] 变更
+    raw_novelty_all = [s.get('R_novelty_bonus', 0.0) for s in g_calc_steps]
+    z_novelty_all = _standardize(raw_novelty_all)
+    
+    # 4.2 Z_core (仅 R_core == 1.0 步骤)
+    raw_core_success = [s.get('R_core_raw', 0.0) for s in g_calc_steps if s.get('R_core') == 1.0]
+    z_core_success = _standardize(raw_core_success)
+    
+    # --- 5. Sec 5.1: 组合 R_step (成功和捷径轨迹) ---
+    # (必须在 R_step_fail 之前计算, 因为 R_step_fail 依赖 G_buffer 中的 R_step)
+    core_idx = 0
+    for i, step in enumerate(g_calc_steps):
+        step['Z_novelty'] = z_novelty_all[i] # 存下 Z_novelty 供 R_step_fail 使用
+        
+        # ✅ [CCAPO V3] 提取 R_format_penalty (硬惩罚，不标准化)
+        R_format_penalty = step.get('R_format_penalty', 0.0)
+
+        if step.get('R_core') == 1.0:
+            # R_step_success = Z_core + w_N * Z_novelty + R_format_penalty
+            z_core = z_core_success[core_idx]
+            step['R_step'] = z_core + w_N * step['Z_novelty'] + R_format_penalty
+            core_idx += 1
+        elif step.get('R_core') == 0.0:
+            # R_step (shortcut) = 0 + R_format_penalty
+            step['R_step'] = 0.0 + R_format_penalty
+    
+    # --- 6. Sec 5.2: R_match_raw (仅 R_core == -1.0 步骤) ---
+    # (这必须在 G_buffer 步骤的 R_step 填充后运行)
+    # (G_buffer 中的 R_step 此时已包含 R_format_penalty, 这是OK的,
+    # 因为惩罚总是负的, 会使匹配到的分数更低, 这符合逻辑。)
+    # (此函数现在将 *覆盖* 上面设置的 0.0)
+    _calculate_R_step_fail(g_calc_steps, g_buffer_steps, embedding_model, config)
+    
+    # --- 7. Sec 5: Z-Score 标准化 (R_match_raw) ---
+    raw_match_fail = [s.get('R_match_raw', 0.0) for s in g_calc_steps if s.get('R_core') == -1.0]
+    z_match_fail = _standardize(raw_match_fail)
+
+    # --- 8. Sec 5.2: 组合 R_step (失败轨迹) ---
+    match_idx = 0
+    for step in g_calc_steps:
+        if step.get('R_core') == -1.0:
+            # R_step_fail = Z_match + w_N * Z_novelty + R_format_penalty
+            z_match = z_match_fail[match_idx]
+            # ✅ [CCAPO V3] 提取 R_format_penalty (硬惩罚，不标准化)
+            R_format_penalty = step.get('R_format_penalty', 0.0)
+            step['R_step'] = z_match + w_N * step.get('Z_novelty', 0.0) + R_format_penalty
+            match_idx += 1
+    
+    # --- 9. Sec 5: A_step (标准化最终的 R_step) ---
+    _calculate_A_step(g_calc_steps)
+    
+    # --- 10. Sec 1: A_final ---
+    for step in g_calc_steps:
+        step['advantages'] = step.get('A_traj', 0.0) + config.omega * step.get('A_step', 0.0)
+        # 移除了调试 print 语句
+    
+    logger.info(f"[CCAPO V3] 优势计算完成 (已解耦格式惩罚)。")
     
     return g_calc_steps, success_rate

@@ -108,6 +108,8 @@ class InfoPoolManager:
                 "parsed_action": step_data["parsed_action"],
                 "action_type": step_data.get("action_type", "unknown"), # <--- ✅ [CCAPO] 新增
                 "action_success": step_data["action_success"],
+                # --- ✅ [CCAPO V3] 关键修正：保存 action_status ---
+                "action_status": step_data.get("action_status", ""),
             }
             # --- 将 Token 和置信度信息加入 details 字典 ---
             if "token_usage" in step_data:

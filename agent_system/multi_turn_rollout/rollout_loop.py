@@ -61,8 +61,8 @@ class TrajectoryCollector:
 
         print(f"\n--- 监控: 进入 preprocess_single_sample (item {item}) ---")
         obs_text_sample = obs.get('text', [''])[item]
-        print(f"收到的 obs['text'] (前200字符): '{obs_text_sample[:200]}'")
-        print(f"收到的 obs['image'] 类型: {type(obs.get('image', [None])[item])}")
+        # print(f"收到的 obs['text'] (前200字符): '{obs_text_sample[:200]}'")
+        # print(f"收到的 obs['image'] 类型: {type(obs.get('image', [None])[item])}")
 
         raw_prompt = gen_batch.non_tensor_batch['raw_prompt'][item]
         data_source = gen_batch.non_tensor_batch['data_source'][item]
@@ -108,7 +108,7 @@ class TrajectoryCollector:
             tokenize=False
         )
 
-        print(f"生成的 prompt_with_chat_template (前200字符): '{prompt_with_chat_template[:200]}'")
+        # print(f"生成的 prompt_with_chat_template (前200字符): '{prompt_with_chat_template[:200]}'")
         
         # Initialize return dict
         row_dict = {}
@@ -188,8 +188,8 @@ class TrajectoryCollector:
         if self.config.data.get('return_raw_chat', False):
             row_dict['raw_prompt'] = chat.tolist()
 
-        print(f"最终 raw_prompt (前200字符): '{raw_prompt[:200]}'")
-        print(f"检查 '<|image_pad|>' 是否在最终 raw_prompt 中: {'<|image_pad|>' in raw_prompt}")
+        # print(f"最终 raw_prompt (前200字符): '{raw_prompt[:200]}'")
+        # print(f"检查 '<|image_pad|>' 是否在最终 raw_prompt 中: {'<|image_pad|>' in raw_prompt}")
         print(f"--- 监控: 退出 preprocess_single_sample (item {item}) ---\n")
 
         return row_dict
@@ -281,9 +281,18 @@ class TrajectoryCollector:
             
             # 1.1. 从最后一步的 info 中提取 trajectory summary
             final_summary = {}
-            if total_infos[bs]:
-                final_summary = total_infos[bs][-1].get('final_summary', {})
             
+            # --- ✅ [CCAPO V3] 修正：从最后一个“活动”步骤获取 final_summary ---
+            # 'total_batch_list[bs]' 只包含活动步骤 (active_masks=True)
+            # 'total_infos[bs]' 包含所有步骤 (包括 done=True 后的填充步骤)
+            num_active_steps = len(total_batch_list[bs])
+            
+            if num_active_steps > 0 and total_infos[bs] and len(total_infos[bs]) >= num_active_steps:
+                # 我们需要最后一个活动步骤的 info, 索引是 num_active_steps - 1
+                last_active_info = total_infos[bs][num_active_steps - 1]
+                final_summary = last_active_info.get('final_summary', {})
+            # --- 结束修正 ---
+
             # 1.2. 提取 $R_\tau$ 所需的轨迹级数据
             # R_success
             traj_task_completed = final_summary.get('task_completed', False)
@@ -294,15 +303,17 @@ class TrajectoryCollector:
 
             # 1.3. 预计算 $N_{success}(\tau)$ (Sec 5.1.2.1, 5.1.3.1)
             traj_n_success_steps = 0
-            for step_info in total_infos[bs]:
+            # --- ✅ [CCAPO V3] 修正：只迭代活动的 info ---
+            for i in range(num_active_steps):
+                step_info = total_infos[bs][i]
                 if step_info.get('action_success', False):
                     traj_n_success_steps += 1
             
             # --- ✅ [CCAPO] Phase 2. 步骤级别(Micro)数据聚合 ---
             step_index_in_traj = 0
-            for i, data in enumerate(total_batch_list[bs]):
+            for i, data in enumerate(total_batch_list[bs]): # 这里的 'i' 已经是 0 到 num_active_steps-1
                 assert traj_uid[bs] == data['traj_uid'], "data is not from the same trajectory"
-                if data['active_masks']:
+                if data['active_masks']: # 这个检查其实多余，因为 total_batch_list[bs] 已经只包含 active
                     
                     # 2.1. 附加轨迹级(Macro)信息到每一步
                     data['traj_task_completed'] = traj_task_completed
@@ -321,6 +332,8 @@ class TrajectoryCollector:
                     data['step_token_usage'] = step_info.get('token_usage', {}) # (Sec 5.1.3.2)
                     data['step_confidence'] = step_info.get('confidence_metrics', {}).get('average_confidence', 0.0)
                     data['log_dir_path'] = step_info.get('log_dir_path', '') # <--- ✅ [CCAPO] 新增
+                    # --- ✅ [CCAPO V3] 关键修正：添加 action_status ---
+                    data['action_status'] = step_info.get('action_status', '')
                     
                     # 2.3. 附加原始的 `rollout` 数据 (用于 IS 和 VF)
                     # `data['rollout_log_probs']` 已经由 `to_list_of_dict(batch)` 自动添加
@@ -446,7 +459,7 @@ class TrajectoryCollector:
             print("\n" + "="*50)
             print(f"--- 监控: 即将输入到 LLM 的完整 Prompt (Batch Item 0) (Step {_step+1}) ---")
             full_prompt_for_llm = self.tokenizer.decode(batch.batch['input_ids'][0], skip_special_tokens=False)
-            print(full_prompt_for_llm)
+            # print(full_prompt_for_llm)
             print("="*50 + "\n")
 
             batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
@@ -555,8 +568,35 @@ class TrajectoryCollector:
 
             batch_list: list[dict] = to_list_of_dict(batch)
             for i in range(batch_size):
-                total_batch_list[i].append(batch_list[i])
-                total_infos[i].append(infos[i]) # <--- ✅ [CCAPO] 必须收集 infos
+                # 只为 active (is_done=False) 的环境添加数据
+                if active_masks[i]:
+                    total_batch_list[i].append(batch_list[i])
+                    total_infos[i].append(infos[i]) # <--- ✅ [CCAPO] 必须收集 infos
+
+                    # ======================= ✅ [CCAPO V3] 关键修正：在此处检查并终结 ✅ =======================
+                    # 如果这个环境 *刚刚* 终结 (dones[i] is True) 并且它仍在 info_pool 中
+                    if dones[i] and hasattr(envs, 'info_pool_managers') and i in envs.info_pool_managers:
+                        
+                        task_completed = infos[i].get("won", False) # 'won' 来自 _step_device
+                        status = "SUCCESS" if task_completed else "FAILURE"
+                        summary_text = "Task finished by agent." if task_completed else "Task failed during execution."
+                        
+                        print(f"--- [rollout_loop.py] 正在为自然终结的环境 {i} (Status: {status}) 终结日志 ---")
+                        
+                        final_summary = envs.info_pool_managers[i].finalize_run(
+                            status=status,
+                            summary=summary_text,
+                            run_start_time=envs.run_start_times[i],
+                            task=envs.tasks[i],
+                            task_completed=task_completed 
+                        )
+                        
+                        # 将 final_summary 注入到我们刚刚 .append() 的 info 中
+                        total_infos[i][-1]['final_summary'] = final_summary
+                        
+                        # 终结后从池中移除
+                        envs.info_pool_managers.pop(i, None)
+                    # ===================================================================================
 
             is_done = np.logical_or(is_done, dones)
             obs = next_obs
@@ -566,7 +606,7 @@ class TrajectoryCollector:
         # ======================= ✅ 2. 修复超时的终结逻辑 ✅ =======================
         # 确保因超时而结束的轨迹也被正确终结
         for i in range(batch_size):
-            # 如果环境没有被标记为 'done'，说明它是因达到 max_steps 而超时的
+            # 如果环境没有被标记为 'done' (is_done[i] is False)，说明它是因达到 max_steps 而超时的
             # 同时检查 info_pool_managers 是否存在且包含该环境的 manager
             if not is_done[i] and hasattr(envs, 'info_pool_managers') and i in envs.info_pool_managers:
                 print(f"--- [rollout_loop.py] 正在为超时的环境 {i} 强制终结日志 ---")

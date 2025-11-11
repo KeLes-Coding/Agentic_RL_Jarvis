@@ -1,6 +1,6 @@
 set -x
 ENGINE=${1:-vllm}
-export VLLM_ATTENTION_BACKEND=XFORMERS
+# export VLLM_ATTENTION_BACKEND=XFORMERS
 export SWANLAB_API_KEY="oB8w36PCJxKeqwif2ijWz"
 
 export CUDA_VISIBLE_DEVICES="1,2"
@@ -41,7 +41,7 @@ group_size=4
 echo "开始执行训练任务..."
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=ccapo \
-    data.train_files=/home/zzh/Workspace/verl-agent/data/atomic_tasks_list_wiki_train.parquet \
+    data.train_files=/home/zzh/Workspace/verl-agent/data/atomic_tasks_list_wiki_test_train.parquet \
     data.val_files=/home/zzh/Workspace/verl-agent/data/atomic_tasks_list_wiki_val.parquet \
     data.train_batch_size=$train_data_size \
     data.val_batch_size=$val_data_size \
@@ -66,7 +66,7 @@ python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.tensor_model_parallel_size=2 \
     actor_rollout_ref.rollout.name=$ENGINE \
     actor_rollout_ref.rollout.gpu_memory_utilization=0.8 \
-    actor_rollout_ref.rollout.enable_chunked_prefill=False \
+    actor_rollout_ref.rollout.enable_chunked_prefill=True \
     actor_rollout_ref.rollout.enforce_eager=False \
     actor_rollout_ref.rollout.free_cache_engine=False \
     actor_rollout_ref.rollout.val_kwargs.temperature=0.4 \
@@ -78,7 +78,7 @@ python3 -m verl.trainer.main_ppo \
     algorithm.use_kl_in_reward=False \
     env.env_name=jarvis \
     env.seed=0 \
-    env.max_steps=20 \
+    env.max_steps=25 \
     env.rollout.n=$group_size \
     env.jarvis.jarvis_config_path=agent_system/environments/env_package/jarvis/jarvis_v2/config.yaml \
     trainer.critic_warmup=0 \
@@ -88,7 +88,7 @@ python3 -m verl.trainer.main_ppo \
     trainer.n_gpus_per_node=2 \
     trainer.nnodes=1 \
     trainer.save_freq=5 \
-    trainer.test_freq=5 \
+    trainer.test_freq=10 \
     trainer.total_epochs=10 \
     trainer.val_before_train=False \
     actor_rollout_ref.model.lora_rank=32 \

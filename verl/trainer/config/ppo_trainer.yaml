@@ -257,8 +257,8 @@ algorithm:
     # R_tau (Sec 4)
     alpha: 0.2                  # P_steps 权重
     gamma_token: 0.1            # P_token 权重 (注意：原 'gamma' 冲突，重命名为 gamma_token)
-    max_steps: 50               # 必须与 env.max_steps 匹配
-    max_tokens: 8192            # 轨迹的最大 token 限制
+    max_steps: 25               # 必须与 env.max_steps 匹配
+    max_tokens: 81920            # 轨迹的最大 token 限制
     min_reasonable_steps: 3     # P_shortcut 阈值
     lambda_shortcut: 0.5        # P_shortcut 惩罚
     
@@ -271,7 +271,7 @@ algorithm:
 
     # R_format_novelty (Sec 5.3)
     w_N: 0.1                    # R_format_novelty 的权重
-    base_bonus: 0.2             # R_format_novelty 的基础奖励
+    base_bonus: 1             # R_format_novelty 的基础奖励
     penalty_format_error: -1.0  # JSON 格式错误的惩罚
     penalty_failure: -0.5       # 动作执行失败 (非 JSON 错误) 的惩罚
     

@@ -444,10 +444,18 @@ class DataParallelPPOActor(BasePPOActor):
         g_calc_steps = g_online_steps
         if G_buffer_batch:
             g_buffer_steps = to_list_of_dict(G_buffer_batch)
-            g_calc_steps = g_online_steps + g_buffer_steps
+            # --- ✅ [CCAPO V3] 关键修正点 ---
+            # 即使 g_buffer_steps 为空, g_calc_steps = g_online_steps + [] 
+            # 也会创建一个 g_online_steps 的 *浅拷贝*。
+            # 这导致 compute_ccapo_advantages 修改的是 *拷贝*，
+            # 而 g_online_steps 保持不变。
+            if g_buffer_steps:
+                g_calc_steps = g_online_steps + g_buffer_steps
+            else:
+                g_calc_steps = g_online_steps # 保持对象引用相同
         
         # --- 2. 计算优势 (Sec 1-5) ---
-        # 这会在 g_calc_steps 列表中原地添加 'advantages'
+        # ccapo_algos.compute_ccapo_advantages 会 *原地修改* g_calc_steps
         # ccapo_config 是 config.algorithm.ccapo
         g_calc_steps_with_adv, lambda_sr = ccapo_algos.compute_ccapo_advantages(
             g_calc_steps,
@@ -458,6 +466,7 @@ class DataParallelPPOActor(BasePPOActor):
         
         # --- 3. 重新组合为 DataProto (仍在 GPU 上) ---
         # 过滤出 G_online 并重新 collate
+        # --- ✅ [CCAPO V3] 修正：从 g_calc_steps_with_adv (修改后的列表) 中过滤 ---
         online_steps_final = [s for s in g_calc_steps_with_adv if not s.get('is_buffer_data', False)]
         G_online_batch_final = DataProto.from_single_dict(collate_fn(online_steps_final))
         
@@ -510,38 +519,135 @@ class DataParallelPPOActor(BasePPOActor):
 
         metrics = {}
         
-        # --- ✅ [CCAPO] 记录详细信号 ---
+        # --- ✅ [CCAPO V3] 记录详细信号 (包含 V3 键、直方图和比例) ---
         try:
             metrics_to_log = ccapo_algos.collections.defaultdict(list)
+            
+            # --- ✅ [CCAPO V2] 新增：用于原始分量的专用列表 ---
+            raw_core_values = []
+            raw_match_values = []
+            # --- 结束 ---
+
+            # --- ✅ [CCAPO V4] 新增：用于比例统计的计数器 ---
+            count_total_steps = 0
+            count_success = 0
+            count_format_error = 0
+            count_exec_failure = 0
+            # --- 结束 ---
+            
             # 我们只记录 G_online 的信号，以匹配 PPO 损失
             for step in online_steps_final: 
+                
+                # --- ✅ [CCAPO V4] 累加比例统计 ---
+                count_total_steps += 1
+                if step.get('action_success', False):
+                    count_success += 1
+                
+                status = step.get('action_status', '')
+                if status.startswith('FORMAT_ERROR'):
+                    count_format_error += 1
+                elif status.startswith('FAILURE'):
+                    count_exec_failure += 1
+                # --- 结束 ---
+
+                # 标准化/最终分数
                 metrics_to_log['R_tau'].append(step.get('R_tau', 0.0))
                 metrics_to_log['A_traj'].append(step.get('A_traj', 0.0))
                 metrics_to_log['R_step'].append(step.get('R_step', 0.0))
                 metrics_to_log['A_step'].append(step.get('A_step', 0.0))
-                metrics_to_log['R_format_novelty'].append(step.get('R_format_novelty', 0.0))
                 metrics_to_log['advantages'].append(step.get('advantages', 0.0)) # 记录最终优势
+                
+                # --- ✅ [CCAPO V3] 修正：记录新的原始分量 ---
+                metrics_to_log['R_novelty_bonus'].append(step.get('R_novelty_bonus', 0.0))
+                metrics_to_log['R_format_penalty'].append(step.get('R_format_penalty', 0.0))
+                # --- 结束 V3 修正 ---
+                
+                # --- ✅ [CCAPO V2] 仅在适用时添加原始分量 ---
+                if 'R_core_raw' in step: # 仅 R_core == 1.0 的步骤
+                    raw_core_values.append(step.get('R_core_raw', 0.0))
+                
+                if 'R_match_raw' in step: # 仅 R_core == -1.0 的步骤
+                    raw_match_values.append(step.get('R_match_raw', 0.0))
+                # --- 结束 ---
+
             
+            # 记录 G_online 的 mean/std/hist
             for key, values in metrics_to_log.items():
                 if values:
                     metrics[f'ccapo/online_{key}_mean'] = ccapo_algos.np.mean(values)
                     metrics[f'ccapo/online_{key}_std'] = ccapo_algos.np.std(values)
+                    # ✅ [新增] 添加直方图
+                    metrics[f'ccapo/online_{key}_hist'] = ccapo_algos.np.array(values, dtype=float)
+
+            # --- ✅ [CCAPO V4] 计算并记录比例 ---
+            epsilon = 1e-6
+            metrics['ccapo_proportions/online_success_rate'] = count_success / (count_total_steps + epsilon)
+            metrics['ccapo_proportions/online_format_error_rate'] = count_format_error / (count_total_steps + epsilon)
+            metrics['ccapo_proportions/online_exec_failure_rate'] = count_exec_failure / (count_total_steps + epsilon)
+            
+            # 总失败率 (对应 "false占比")
+            total_failure_count = count_format_error + count_exec_failure
+            metrics['ccapo_proportions/online_total_failure_rate'] = total_failure_count / (count_total_steps + epsilon)
+            
+            # 记录原始计数（用于调试）
+            metrics['ccapo_counts/online_total_steps'] = count_total_steps
+            metrics['ccapo_counts/online_success'] = count_success
+            metrics['ccapo_counts/online_format_error'] = count_format_error
+            metrics['ccapo_counts/online_exec_failure'] = count_exec_failure
+            # --- 结束 ---
+
+            # --- ✅ [CCAPO V2] 记录新的原始分量 (如果存在) ---
+            # 我们使用 'ccapo_raw' 前缀来区分
+            if raw_core_values:
+                metrics[f'ccapo_raw/online_R_core_raw_mean'] = ccapo_algos.np.mean(raw_core_values)
+                metrics[f'ccapo_raw/online_R_core_raw_std'] = ccapo_algos.np.std(raw_core_values)
+                metrics[f'ccapo_raw/online_R_core_raw_hist'] = ccapo_algos.np.array(raw_core_values, dtype=float) # ✅ 直方图
+            else:
+                metrics[f'ccapo_raw/online_R_core_raw_mean'] = 0.0 
+                metrics[f'ccapo_raw/online_R_core_raw_std'] = 0.0
+
+            if raw_match_values:
+                metrics[f'ccapo_raw/online_R_match_raw_mean'] = ccapo_algos.np.mean(raw_match_values)
+                metrics[f'ccapo_raw/online_R_match_raw_std'] = ccapo_algos.np.std(raw_match_values)
+                metrics[f'ccapo_raw/online_R_match_raw_hist'] = ccapo_algos.np.array(raw_match_values, dtype=float) # ✅ 直方图
+            else:
+                metrics[f'ccapo_raw/online_R_match_raw_mean'] = 0.0
+                metrics[f'ccapo_raw/online_R_match_raw_std'] = 0.0
+            # --- 结束 ---
 
             # (可选) 记录 G_buffer 信号
             if buffer_steps_final:
                 buffer_metrics_to_log = ccapo_algos.collections.defaultdict(list)
+                
+                buffer_raw_core_values = []
+                
                 for step in buffer_steps_final:
                     buffer_metrics_to_log['R_step'].append(step.get('R_step', 0.0))
                     buffer_metrics_to_log['A_step'].append(step.get('A_step', 0.0))
-                    buffer_metrics_to_log['R_format_novelty'].append(step.get('R_format_novelty', 0.0))
                     buffer_metrics_to_log['advantages'].append(step.get('advantages', 0.0))
+                    
+                    # --- ✅ [CCAPO V3] 修正：记录 G_buffer 的 V3 键 ---
+                    buffer_metrics_to_log['R_novelty_bonus'].append(step.get('R_novelty_bonus', 0.0))
+                    buffer_metrics_to_log['R_format_penalty'].append(step.get('R_format_penalty', 0.0))
+                    
+                    if 'R_core_raw' in step:
+                         buffer_raw_core_values.append(step.get('R_core_raw', 0.0))
                 
                 for key, values in buffer_metrics_to_log.items():
                     if values:
                         metrics[f'ccapo/buffer_{key}_mean'] = ccapo_algos.np.mean(values)
+                        metrics[f'ccapo/buffer_{key}_hist'] = ccapo_algos.np.array(values, dtype=float) # ✅ 直方图
+                        
+                if buffer_raw_core_values:
+                    metrics[f'ccapo_raw/buffer_R_core_raw_mean'] = ccapo_algos.np.mean(buffer_raw_core_values)
+                    metrics[f'ccapo_raw/buffer_R_core_raw_hist'] = ccapo_algos.np.array(buffer_raw_core_values, dtype=float) # ✅ 直方图
+                else:
+                    metrics[f'ccapo_raw/buffer_R_core_raw_mean'] = 0.0
+                        
         except Exception as e:
             logger.warning(f"[CCAPO] 无法记录详细信号: {e}")
         # --- 结束记录 ---
+
 
         # --- 5. PPO 循环 ---
         for epoch in range(self.config.ppo_epochs):
@@ -610,6 +716,7 @@ class DataParallelPPOActor(BasePPOActor):
                         response_mask = micro_batch["attention_mask"][:, -response_length:]
 
                     pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = compute_policy_loss(
+                        # --- ✅ [CCAPO V2] 修正：使用 'rollout_log_probs' (来自 STDB/Online) ---
                         old_log_prob=micro_batch["rollout_log_probs"],
                         log_prob=log_prob,
                         advantages=micro_batch["advantages"],
@@ -657,8 +764,10 @@ class DataParallelPPOActor(BasePPOActor):
             # --- END: 修正后的逻辑 ---
 
         # --- 6. 准备 STDB 更新数据 ---
-        # `g_online_steps` 已经被 `compute_ccapo_advantages` 原地修改，包含了 R_tau
-        online_trajs_for_stdb = _group_steps_by_traj(g_online_steps)
+        # --- ✅ [CCAPO V3] 修正：使用 g_calc_steps_with_adv (修改后的列表) ---
+        # 我们需要从 *计算了优势* 的列表中提取
+        online_steps_for_stdb_grouping = [s for s in g_calc_steps_with_adv if not s.get('is_buffer_data', False)]
+        online_trajs_for_stdb = _group_steps_by_traj(online_steps_for_stdb_grouping)
         
         # Tensors (like prompt_vector) 必须被移到 CPU 以返回给 driver
         cpu_trajs_for_stdb = {}

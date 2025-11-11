@@ -99,7 +99,7 @@ class Actuator:
         if not self.tap(uid, elements):
             self.logger.error("输入文本失败：前置点击操作失败。")
             return False
-        time.sleep(0.5)
+        time.sleep(1.5)
         self.logger.info("开始通过逐字符模拟键盘的方式输入...")
         for char in text:
             command_parts = []

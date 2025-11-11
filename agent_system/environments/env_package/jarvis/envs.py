@@ -7,7 +7,8 @@ from typing import List, Dict, Tuple, Union, Any
 import logging
 import re
 import openai
-import subprocess # <<< 新增：导入 subprocess 模块
+import subprocess 
+from concurrent.futures import ThreadPoolExecutor, Future # <<< 新增：导入线程池
 
 try:
     from PIL import Image
@@ -64,6 +65,8 @@ class JarvisMultiDeviceEnv:
     一个底层的、支持多设备的 Jarvis 环境。
     它封装了与一组安卓设备的直接交互 (reset, step)。
     这个类不处理复杂的 prompt 构建，只提供原始观测数据。
+    
+    <<< 修改：此类现在使用 ThreadPoolExecutor 来并行执行 reset 和 step 操作。>>>
     """
     def __init__(self, jarvis_config_path: str, max_steps_per_episode: int):
         try:
@@ -80,9 +83,15 @@ class JarvisMultiDeviceEnv:
         print(f"JarvisMultiDeviceEnv 初始化成功，管理 {self.num_envs} 台设备: {self.device_serials}")
 
         adb_path = self.jarvis_config.get("adb", {}).get("executable_path", "adb")
-        self.adb_path = adb_path # <<< 新增：存储 adb_path 供清理方法使用
+        self.adb_path = adb_path 
         self.observers: Dict[str, Observer] = {s: Observer(adb_path, s) for s in self.device_serials}
         self.actuators: Dict[str, Actuator] = {s: Actuator(adb_path, s) for s in self.device_serials}
+
+        # <<< 新增：初始化线程池 >>>
+        # 为每个设备（环境）创建一个工作线程
+        self.executor = ThreadPoolExecutor(max_workers=self.num_envs, thread_name_prefix="jarvis_env_worker")
+        print(f"ThreadPoolExecutor (线程池) 已启动，设置 max_workers={self.num_envs} 以实现并行I/O。")
+
 
         self.max_steps_per_episode = max_steps_per_episode
         self.episode_steps: Dict[str, int] = {s: 0 for s in self.device_serials}
@@ -146,7 +155,7 @@ class JarvisMultiDeviceEnv:
             r"^com\.android\.adbkeyboard$",      # ADB Keyboard (根据原有逻辑保留)
             r"^com\.android\.systemui$",         # 系统 UI
             r"^com\.android\.settings$",         # 设置
-            r".*launcher.*",                     # 任何包含 "launcher" 的包名
+            r".*launcher.*",                   # 任何包含 "launcher" 的包名
             r"^com\.google\.android\.gms$",      # Google Play 服务
             r"^com\.android\.vending$",          # Google Play 商店 (Vending)
             r"^android$",                        # 核心操作系统包
@@ -186,7 +195,7 @@ class JarvisMultiDeviceEnv:
             # 首先强制停止应用，确保它没有在运行
             try:
                 force_stop_cmd = adb_command_base + ["am", "force-stop", package_name]
-                subprocess.run(force_stop_cmd, capture_output=True, check=True, timeout=10)
+                subprocess.run(force_stop_cmd, capture_output=True, check=False, timeout=10) # check=False 忽略停止失败
             except Exception:
                 # 强制停止失败通常不是严重问题（例如，应用可能已经停止），所以忽略异常
                 pass
@@ -207,25 +216,22 @@ class JarvisMultiDeviceEnv:
 
         print(f"--- [设备: {serial}] 应用数据清理完成。清理数量: {cleared_count}, 跳过 (核心/安全) 数量: {skipped_count} ---")
     # ===========================================================================
-    
 
 
-    def reset(self, tasks: List[Dict] = None) -> Tuple[Dict[str, List], List[Dict]]:
-        obs_images = []
-        obs_texts = []
-        infos = []
-
-        for i, serial in enumerate(self.device_serials):
-            # ======================= ✅ 修改：在 reset 开始时调用清理方法 ✅ =======================
+    # <<< 新增：用于并行 reset 的辅助方法 >>>
+    def _reset_device(self, serial: str, task: Dict) -> Tuple[np.ndarray, str, Dict]:
+        """
+        (辅助函数) 在单独的线程中重置单个设备。
+        返回 (obs_image, obs_text, info)
+        """
+        try:
+            # ======================= ✅ 在 reset 开始时调用清理方法 ✅ =======================
             self._clear_background_apps(serial)
             # ===============================================================================
 
             self.episode_steps[serial] = 0
 
-            if tasks and i < len(tasks):
-                self.tasks[serial] = tasks[i]
-            else:
-                self.tasks[serial] = {}
+            self.tasks[serial] = task if task else {}
 
             self.actuators[serial].home() # 清理后返回主屏幕
             
@@ -259,17 +265,61 @@ class JarvisMultiDeviceEnv:
             if final_image_array is None:
                 final_image_array = np.zeros((256, 256, 3), dtype=np.uint8)
 
-            obs_images.append(final_image_array)
             image_placeholders = "<image>\n"
             obs_text = obs_data.get("simplified_elements_str", "")
-            obs_texts.append(f"{image_placeholders}{obs_text}")
+            final_obs_text = f"{image_placeholders}{obs_text}"
 
             info_dict = {
                 "device_serial": serial,
                 "raw_obs_data": obs_data,
                 "compressed_screenshot_bytes": compressed_bytes
             }
-            infos.append(info_dict)
+            return final_image_array, final_obs_text, info_dict
+        
+        except Exception as e:
+            print(f"--- [设备: {serial}] 线程 'reset' 失败: {e} ---")
+            # 返回一个表示失败的空状态，确保批处理(batch)的形状一致
+            return (
+                np.zeros((256, 256, 3), dtype=np.uint8), 
+                "<image>\nERROR: Reset failed.", 
+                {"device_serial": serial, "raw_obs_data": {}, "compressed_screenshot_bytes": None, "error": str(e)}
+            )
+
+
+    # <<< 修改：`reset` 方法现在使用线程池 >>>
+    def reset(self, tasks: List[Dict] = None) -> Tuple[Dict[str, List], List[Dict]]:
+        obs_images = []
+        obs_texts = []
+        infos = []
+
+        # 为每个设备准备任务
+        device_tasks = []
+        if tasks:
+            # 确保 task 列表至少和设备列表一样长，如果不够，则用空字典填充
+            device_tasks = [tasks[i] if i < len(tasks) else {} for i in range(self.num_envs)]
+        else:
+            device_tasks = [{} for _ in range(self.num_envs)]
+
+        # <<< 修改：使用线程池并行执行 reset >>>
+        futures: List[Future] = []
+        for i, serial in enumerate(self.device_serials):
+            task = device_tasks[i]
+            futures.append(self.executor.submit(self._reset_device, serial, task))
+
+        # 按顺序收集结果
+        for future in futures:
+            try:
+                img, text, info = future.result() # 等待线程完成
+                obs_images.append(img)
+                obs_texts.append(text)
+                infos.append(info)
+            except Exception as e:
+                # 处理 _reset_device 中未捕获的异常
+                print(f"--- 严重错误: 'reset' 线程 'future.result()' 失败: {e} ---")
+                obs_images.append(np.zeros((256, 256, 3), dtype=np.uint8))
+                obs_texts.append("<image>\nERROR: Future result failed.")
+                infos.append({"device_serial": "unknown", "error": str(e)})
+
         return {"image": obs_images, "text": obs_texts}, infos
 
     # ======================= ✅ 新方法：封装 `finish` 动作的处理逻辑 ✅ =======================
@@ -379,11 +429,13 @@ class JarvisMultiDeviceEnv:
         return feedback
     # ====================================================================================
 
-    def step(self, actions: List[str]) -> Tuple[Dict[str, List], List[float], List[bool], List[Dict]]:
-        obs_images, obs_texts, rewards, dones, infos = [], [], [], [], []
-
-        for i, serial in enumerate(self.device_serials):
-            action_str = actions[i]
+    # <<< 新增：用于并行 step 的辅助方法 >>>
+    def _step_device(self, serial: str, action_str: str) -> Tuple[np.ndarray, str, float, bool, Dict]:
+        """
+        (辅助函数) 在单独的线程中执行单个设备的 step。
+        返回 (obs_image, obs_text, reward, done, info)
+        """
+        try:
             pre_action_obs_data = self.observers[serial].get_current_observation(
                 max_elements=self.max_elements_per_obs,
                 max_str_len=self.max_str_len_per_obs
@@ -404,21 +456,19 @@ class JarvisMultiDeviceEnv:
                 screenshots_bytes = [screenshots_bytes] if screenshots_bytes else []
 
             final_image_array = None
-            compressed_bytes = None
+            compressed_bytes_post_action = None
             if screenshots_bytes:
                 first_shot_bytes = screenshots_bytes[0]
-                compressed_bytes = self._compress_single_image(first_shot_bytes)
-                if compressed_bytes:
+                compressed_bytes_post_action = self._compress_single_image(first_shot_bytes)
+                if compressed_bytes_post_action:
                     try:
-                        img = Image.open(io.BytesIO(compressed_bytes)).convert("RGB")
+                        img = Image.open(io.BytesIO(compressed_bytes_post_action)).convert("RGB")
                         final_image_array = np.array(img, dtype=np.uint8)
                     except Exception as e:
                         print(f"警告: 图像解码失败 - {e}")
 
             if final_image_array is None:
                 final_image_array = np.zeros((256, 256, 3), dtype=np.uint8)
-
-            obs_images.append(final_image_array)
 
             feedback_prefix = ""
 
@@ -437,8 +487,8 @@ class JarvisMultiDeviceEnv:
                 feedback_prefix += swipe_reminder
 
             image_placeholders = "<image>\n"
-            obs_text = post_action_obs_data.get("simplified_elements_str", "")
-            obs_texts.append(f"{feedback_prefix}{image_placeholders}{obs_text}")
+            obs_text_content = post_action_obs_data.get("simplified_elements_str", "")
+            final_obs_text = f"{feedback_prefix}{image_placeholders}{obs_text_content}"
 
             done = False
             reward = 0.0
@@ -449,25 +499,79 @@ class JarvisMultiDeviceEnv:
                 reward, task_completed = self._handle_finish_action(action_str, serial)
 
             elif not action_success:
+                # 动作失败的惩罚
                 reward = -0.1
 
             if self.episode_steps[serial] >= self.max_steps_per_episode:
                 done = True
                 if not action_str.startswith("finish"):
+                    # 超时，任务未完成
                     task_completed = False
+            
+            # 动作成功但未结束的微小正奖励（可选，目前为0）
+            # if action_success and not done:
+            #     reward = 0.01 
 
-            rewards.append(reward)
-            dones.append(done)
-
+            compressed_bytes_pre_action = self._compress_single_image(pre_action_obs_data.get("screenshot_bytes", b''))
+            
             info_dict = {
                 "device_serial": serial,
                 "action_success": action_success,
                 "won": task_completed,
                 "task_completed": task_completed,
-                "raw_obs_data": pre_action_obs_data,
-                "compressed_screenshot_bytes": self._compress_single_image(pre_action_obs_data.get("screenshot_bytes", b'')),
+                "raw_obs_data": pre_action_obs_data, # info 中通常携带动作前的观察
+                "compressed_screenshot_bytes": compressed_bytes_pre_action,
+                # --- ✅ [CCAPO V3] 关键修正：将 status 传递出去 ---
+                "action_status": status
             }
-            infos.append(info_dict)
+            
+            return final_image_array, final_obs_text, float(reward), bool(done), info_dict
+
+        except Exception as e:
+            print(f"--- [设备: {serial}] 线程 'step' 失败: {e} ---")
+            # 返回一个表示失败的空状态
+            return (
+                np.zeros((256, 256, 3), dtype=np.uint8), 
+                f"<image>\nERROR: Step failed due to {e}", 
+                -0.1,  # 惩罚
+                True,  # 终止这个出问题的 episode
+                {"device_serial": serial, "action_success": False, "won": False, "task_completed": False, "error": str(e)}
+            )
+
+    # <<< 修改：`step` 方法现在使用线程池 >>>
+    def step(self, actions: List[str]) -> Tuple[Dict[str, List], List[float], List[bool], List[Dict]]:
+        obs_images, obs_texts, rewards, dones, infos = [], [], [], [], []
+
+        # 健壮性检查：确保 actions 列表长度与设备数匹配
+        if len(actions) != self.num_envs:
+            print(f"--- 错误: 传入的 actions 数量 ({len(actions)}) 与设备数 ({self.num_envs}) 不匹配! ---")
+            # 这是一个严重的逻辑错误，但我们尝试通过广播第一个动作来恢复，而不是崩溃
+            safe_action = actions[0] if actions else "wait(1.0)"
+            print(f"--- 警告: 将使用动作 '{safe_action}' 广播到所有 {self.num_envs} 个设备。 ---")
+            actions = [safe_action] * self.num_envs
+
+        # <<< 修改：使用线程池并行执行 step >>>
+        futures: List[Future] = []
+        for i, serial in enumerate(self.device_serials):
+            futures.append(self.executor.submit(self._step_device, serial, actions[i]))
+
+        # 按顺序收集结果
+        for future in futures:
+            try:
+                img, text, reward, done, info = future.result()
+                obs_images.append(img)
+                obs_texts.append(text)
+                rewards.append(reward)
+                dones.append(done)
+                infos.append(info)
+            except Exception as e:
+                print(f"--- 严重错误: 'step' 线程 'future.result()' 失败: {e} ---")
+                # 添加占位符以保持批处理(batch)大小一致
+                obs_images.append(np.zeros((256, 256, 3), dtype=np.uint8))
+                obs_texts.append("<image>\nERROR: Future result failed.")
+                rewards.append(-0.1) # 惩罚
+                dones.append(True) # 终止
+                infos.append({"device_serial": "unknown", "error": str(e)})
 
         observations = {"image": obs_images, "text": obs_texts}
         return observations, np.array(rewards, dtype=np.float32), np.array(dones, dtype=bool), infos
@@ -534,6 +638,22 @@ class JarvisMultiDeviceEnv:
             error_message = f"EXECUTION_ERROR: {repr(e)}"
             print(f"--- [设备: {serial}] 动作 '{action_str}' 执行时出错: {error_message} ---")
             return error_message
+
+    # <<< 新增：添加一个 close 方法来清理线程池 >>>
+    def close(self):
+        """
+        关闭环境并清理资源，特别是线程池。
+        """
+        print(f"--- 正在关闭 JarvisMultiDeviceEnv (管理 {self.num_envs} 台设备)，清理线程池... ---")
+        self.executor.shutdown(wait=True)
+        print("--- 线程池已关闭。 ---")
+
+    def __del__(self):
+        # 作为一个保障，以防用户忘记调用 .close()
+        if hasattr(self, 'executor'):
+            # 在 __del__ 中，我们不等待线程完成，只是触发关闭
+            self.executor.shutdown(wait=False)
+            print(f"--- (via __del__) 触发线程池关闭。 ---")
 
 
 def build_jarvis_envs(jarvis_config_path: str, max_steps: int) -> JarvisMultiDeviceEnv:
