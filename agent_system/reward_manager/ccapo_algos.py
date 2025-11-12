@@ -194,6 +194,7 @@ def _calculate_R_step_success(g_calc_steps: List[Dict[str, Any]], g_calc_trajs: 
             if step.get('action_success', False):
                 current_successful_step_t += 1
                 k_norm = current_successful_step_t / n_success if n_success > 0 else 0
+                print(f"Traj {traj_uid} Step {step.get('step_index', 0)}: k_norm={k_norm}, n_success={n_success}, current_successful_step_t={current_successful_step_t}")
                 
                 stage = 'Late'
                 if k_norm <= 0.33: stage = 'Early'
@@ -224,6 +225,7 @@ def _calculate_R_step_success(g_calc_steps: List[Dict[str, Any]], g_calc_trajs: 
         S_utility = P_success_given_action / (P_success_global + 1e-6)
         
         I_action_cache[key] = S_necessity * S_utility
+        print(f"Action '{key[0]}' Stage '{key[1]}': S_necessity={S_necessity}, S_utility={S_utility}, I_action={I_action_cache[key]}")
 
     # --- Sec 5.1.3 & 5.1: 仅计算 R_core_raw ---
     for step in g_calc_steps:
@@ -246,6 +248,7 @@ def _calculate_R_step_success(g_calc_steps: List[Dict[str, Any]], g_calc_trajs: 
         
         # --- ✅ [CCAPO V2] 修改: 只存储 R_core_raw ---
         step['R_core_raw'] = i_action * q_efficiency
+        print(f"Step {step.get('step_index', 0)}: Q_step={q_step}, Q_economy={step['Q_economy']}, I_action={i_action}, R_core_raw={step['R_core_raw']}")
         # (移除 R_step 的计算)
 
 # --- Sec 5.2: 微观步骤奖励 (失败轨迹) ---
@@ -265,7 +268,7 @@ def _calculate_R_step_fail(g_calc_steps: List[Dict[str, Any]], g_buffer_steps: L
         # G_buffer 都是成功轨迹 (R_core == 1.0)
         # --- ✅ [CCAPO V2] 修改: S(a_j*) = R_step_success(a_j*)
         # 此时 R_step 已由 R_step_success (Z_core + w_N*Z_novelty) 填充
-        score = step.get('R_step', 0.0) 
+        score = step.get('R_step', 0.0)
         action = step.get('parsed_action')
         thought = step.get('thought')
         

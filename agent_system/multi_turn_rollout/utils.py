@@ -24,7 +24,26 @@ from verl import DataProto
 def to_list_of_dict(batch: DataProto) -> list[dict]:
     tensors = batch.batch
     non_tensor = batch.non_tensor_batch
-    batch_size = len(tensors['input_ids'])
+
+    # ======================= ✅ [ 修复 RuntimeError ] =======================
+    # 确定 batch_size。
+    # 我们不能使用 `if tensors:` 因为 `tensordict` 库禁止将其转换为 bool。
+    # 我们直接检查 keys 的长度。
+    
+    batch_size = 0
+    if len(tensors.keys()) > 0:
+        # 从第一个可用的张量获取 batch_size
+        first_key = list(tensors.keys())[0]
+        batch_size = len(tensors[first_key])
+    elif non_tensor: # non_tensor 是一个普通 dict, `if non_tensor` 是安全的 (检查是否为空)
+        # 如果没有张量 (例如 G_buffer 只有非张量数据)，则从非张量获取
+        first_key = list(non_tensor.keys())[0]
+        batch_size = len(non_tensor[first_key])
+    else:
+        # 这是一个空的 DataProto
+        return [] 
+    # ======================= 修复结束 =======================
+
     save_list = []
     for bs in range(batch_size):
         save_dict = dict()

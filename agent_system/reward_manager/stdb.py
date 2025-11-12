@@ -128,7 +128,12 @@ class SuccessTrajectoryDatabase:
             return
 
         try:
-            db_dict, self.prompt_vectors, self.all_log_paths = torch.load(self.save_path)
+            # ======================= ✅ [ 修复 Bug 1 ] =======================
+            # 明确设置 weights_only=False，以允许 torch.load 加载
+            # 包含 Python 字典、Set 和 Numpy 标量 (float) 的 pickle 文件。
+            db_dict, self.prompt_vectors, self.all_log_paths = torch.load(self.save_path, weights_only=False)
+            # ======================= 修复结束 =======================
+
             self.db = collections.defaultdict(list, db_dict)
             
             # 确保堆结构被正确加载
@@ -317,13 +322,18 @@ class SuccessTrajectoryDatabase:
         traj_task_completed = summary_data.get('task_completed', False)
         traj_total_steps = summary_data.get('step_count', 0)
         traj_total_tokens = summary_data.get('token_usage', {}).get('total_tokens', 0)
+
+        # ======================= ✅ [ 修复 KeyError: 'traj_uid' ] =======================
+        # log_dir_path 的最后一部分就是 traj_uid
+        traj_uid = os.path.basename(log_dir_path)
+        # ======================= 修复结束 =======================
         
         # --- 2. 加载步骤级(Micro)数据 ---
         loaded_steps = []
         
         # 2.1 预计算 N_success(tau)
         traj_n_success_steps = 0
-        for i in range(traj_total_steps + 1): # 假设 step_count 是从0开始的
+        for i in range(1, traj_total_steps + 1): # 假设 step_count 是从0开始的
             step_detail_path = os.path.join(log_dir_path, f"step_{i}", "step_details.json")
             if os.path.exists(step_detail_path):
                 try:
@@ -335,7 +345,7 @@ class SuccessTrajectoryDatabase:
                     self.file_logger.warning(f"读取 {step_detail_path} 时出错: {e}")
             
         # 2.2 加载每一步
-        for i in range(traj_total_steps + 1): # 假设 step_count 是从0开始的
+        for i in range(1, traj_total_steps + 1): # 假设 step_count 是从0开始的
             step_detail_path = os.path.join(log_dir_path, f"step_{i}", "step_details.json")
             if not os.path.exists(step_detail_path):
                 continue
@@ -352,6 +362,15 @@ class SuccessTrajectoryDatabase:
                 rollout_log_probs = torch.tensor(log_probs_list)
             else:
                 rollout_log_probs = torch.tensor([]) # 占位
+            
+            # ======================= ✅ [ 修复 G_Buffer Bug ] =======================
+            # 重新水合 PPO 更新所需的张量
+            # (我们假设它们是长整型，因为它们是 token IDs)
+            input_ids = torch.tensor(step_data.get('input_ids', []), dtype=torch.long)
+            attention_mask = torch.tensor(step_data.get('attention_mask', []), dtype=torch.long)
+            position_ids = torch.tensor(step_data.get('position_ids', []), dtype=torch.long)
+            responses = torch.tensor(step_data.get('responses', []), dtype=torch.long)
+            # =====================================================================
             
             rehydrated_step = {
                 # 轨迹级(Macro)数据
@@ -374,9 +393,17 @@ class SuccessTrajectoryDatabase:
                 # 核心 RL 数据
                 'rollout_log_probs': rollout_log_probs, # $\pi_{\theta_{stored}}$
                 
+                # ======================= ✅ [ 修复 G_Buffer Bug ] =======================
+                'input_ids': input_ids,
+                'attention_mask': attention_mask,
+                'position_ids': position_ids,
+                'responses': responses,
+                # =====================================================================
+
                 # 标识符
                 'log_dir_path': log_dir_path,
                 'is_buffer_data': True, # 标记这是来自 STDB 的数据
+                'traj_uid': traj_uid,
             }
             loaded_steps.append(rehydrated_step)
             

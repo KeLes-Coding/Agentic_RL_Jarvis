@@ -125,7 +125,18 @@ class InfoPoolManager:
                 except Exception as e:
                     print(f"Warning: could not serialize rollout_log_probs. {e}")
                     details["rollout_log_probs"] = "Error: Not serializable"
-            # --------------------------------------------------------
+            
+            # ======================= ✅ [ 修复 G_Buffer Bug ] =======================
+            # 保存 PPO 更新所需的张量 (作为列表)
+            # (我们假设 envs.py 将这些张量从 set_last_step_tensors 传递到了 step_data)
+            for key in ["input_ids", "attention_mask", "position_ids", "responses"]:
+                if key in step_data:
+                    try:
+                        details[key] = step_data[key].cpu().tolist()
+                    except Exception as e:
+                        print(f"Warning: could not serialize {key}. {e}")
+                        details[key] = "Error: Not serializable"
+            # =====================================================================
             
             with open(os.path.join(step_dir, "step_details.json"), "w", encoding="utf-8") as f:
                 json.dump(details, f, indent=4, ensure_ascii=False)
@@ -133,6 +144,7 @@ class InfoPoolManager:
         except Exception as e:
             print(f"Error saving step artifacts for step {self.step_count}: {e}")
 
+    
     # ======================= ✅ 2. 修改 finalize_run 方法签名和逻辑 ✅ =======================
     def finalize_run(self, status: str, summary: str, run_start_time: datetime, task: str, task_completed: bool):
     # ======================================================================================

@@ -42,6 +42,37 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
+# ======================= ✅ 1. 新增：RL_DATASET 专用文件日志器 ✅ =======================
+dataset_file_logger = logging.getLogger("RL_DATASET_FILE")
+dataset_file_logger.setLevel(logging.INFO) # 捕获 INFO 及以上级别
+dataset_file_logger.propagate = False      # 防止重复记录到 root logger
+
+# 仅在日志器没有处理器时才添加，以防止重复
+if not dataset_file_logger.handlers:
+    try:
+        log_dir = "logger/RL_DATASET" # <--- 新的日志目录
+        os.makedirs(log_dir, exist_ok=True)
+        log_file = os.path.join(log_dir, "dataset_operations.log") # <--- 新的日志文件
+        
+        # 创建文件处理器 (追加模式)
+        file_handler = logging.FileHandler(log_file, mode='a', encoding='utf-8')
+        
+        # 创建格式化器
+        formatter = logging.Formatter(
+            '%(asctime)s - [DATASET_FILE] - %(levelname)s - %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S'
+        )
+        file_handler.setFormatter(formatter)
+        
+        # 添加处理器
+        dataset_file_logger.addHandler(file_handler)
+        dataset_file_logger.info("--- RL_DATASET 专用文件日志器已初始化 ---")
+        
+    except Exception as e:
+        logger.error(f"[RL_DATASET] 无法创建专用文件日志器: {e}")
+# ======================= 日志设置结束 =======================
+
+
 def collate_fn(data_list: list[dict]) -> dict:
     """
     Collate a batch of sample dicts into batched tensors and arrays.
@@ -80,7 +111,7 @@ class RLHFDataset(Dataset):
     - Caches files locally.
     - Reads into a HuggingFace Dataset and tokenizes prompts.
     - Optionally handles images/videos via a ProcessorMixin.
-    - Filters prompts over a max length.
+    - Filter prompts over a max length.
     - Supports resuming from checkpoints.
     - ❗️ (新增) Optionally vectorizes prompts for similarity search.
 
@@ -98,6 +129,12 @@ class RLHFDataset(Dataset):
         config: DictConfig,
         processor: Optional[ProcessorMixin] = None,
     ):
+        
+        # ======================= ✅ 2. 分配专用日志器 ✅ =======================
+        self.file_logger = dataset_file_logger
+        self.file_logger.info("--- 开始初始化 RLHFDataset 实例 ---")
+        # =====================================================================
+
         if not isinstance(data_files, (List, ListConfig)):
             data_files = [data_files]
 
@@ -124,6 +161,8 @@ class RLHFDataset(Dataset):
         self.need_tools_kwargs = config.get("need_tools_kwargs", False)
         self.filter_prompts = config.get("filter_prompts", True)
         self.serialize_dataset = False
+        
+        self.file_logger.info(f"Dataset config: max_prompt_length={self.max_prompt_length}, filter_overlong_prompts={self.filter_overlong_prompts}")
 
         # ❗️ 新增：初始化 prompt 向量化器
         self.vectorize_prompts = True  # 默认开启
@@ -136,56 +175,69 @@ class RLHFDataset(Dataset):
                     # all-MiniLM-L6-v2 是一个常用的轻量级句向量模型
                     self.vectorizer = SentenceTransformer(self.vectorizer_model_name) 
                     logger.info(f"成功初始化 Prompt 向量化器: {self.vectorizer_model_name}")
+                    self.file_logger.info(f"成功初始化 Prompt 向量化器: {self.vectorizer_model_name}")
                 except Exception as e:
                     logger.error(f"加载 SentenceTransformer 模型 '{self.vectorizer_model_name}' 失败: {e}")
+                    self.file_logger.error(f"加载 SentenceTransformer 模型 '{self.vectorizer_model_name}' 失败: {e}")
                     self.vectorize_prompts = False
             else:
                 logger.error(
                     "未找到 'sentence-transformers' 库。"
                     "请通过 `pip install sentence-transformers` 安装以启用 prompt 向量化。"
                 )
+                self.file_logger.error(
+                    "未找到 'sentence-transformers' 库。向量化已禁用。"
+                )
                 self.vectorize_prompts = False # 自动禁用该功能
 
         self._download()
         self._read_files_and_tokenize()
+        self.file_logger.info("--- RLHFDataset 实例初始化完成 ---")
 
     def _download(self, use_origin_parquet=False):
         from verl.utils.fs import copy_to_local
-
+        
+        self.file_logger.info(f"开始下载/复制数据文件 (use_origin_parquet={use_origin_parquet})")
         data_files = self.data_files if not use_origin_parquet else self.original_data_files
         for i, parquet_file in enumerate(data_files):
             self.data_files[i] = copy_to_local(src=parquet_file, cache_dir=self.cache_dir, use_shm=self.use_shm)
+        self.file_logger.info(f"数据文件定位完成: {self.data_files}")
 
     def _read_files_and_tokenize(self):
         dataframes = []
         for parquet_file in self.data_files:
             # read parquet files and cache
+            self.file_logger.info(f"正在加载 parquet 文件: {parquet_file}")
             dataframe = datasets.load_dataset("parquet", data_files=parquet_file)["train"]
             dataframes.append(dataframe)
         self.dataframe: datasets.Dataset = datasets.concatenate_datasets(dataframes)
 
+        self.file_logger.info(f"数据集总行数 (合并后): {len(self.dataframe)}")
         print(f"dataset len: {len(self.dataframe)}")
 
         # filter out too long prompts
         if self.filter_overlong_prompts:
             tokenizer = self.tokenizer
             prompt_key = self.prompt_key
+            self.file_logger.info(f"开始过滤超长提示 (max_length={self.max_prompt_length})，使用 {self.num_workers} 个进程...")
             self.dataframe = self.dataframe.filter(
                 lambda doc: len(tokenizer.apply_chat_template(doc[prompt_key], add_generation_prompt=True)) <= self.max_prompt_length,
                 num_proc=self.num_workers,
                 desc=f"Filtering prompts longer than {self.max_prompt_length} tokens",
             )
-
+            self.file_logger.info(f"过滤后数据集行数: {len(self.dataframe)}")
             print(f"filter dataset len: {len(self.dataframe)}")
 
     def resume_dataset_state(self):
         self.serialize_dataset = not hasattr(self, "original_data_files")
+        self.file_logger.info(f"Resuming dataset state (serialize_dataset={self.serialize_dataset})")
         # resume dataframe if not it's serialized in data.pt
         if not self.serialize_dataset:
             self._download(use_origin_parquet=True)  # download and resume from original parquet files
             self._read_files_and_tokenize()
         else:
             print(r"old dataloader ckpt file is used, please train from scratch for better ckpt performance")
+            self.file_logger.warning(r"old dataloader ckpt file is used, please train from scratch for better ckpt performance")
 
     def __len__(self):
         return len(self.dataframe)
@@ -209,39 +261,57 @@ class RLHFDataset(Dataset):
 
         return messages
 
+    # ======================= ✅ 3. 修复 __getitem__ 并添加详细日志 ✅ =======================
     def __getitem__(self, item):
         """
         Note that we also return the raw_input_ids so that it can be combined with other chat template
         """
+        self.file_logger.info(f"--- [getitem] 开始处理 item {item} ---")
+        
         # 从HuggingFace dataset中获取原始数据行
         original_row: dict = self.dataframe[item]
-
+        
         # ❗️ 关键修复：创建一个副本，以防后续操作修改原始字典。
         row_dict = original_row.copy()
         
         # 最终要返回的样本，我们从这里开始构建
         final_item = {}
 
-        # ❗️ [CCAPO 修正]：在此处，从 original_row 向量化核心任务
+        # ❗️ [CCAPO/STDB 关键修复 1]：创建 prompt_vector
         if self.vectorizer is not None:
             try:
-                # 根据你的 parquet 样本: prompt 是 [{'content': '...', 'role': 'user'}]
-                # 我们提取第一个 'content' 作为任务字符串
+                # 假设 prompt 是 [{'content': '...', 'role': 'user'}]
                 task_content_string = original_row[self.prompt_key][0]['content']
+                self.file_logger.info(f"Item {item}: 正在向量化任务: '{task_content_string[:100]}...'")
                 prompt_vector = self.vectorizer.encode(task_content_string, convert_to_tensor=True)
-                final_item["prompt_vector"] = prompt_vector
+                # 这是一个张量, collate_fn 会自动将其放入 gen_batch.batch
+                final_item["prompt_vector"] = prompt_vector 
+                
+                # ======================= ✅ (请求 1) 打印向量摘要 ✅ =======================
+                vec_summary = (
+                    f"Shape: {prompt_vector.shape}, "
+                    f"DType: {prompt_vector.dtype}, "
+                    f"Mean: {prompt_vector.mean():.4f}, "
+                    f"Std: {prompt_vector.std():.4f}, "
+                    f"Values[0:3]: {prompt_vector[:3]}"
+                )
+                self.file_logger.info(f"Item {item}: prompt_vector 创建成功. {vec_summary}")
+                # ========================================================================
+
             except Exception as e:
                 logger.warning(f"Failed to vectorize prompt for item {item} (task: {original_row[self.prompt_key]}): {e}")
-                # ❗️ [FIX] 创建一个零向量而不是 None，以确保 collate_fn 正常工作
+                self.file_logger.warning(f"Item {item}: 向量化失败: {e}. 创建零向量。")
                 try:
                     dim = self.vectorizer.get_sentence_embedding_dimension()
                     final_item["prompt_vector"] = torch.zeros(dim, dtype=torch.float32)
                 except Exception as e2:
-                    logger.error(f"无法获取向量器维度: {e2}. 将 prompt_vector 设置为 None.")
-                    # 最终回退（如果维度都拿不到），但这在 collate_fn 中仍可能失败
-                    final_item["prompt_vector"] = None
-        
-        # (如果 self.vectorizer is None, 则 final_item 中不会有 "prompt_vector" 键)
+                    logger.error(f"无法获取向量器维度: {e2}. 将 prompt_vector 设置为 384 维零向量。")
+                    self.file_logger.error(f"Item {item}: 无法获取向量器维度: {e2}. 回退到 384 维零向量。")
+                    final_item["prompt_vector"] = torch.zeros(384, dtype=torch.float32) # 回退到 common_dim
+        else:
+            # 如果向量化器未初始化，我们也需要一个占位符以避免下游出错
+            self.file_logger.warning(f"Item {item}: Vectorizer 未初始化。创建 384 维零向量作为占位符。")
+            final_item["prompt_vector"] = torch.zeros(384, dtype=torch.float32) # 假设一个维度
 
         messages = self._build_messages(row_dict)
         model_inputs = {}
@@ -348,13 +418,45 @@ class RLHFDataset(Dataset):
         if need_tools_kwargs and not tools_kwargs:
             logger.warning("tools_kwargs is empty for index {}, data source: {}", index, original_row["data_source"])
         
-        # 确保 index 和 tools_kwargs 也被添加
-        final_item["index"] = index
+        # ❗️ [CCAPO/STDB 关键修复 2]：确保 'prompt_index' 存在
+        # STDB 期望 'prompt_index' 作为 key。
+        # 1. 尝试从 parquet 根级别获取 'prompt_index' (这已在上面的 for 循环中完成)
+        if "prompt_index" not in final_item:
+            self.file_logger.debug(f"Item {item}: 'prompt_index' not in root, checking 'index'")
+            # 2. 如果没有，使用 'index' (也可能在 parquet 根级别)
+            if "index" in final_item:
+                final_item["prompt_index"] = final_item["index"]
+                self.file_logger.debug(f"Item {item}: Using root 'index' for prompt_index.")
+            else:
+                # 3. 如果还没有，使用 'extra_info.index'
+                final_item["prompt_index"] = index
+                self.file_logger.debug(f"Item {item}: Using 'extra_info.index' for prompt_index.")
+        else:
+             self.file_logger.debug(f"Item {item}: Found 'prompt_index' in root.")
+
+        # (我们不再需要 final_item["index"] = index，因为它现在被 final_item["prompt_index"] 取代)
         final_item["tools_kwargs"] = tools_kwargs
         
-        # print("final_item keys:", final_item.keys())
-        # print(f"Processed item {item}: index={final_item['index']}, input_ids shape={final_item['input_ids'].shape}")
+        
+        # ======================= ✅ (请求 2) 打印最终数据格式 ✅ =======================
+        self.file_logger.info(f"--- [getitem] (Item {item}) 最终数据格式 (Keys & Types) ---")
+        for key, value in final_item.items():
+            key_type_info = f"  - Key: '{key}', Type: {type(value)}"
+            if isinstance(value, torch.Tensor):
+                key_type_info += f", Shape: {value.shape}, DType: {value.dtype}"
+            elif isinstance(value, np.ndarray):
+                 key_type_info += f", Shape: {value.shape}, DType: {value.dtype}"
+            elif isinstance(value, list):
+                 key_type_info += f", Length: {len(value)}"
+            elif isinstance(value, (str, int, float, bool)):
+                 key_type_info += f", Value: {str(value)[:100]}" # 打印非张量的值（截断）
+            self.file_logger.info(key_type_info)
+        # ========================================================================
+
+        self.file_logger.info(f"--- [getitem] 完成处理 item {item} ---")
+        
         return final_item
+    # ======================= 修复结束 =======================
 
     def __getstate__(self):
         if not self.serialize_dataset:
@@ -367,24 +469,42 @@ class RLHFDataset(Dataset):
             if "vectorizer" in state:
                 del state["vectorizer"]
                 
+            # ❗️ 新增：防止 file_logger 实例被序列化
+            if "file_logger" in state:
+                del state["file_logger"]
+                
             return state
 
         return self.__dict__.copy()
 
-    # ❗️ 新增：__setstate__ 用于在反序列化时重新加载 vectorizer
+    # ❗️ 新增：__setstate__ 用于在反序列化时重新加载 vectorizer 和 logger
     def __setstate__(self, state):
         self.__dict__.update(state)
+        
+        # 重新初始化 logger
+        self.file_logger = dataset_file_logger
+        self.file_logger.info("RLHFDataset 实例已从 state 重新加载。")
+        
         # 重新初始化 vectorizer
         if self.vectorize_prompts:
-            try:
-                from sentence_transformers import SentenceTransformer
-                self.vectorizer = SentenceTransformer(self.vectorizer_model_name)
-                logger.info(f"成功从 state 重新初始化 Prompt 向量化器: {self.vectorizer_model_name}")
-            except ImportError:
-                logger.error(
-                    "未找到 'sentence-transformers' 库。"
-                    "请通过 `pip install sentence-transformers` 安装以启用 prompt 向量化。"
-                )
+            if _SENTENCE_TRANSFORMERS_AVAILABLE:
+                try:
+                    from sentence_transformers import SentenceTransformer
+                    self.vectorizer = SentenceTransformer(self.vectorizer_model_name)
+                    self.file_logger.info(f"成功从 state 重新初始化 Prompt 向量化器: {self.vectorizer_model_name}")
+                except ImportError:
+                    self.file_logger.error(
+                        "未找到 'sentence-transformers' 库。"
+                        "请通过 `pip install sentence-transformers` 安装以启用 prompt 向量化。"
+                    )
+                    self.vectorizer = None
+                    self.vectorize_prompts = False
+                except Exception as e:
+                    self.file_logger.error(f"从 state 加载 SentenceTransformer 模型 '{self.vectorizer_model_name}' 失败: {e}")
+                    self.vectorizer = None
+                    self.vectorize_prompts = False
+            else:
+                self.file_logger.error("从 state 恢复时: 未找到 'sentence-transformers' 库。向量化已禁用。")
                 self.vectorizer = None
                 self.vectorize_prompts = False
         else:

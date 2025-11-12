@@ -752,14 +752,28 @@ class RayPPOTrainer:
             input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
             sample_inputs.extend(input_texts)
 
-            batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
+            # batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
             
-            # --- ✅ 关键修改：在这里添加 'ground_truth_answer' ---
-            # 在 pop 之前，先检查 key 是否存在
+            # # --- ✅ 关键修改：在这里添加 'ground_truth_answer' ---
+            # # 在 pop 之前，先检查 key 是否存在
+            # non_tensor_batch_keys_to_pop = [
+            #     key for key in ["raw_prompt_ids", "data_source", "multi_modal_data", "raw_prompt", "tools_kwargs", "ground_truth_answer"]
+            #     if key in test_batch.non_tensor_batch
+            # ]
+
+            # ======================= ✅ [ STDB 修复 ] =======================
+            batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids", "prompt_vector"]
+            
+            # --- ✅ 关键修改：在这里添加 'ground_truth_answer', 'prompt_index' ---
             non_tensor_batch_keys_to_pop = [
-                key for key in ["raw_prompt_ids", "data_source", "multi_modal_data", "raw_prompt", "tools_kwargs", "ground_truth_answer"]
+                key for key in [
+                    "raw_prompt_ids", "data_source", "multi_modal_data", 
+                    "raw_prompt", "tools_kwargs", "ground_truth_answer",
+                    "prompt_index"
+                    ]
                 if key in test_batch.non_tensor_batch
             ]
+            # ======================= 修复结束 =======================
 
             test_gen_batch = test_batch.pop(
                 batch_keys=batch_keys_to_pop,
@@ -1104,10 +1118,15 @@ class RayPPOTrainer:
                 # --- 结束 Fix ---
 
                 # pop those keys for generation
-                batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
+                # ======================= ✅ [ STDB 最终修复 ] =======================
+                # 确保 STDB 依赖的 'prompt_vector' 和 'prompt_index' 被 pop 到 gen_batch 中
+                batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids", "prompt_vector"]
+                
+                non_tensor_batch_keys_to_pop = ["raw_prompt_ids", "data_source", "prompt_index"]
+                # ======================= 修复结束 =======================
                 
                 # --- ✅ 关键修改：在这里添加 'ground_truth_answer' ---
-                non_tensor_batch_keys_to_pop = ["raw_prompt_ids", "data_source"]
+                # non_tensor_batch_keys_to_pop = ["raw_prompt_ids", "data_source"] # <--- 这是你原来的代码
                 if "multi_modal_data" in batch.non_tensor_batch:
                     non_tensor_batch_keys_to_pop.append("multi_modal_data")
                 if "raw_prompt" in batch.non_tensor_batch:
@@ -1117,9 +1136,6 @@ class RayPPOTrainer:
                 if "ground_truth_answer" in batch.non_tensor_batch:
                     non_tensor_batch_keys_to_pop.append("ground_truth_answer")
                 
-                # --- ✅ [CCAPO] 'prompt_vector' 和 'index' 不能 pop ---
-                # 幸运的是，它们默认不会被 pop
-
                 gen_batch = batch.pop(
                     batch_keys=batch_keys_to_pop,
                     non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
@@ -1288,6 +1304,23 @@ class RayPPOTrainer:
                                 with _timer("update_actor_ccapo", timing_raw):
                                     G_online_batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
                                     
+                                    # ======================= ✅ [ 修复 Bug 3 (AssertionError) ] =======================
+                                    # 装饰器 @dispatch_dp_compute_data_proto 期望所有 DataProto 参数
+                                    # 都能被 world_size (即 GPU 数量) 整除。
+                                    # G_buffer (buffer_batch) 的大小 (如此次的 45) 可能无法被整除 (chunks=2),
+                                    # 导致在 protocol.py 中触发 AssertionError。
+                                    #
+                                    # 我们通过在调用前手动填充两个 DataProto 对象来修复此问题。
+                                    world_size = self.actor_rollout_wg.world_size
+                                    
+                                    G_online_batch, online_pad_size = pad_dataproto_to_divisor(G_online_batch, world_size)
+                                    buffer_batch, buffer_pad_size = pad_dataproto_to_divisor(buffer_batch, world_size)
+
+                                    # 将填充大小存入 meta_info, 以便 worker 知道如何 unpad
+                                    G_online_batch.meta_info["pad_size"] = online_pad_size
+                                    buffer_batch.meta_info["pad_size"] = buffer_pad_size
+                                    # ======================= 修复结束 =======================
+
                                     # Send both batches to the actor worker
                                     actor_output = self.actor_rollout_wg.update_actor_ccapo(G_online_batch, buffer_batch)
                                 

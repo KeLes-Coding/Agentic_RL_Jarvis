@@ -26,6 +26,44 @@ from agent_system.multi_turn_rollout.utils import process_image, to_list_of_dict
 from agent_system.environments import EnvironmentManagerBase
 from typing import List, Dict
 
+# ======================= ✅ 1. 新增：ROLLOUT 专用文件日志器 ✅ =======================
+import os
+import logging
+
+# --- 1. 标准日志器 (用于 STDOUT / 主日志) ---
+logger = logging.getLogger(__name__)
+
+# --- 2. 专用文件日志器 (用于 logger/ROLLOUT/rollout_operations.log) ---
+rollout_file_logger = logging.getLogger("ROLLOUT_FILE")
+rollout_file_logger.setLevel(logging.INFO) # 捕获 INFO 及以上级别
+rollout_file_logger.propagate = False      # 防止重复记录到 root logger
+
+# 仅在日志器没有处理器时才添加，以防止重复
+if not rollout_file_logger.handlers:
+    try:
+        log_dir = "logger/ROLLOUT" # <--- 新的日志目录
+        os.makedirs(log_dir, exist_ok=True)
+        log_file = os.path.join(log_dir, "rollout_operations.log") # <--- 新的日志文件
+        
+        # 创建文件处理器 (追加模式)
+        file_handler = logging.FileHandler(log_file, mode='a', encoding='utf-8')
+        
+        # 创建格式化器
+        formatter = logging.Formatter(
+            '%(asctime)s - [ROLLOUT_FILE] - %(levelname)s - %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S'
+        )
+        file_handler.setFormatter(formatter)
+        
+        # 添加处理器
+        rollout_file_logger.addHandler(file_handler)
+        rollout_file_logger.info("--- ROLLOUT 专用文件日志器已初始化 ---")
+        
+    except Exception as e:
+        logger.error(f"[ROLLOUT] 无法创建专用文件日志器: {e}")
+# ======================= 日志设置结束 =======================
+
+
 class TrajectoryCollector:
     def __init__(self, config, tokenizer: PreTrainedTokenizer, processor=None):
         """
@@ -39,6 +77,11 @@ class TrajectoryCollector:
         self.config = config
         self.tokenizer = tokenizer
         self.processor = processor
+        
+        # ======================= ✅ 2. 分配专用日志器 ✅ =======================
+        self.file_logger = rollout_file_logger
+        self.file_logger.info("--- 初始化 TrajectoryCollector 实例 ---")
+        # =====================================================================
 
     def preprocess_single_sample(
         self,
@@ -239,6 +282,7 @@ class TrajectoryCollector:
 
     def gather_rollout_data(
             self,
+            gen_batch: DataProto, # <--- ✅ 接收 gen_batch
             total_batch_list: List[List[Dict]],
             total_infos: List[List[Dict]], # <--- ✅ [CCAPO] 接收 total_infos
             episode_rewards: np.ndarray,
@@ -250,6 +294,7 @@ class TrajectoryCollector:
         Collect and organize trajectory data, handling batch size adjustments to meet parallel training requirements.
         
         Parameters:
+            gen_batch (DataProto): Batch data containing original prompts <--- ✅
             total_batch_list (List[List[Dict]]): List of trajectory data for each environment
             total_infos (List[List[Dict]]): List of info dicts from env.step()
             episode_rewards (np.ndarray): Total rewards for each environment
@@ -260,6 +305,8 @@ class TrajectoryCollector:
         Returns:
             DataProto: Collected and organized trajectory data
         """
+        self.file_logger.info(f"--- [gather_rollout_data] 开始聚合 {len(total_batch_list)} 条轨迹 ---")
+        
         batch_size = len(total_batch_list)
 
         episode_rewards_mean = np.mean(episode_rewards)
@@ -274,6 +321,26 @@ class TrajectoryCollector:
         for key, value in success.items():
             success_rate[key] = np.mean(value)
         
+        # ======================= ✅ [修复] 从 gen_batch 的正确位置提取 Prompt 级信息 =======================
+        self.file_logger.info(f"[gather_rollout_data] 正在从 gen_batch 中提取 STDB 关键信息...")
+        self.file_logger.info(f"[gather_rollout_data] gen_batch.batch keys: {list(gen_batch.batch.keys())}")
+        self.file_logger.info(f"[gather_rollout_data] gen_batch.non_tensor_batch keys: {list(gen_batch.non_tensor_batch.keys())}")
+        
+        # 1. prompt_index 是非张量, 来自 non_tensor_batch
+        prompt_index_list = gen_batch.non_tensor_batch.get('prompt_index', [None] * batch_size)
+        
+        # 2. prompt_vector 是张量, 来自 batch
+        # ❗️ [修复] 使用 default=None 防止 KeyError 崩溃
+        prompt_vector_tensor = gen_batch.batch.get('prompt_vector', None) 
+        
+        if any(p is None for p in prompt_index_list) or prompt_vector_tensor is None:
+             # ❗️ 这个警告现在是关键：如果它在修复 ray_trainer.py 后仍然出现，说明 pop 列表还是错了
+             print(f"警告: (gather_rollout_data) 未能从 gen_batch 中提取 'prompt_index' 或 'prompt_vector'。STDB 录入可能会失败。")
+             self.file_logger.warning(f"[gather_rollout_data] 未能从 gen_batch 中提取 'prompt_index' (found: {not any(p is None for p in prompt_index_list)}) 或 'prompt_vector' (found: {prompt_vector_tensor is not None})。STDB 将失败。")
+        else:
+             self.file_logger.info(f"[gather_rollout_data] 成功从 gen_batch 中提取了 'prompt_index' 和 'prompt_vector'。")
+        # ======================= 修复结束 =======================
+            
         effective_batch = []
         for bs in range(batch_size):
             
@@ -309,8 +376,25 @@ class TrajectoryCollector:
                 if step_info.get('action_success', False):
                     traj_n_success_steps += 1
             
+            # ======================= ✅ [修复] 获取此轨迹(bs)的 Prompt 级信息 =======================
+            traj_prompt_index = prompt_index_list[bs]
+            # ❗️ [修复] 安全地从张量中索引
+            traj_prompt_vector = prompt_vector_tensor[bs] if prompt_vector_tensor is not None else None
+            # ======================= 修复结束 =======================
+
             # --- ✅ [CCAPO] Phase 2. 步骤级别(Micro)数据聚合 ---
             step_index_in_traj = 0
+            
+            # ======================= ✅ 日志：在聚合前打印第一个步骤的 STDB 关键信息 =======================
+            if bs == 0 and num_active_steps > 0: # 只为第一个轨迹打印
+                self.file_logger.info(f"--- [gather_rollout_data] 轨迹 {bs} (uid={traj_uid[bs]}) 的 STDB 关键信息预览 ---")
+                self.file_logger.info(f"  - traj_prompt_index: {traj_prompt_index} (Type: {type(traj_prompt_index)})")
+                self.file_logger.info(f"  - traj_prompt_vector: {'Tensor' if traj_prompt_vector is not None else 'None'} (Type: {type(traj_prompt_vector)})")
+                first_step_info = total_infos[bs][0] if total_infos[bs] else {}
+                self.file_logger.info(f"  - log_dir_path (from info): {first_step_info.get('log_dir_path', 'N/A')}")
+                self.file_logger.info(f"----------------------------------------------------------")
+            # ===================================================================================
+
             for i, data in enumerate(total_batch_list[bs]): # 这里的 'i' 已经是 0 到 num_active_steps-1
                 assert traj_uid[bs] == data['traj_uid'], "data is not from the same trajectory"
                 if data['active_masks']: # 这个检查其实多余，因为 total_batch_list[bs] 已经只包含 active
@@ -338,7 +422,11 @@ class TrajectoryCollector:
                     # 2.3. 附加原始的 `rollout` 数据 (用于 IS 和 VF)
                     # `data['rollout_log_probs']` 已经由 `to_list_of_dict(batch)` 自动添加
                     # `data['values']` (如果存在) 也已自动添加
-                    # `data['prompt_vector']` 也会被 `to_list_of_dict` 自动添加 (来自 gen_batch)
+                    
+                    # ======================= ✅ [修复] 将 Prompt 级信息附加到每一步 =======================
+                    data['prompt_index'] = traj_prompt_index
+                    data['prompt_vector'] = traj_prompt_vector
+                    # ======================= 修复结束 =======================
                     
                     step_index_in_traj += 1
 
@@ -363,6 +451,7 @@ class TrajectoryCollector:
         gen_batch_output = DataProto.from_single_dict(
             data=collate_fn(effective_batch)
         )
+        self.file_logger.info(f"--- [gather_rollout_data] 聚合完成。总步骤: {len(effective_batch)} ---")
         return gen_batch_output
 
     def vanilla_multi_turn_loop(
@@ -374,6 +463,8 @@ class TrajectoryCollector:
         """
         为物理设备环境优化的轨迹收集循环。
         """
+        self.file_logger.info(f"--- [vanilla_multi_turn_loop] 开始 (Batch size: {len(gen_batch)}) ---")
+        
         # ======================= ✅ 1. 准备并传递任务信息给 reset 方法 ✅ =======================
         tasks_for_this_batch = []
         try:
@@ -390,12 +481,15 @@ class TrajectoryCollector:
                         "ground_truth_answer": ground_truth_answers[i]
                     })
                 print("--- [rollout_loop.py] 已成功准备任务和参考答案用于环境重置。 ---")
+                self.file_logger.info(f"已准备 {len(tasks_for_this_batch)} 个任务用于环境重置。")
             else:
                 print("警告: 在 gen_batch 中未找到 'ground_truth_answer' 或 'raw_prompt'。环境将以无任务信息的方式重置。")
+                self.file_logger.warning("在 gen_batch 中未找到 'ground_truth_answer' 或 'raw_prompt'。")
                 tasks_for_this_batch = [{} for _ in range(len(gen_batch))]
 
         except (KeyError, IndexError, TypeError) as e:
             print(f"严重警告: 准备任务信息时出错: {e}")
+            self.file_logger.error(f"准备任务信息时出错: {e}")
             # 如果出错，创建一个空列表以避免崩溃
             tasks_for_this_batch = [{} for _ in range(len(gen_batch))]
         
@@ -471,6 +565,13 @@ class TrajectoryCollector:
                 non_tensor_batch_keys_to_pop.append("raw_prompt")
             if "tools_kwargs" in batch.non_tensor_batch:
                 non_tensor_batch_keys_to_pop.append("tools_kwargs")
+            
+            # ======================= ✅ 日志：检查 pop 前的 gen_batch 键 =======================
+            self.file_logger.info(f"[vanilla_multi_turn_loop] Step {_step+1}: 准备 pop batch。")
+            self.file_logger.info(f"  - batch.batch keys (pop 前): {list(batch.batch.keys())}")
+            self.file_logger.info(f"  - batch.non_tensor_batch keys (pop 前): {list(batch.non_tensor_batch.keys())}")
+            # =========================================================================
+
             batch_input = batch.pop(
                 batch_keys=batch_keys_to_pop,
                 non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
@@ -519,6 +620,12 @@ class TrajectoryCollector:
                 token_usage_list = []
                 confidence_metrics_list = []
                 log_probs_list = [] # <--- ✅ [CCAPO] 新增
+                
+                # ======================= ✅ [ 修复 G_Buffer Bug ] =======================
+                # 我们需要传递 PPO 更新所需的所有张量
+                tensors_for_env_list = []
+                # =====================================================================
+                
                 for i in range(batch_size):
                     token_usage_list.append({
                         "prompt_tokens": input_token_counts[i].item(),
@@ -531,6 +638,18 @@ class TrajectoryCollector:
                     })
                     # <--- ✅ [CCAPO] 收集每个样本的 log_probs 张量 (Sec 6.1)
                     log_probs_list.append(log_probs[i])
+                    
+                    # ======================= ✅ [ 修复 G_Buffer Bug ] =======================
+                    # 收集 PPO 更新所需的核心张量
+                    # batch_input 包含 input_ids, attention_mask, position_ids
+                    # batch 包含 responses (因为它是 batch_input.union(batch_output))
+                    tensors_for_env_list.append({
+                        "input_ids": batch.batch["input_ids"][i],
+                        "attention_mask": batch.batch["attention_mask"][i],
+                        "position_ids": batch.batch["position_ids"][i],
+                        "responses": batch.batch["responses"][i],
+                    })
+                    # =====================================================================
                 
                 # 4. 暂存数据
                 if hasattr(envs, "set_last_step_token_usage"):
@@ -540,10 +659,17 @@ class TrajectoryCollector:
                 # <--- ✅ [CCAPO] 暂存 log_probs
                 if hasattr(envs, "set_last_step_log_probs"):
                     envs.set_last_step_log_probs(log_probs_list)
+                
+                # ======================= ✅ [ 修复 G_Buffer Bug ] =======================
+                # 暂存 PPO 核心张量
+                if hasattr(envs, "set_last_step_tensors"):
+                    envs.set_last_step_tensors(tensors_for_env_list)
+                # =====================================================================
 
             except Exception as e:
                 import traceback
                 print(f"!!!!!! [Rollout Step: {_step+1}] 计算 Token 和置信度时出错: {e} !!!!!!")
+                self.file_logger.error(f"[vanilla_multi_turn_loop] Step {_step+1}: 计算 Token 和置信度时出错: {e}\n{traceback.format_exc()}")
                 print(traceback.format_exc())
             # ==============================================================================
 
@@ -582,6 +708,7 @@ class TrajectoryCollector:
                         summary_text = "Task finished by agent." if task_completed else "Task failed during execution."
                         
                         print(f"--- [rollout_loop.py] 正在为自然终结的环境 {i} (Status: {status}) 终结日志 ---")
+                        self.file_logger.info(f"[vanilla_multi_turn_loop] Step {_step+1}: 环境 {i} (uid={traj_uid[i]}) 自然终结 (Status: {status})。")
                         
                         final_summary = envs.info_pool_managers[i].finalize_run(
                             status=status,
@@ -601,7 +728,11 @@ class TrajectoryCollector:
             is_done = np.logical_or(is_done, dones)
             obs = next_obs
             if is_done.all():
+                self.file_logger.info(f"[vanilla_multi_turn_loop] Step {_step+1}: 所有环境完成。")
                 break
+        
+        if not is_done.all():
+            self.file_logger.info(f"[vanilla_multi_turn_loop] 达到 Max Steps ({self.config.env.max_steps})。")
 
         # ======================= ✅ 2. 修复超时的终结逻辑 ✅ =======================
         # 确保因超时而结束的轨迹也被正确终结
@@ -610,6 +741,7 @@ class TrajectoryCollector:
             # 同时检查 info_pool_managers 是否存在且包含该环境的 manager
             if not is_done[i] and hasattr(envs, 'info_pool_managers') and i in envs.info_pool_managers:
                 print(f"--- [rollout_loop.py] 正在为超时的环境 {i} 强制终结日志 ---")
+                self.file_logger.warning(f"[vanilla_multi_turn_loop] 环境 {i} (uid={traj_uid[i]}) 超时。强制终结。")
                 final_status = "TIMEOUT"
                 summary_text = f"Task stopped due to reaching max steps ({self.config.env.max_steps})."
 
@@ -638,6 +770,7 @@ class TrajectoryCollector:
             episode_rewards=episode_rewards,
             episode_lengths=episode_lengths,
         )
+        self.file_logger.info(f"--- [vanilla_multi_turn_loop] 结束 ---")
         return total_batch_list, total_infos, episode_rewards, episode_lengths, success, traj_uid # <--- ✅ [CCAPO] 返回 total_infos
     
     def dynamic_multi_turn_loop(
@@ -672,12 +805,16 @@ class TrajectoryCollector:
         total_traj_uid = []
         try_count: int = 0
         max_try_count = self.config.algorithm.filter_groups.max_num_gen_batches
+        
+        self.file_logger.info(f"--- [dynamic_multi_turn_loop] 开始 (Target size: {self.config.data.train_batch_size * self.config.env.rollout.n}) ---")
 
         while len(total_batch_list) < self.config.data.train_batch_size * self.config.env.rollout.n and try_count < max_try_count:
 
             if len(total_batch_list) > 0:
                 print(f"valid num={len(total_batch_list)} < target num={self.config.data.train_batch_size * self.config.env.rollout.n}. Keep generating... ({try_count}/{max_try_count})")
             try_count += 1
+            
+            self.file_logger.info(f"[dynamic_multi_turn_loop] 动态采样循环 第 {try_count}/{max_try_count} 次")
 
             batch_list, infos, episode_rewards, episode_lengths, success, traj_uid = self.vanilla_multi_turn_loop( # <--- ✅ [CCAPO] 接收 infos
                 gen_batch=gen_batch,
@@ -704,6 +841,8 @@ class TrajectoryCollector:
         total_episode_lengths = np.concatenate(total_episode_lengths, axis=0)
         total_success = {key: np.concatenate([success[key] for success in total_success], axis=0) for key in total_success[0].keys()}
         total_traj_uid = np.concatenate(total_traj_uid, axis=0)
+        
+        self.file_logger.info(f"--- [dynamic_multi_turn_loop] 结束 (收集到 {len(total_batch_list)} 条轨迹) ---")
 
         return total_batch_list, total_infos, total_episode_rewards, total_episode_lengths, total_success, total_traj_uid # <--- ✅ [CCAPO] 返回 total_infos
 
@@ -726,6 +865,16 @@ class TrajectoryCollector:
         Returns:
             DataProto: Final collected trajectory data with metadata.
         """
+        # ======================= ✅ 日志：在 multi_turn_loop 记录 gen_batch 内容 =======================
+        self.file_logger.info(f"--- [multi_turn_loop] 开始 (is_train: {is_train}) ---")
+        self.file_logger.info(f"[multi_turn_loop] 传入的 gen_batch.batch keys: {list(gen_batch.batch.keys())}")
+        self.file_logger.info(f"[multi_turn_loop] 传入的 gen_batch.non_tensor_batch keys: {list(gen_batch.non_tensor_batch.keys())}")
+        if 'prompt_index' not in gen_batch.non_tensor_batch:
+             self.file_logger.error("[multi_turn_loop] 关键错误：'prompt_index' 不在传入的 gen_batch.non_tensor_batch 中！")
+        if 'prompt_vector' not in gen_batch.batch:
+             self.file_logger.error("[multi_turn_loop] 关键错误：'prompt_vector' 不在传入的 gen_batch.batch 中！")
+        # ===================================================================================
+
         # Initial observations from the environment
         if self.config.algorithm.filter_groups.enable and is_train:
             # Dynamic Sampling (for DAPO and Dynamic GiGPO)
@@ -750,6 +899,7 @@ class TrajectoryCollector:
 
         # Create trajectory data
         gen_batch_output: DataProto = self.gather_rollout_data(
+            gen_batch=gen_batch, # <--- ✅ [修复] 确保 gen_batch 被传递
             total_batch_list=total_batch_list,
             total_infos=total_infos, # <--- ✅ [CCAPO] 传递 total_infos
             episode_rewards=total_episode_rewards,
@@ -758,4 +908,5 @@ class TrajectoryCollector:
             traj_uid=total_traj_uid,
         )
         
+        self.file_logger.info(f"--- [multi_turn_loop] 结束 ---")
         return gen_batch_output
