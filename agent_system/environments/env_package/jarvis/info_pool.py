@@ -106,6 +106,9 @@ class InfoPoolManager:
                 "task": step_data["task"],
                 "thought": step_data["thought"],
                 "parsed_action": step_data["parsed_action"],
+                # ======================= ✅ 升级：保存原始 LLM 响应 ✅ =======================
+                "raw_llm_response": step_data.get("raw_llm_response", "N/A"),
+                # ===========================================================================
                 "action_type": step_data.get("action_type", "unknown"), # <--- ✅ [CCAPO] 新增
                 "action_success": step_data["action_success"],
                 # --- ✅ [CCAPO V3] 关键修正：保存 action_status ---
@@ -136,6 +139,16 @@ class InfoPoolManager:
                     except Exception as e:
                         print(f"Warning: could not serialize {key}. {e}")
                         details[key] = "Error: Not serializable"
+            
+            # --- ✅ [ 修复 G_Buffer VLM Bug ] ---
+            # 保存 VLM inputs (假设它们是 JSON 兼容的, e.g., dict of paths)
+            # 假设 step_data['multi_modal_inputs'] 是单个步骤的 dict, e.g., {'image': 'path/to/img.jpg'}
+            if "multi_modal_inputs" in step_data:
+                try:
+                    details["multi_modal_inputs"] = step_data["multi_modal_inputs"]
+                except Exception as e:
+                    print(f"Warning: could not serialize multi_modal_inputs. {e}")
+                    details["multi_modal_inputs"] = "Error: Not serializable"
             # =====================================================================
             
             with open(os.path.join(step_dir, "step_details.json"), "w", encoding="utf-8") as f:

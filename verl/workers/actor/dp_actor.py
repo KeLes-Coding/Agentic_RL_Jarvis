@@ -71,9 +71,31 @@ class DataParallelPPOActor(BasePPOActor):
         """
         response_length = micro_batch["responses"].size(-1)
         multi_modal_inputs = {}
-        if "multi_modal_inputs" in micro_batch:
-            for key in micro_batch["multi_modal_inputs"][0].keys():
-                multi_modal_inputs[key] = torch.cat([inputs[key] for inputs in micro_batch["multi_modal_inputs"]], dim=0)
+        if "multi_modal_inputs" in micro_batch and micro_batch["multi_modal_inputs"]:
+            # micro_batch["multi_modal_inputs"] is a list of dicts, e.g., [ {'image': 'path1'}, {'image': 'path2'} ]
+            # or [ {'image': tensor1}, {'image': tensor2} ]
+            
+            # --- ✅ [VLM Buffer 修复] ---
+            # 检查第一个元素的第一个键的值，以确定是张量还是字符串
+            first_input = micro_batch["multi_modal_inputs"][0]
+            if first_input:
+                # 确保 first_input 是字典
+                first_input_keys = getattr(first_input, 'keys', lambda: [])()
+                if not first_input_keys:
+                    logger.warning(f"VLM _forward_micro_batch: multi_modal_inputs[0] ' {first_input} ' 没有 .keys()。跳过 VLM 输入。")
+                else:
+                    first_key = list(first_input_keys)[0]
+                    first_val = first_input[first_key]
+                    
+                    if isinstance(first_val, torch.Tensor):
+                        # 原始逻辑：G_online，批处理张量
+                        for key in first_input_keys:
+                            multi_modal_inputs[key] = torch.cat([inputs[key] for inputs in micro_batch["multi_modal_inputs"]], dim=0)
+                    else:
+                        # G_buffer 逻辑：批处理路径 (或其他非张量)
+                        for key in first_input_keys:
+                            multi_modal_inputs[key] = [inputs[key] for inputs in micro_batch["multi_modal_inputs"]]
+            # --- 修复结束 ---
 
         with torch.autocast(device_type=self.device_name, dtype=torch.bfloat16):
             input_ids = micro_batch["input_ids"]
@@ -99,7 +121,10 @@ class DataParallelPPOActor(BasePPOActor):
 
                 # pad and slice the inputs if sp > 1
                 if self.use_ulysses_sp:
-                    is_vlm_model = "multi_modal_inputs" in micro_batch
+                    # --- ✅ [VLM Buffer 修复] 检查 multi_modal_inputs 是否真的被填充了 ---
+                    is_vlm_model = bool(multi_modal_inputs)
+                    # --- 修复结束 ---
+                    
                     if is_vlm_model:
                         # vlm model's inputs will be sliced after embedding
                         input_ids_rmpad, position_ids_rmpad, pad_size = ulysses_pad(
@@ -428,7 +453,6 @@ class DataParallelPPOActor(BasePPOActor):
         self.actor_optimizer.zero_grad()
         return metrics
     
-    # --- ✅ [CCAPO] 新增：CCAPO 策略更新方法 ---
     @GPUMemoryLogger(role="dp actor (CCAPO)", logger=logger)
     def update_policy_ccapo(self, G_online_batch: DataProto, G_buffer_batch: DataProto, embedding_model, ccapo_config: DictConfig):
         """
@@ -631,7 +655,7 @@ class DataParallelPPOActor(BasePPOActor):
                     buffer_metrics_to_log['R_format_penalty'].append(step.get('R_format_penalty', 0.0))
                     
                     if 'R_core_raw' in step:
-                         buffer_raw_core_values.append(step.get('R_core_raw', 0.0))
+                            buffer_raw_core_values.append(step.get('R_core_raw', 0.0))
                 
                 for key, values in buffer_metrics_to_log.items():
                     if values:
@@ -668,12 +692,12 @@ class DataParallelPPOActor(BasePPOActor):
             batches_to_process = []
             if G_online_batch_final and G_online_batch_final.batch.batch_size[0] > 0:
                 batches_to_process.append(
-                    (G_online_batch_final.batch, (1.0 - lambda_sr), "online")
+                    (G_online_batch_final, (1.0 - lambda_sr), "online") # <-- 修正: 传递 DataProto
                 )
             
             if G_buffer_batch_final and G_buffer_batch_final.batch.batch_size[0] > 0:
                  batches_to_process.append(
-                    (G_buffer_batch_final.batch, lambda_sr, "buffer")
+                    (G_buffer_batch_final, lambda_sr, "buffer") # <-- 修正: 传递 DataProto
                 )
 
             if not batches_to_process:
@@ -682,8 +706,8 @@ class DataParallelPPOActor(BasePPOActor):
 
             # 3. 计算总的梯度累积步数
             total_micro_batches = sum(
-                (batch_data.batch_size[0] + ppo_micro_batch_size_per_gpu - 1) // ppo_micro_batch_size_per_gpu
-                for batch_data, _, _ in batches_to_process
+                (data_proto.batch.batch_size[0] + ppo_micro_batch_size_per_gpu - 1) // ppo_micro_batch_size_per_gpu # <-- 修正
+                for data_proto, _, _ in batches_to_process # <-- 修正
             )
 
             if total_micro_batches == 0:
@@ -692,34 +716,48 @@ class DataParallelPPOActor(BasePPOActor):
             total_loss_accumulator = 0.0 # 用于日志记录
 
             # 4. 循环处理 G_online 和 G_buffer
-            for batch_data, loss_weight, name in batches_to_process:
+            for data_proto, loss_weight, name in batches_to_process: # <-- 修正
                 
                 # 5. 将每个批次分割成微批次
-                micro_batches = batch_data.split(ppo_micro_batch_size_per_gpu)
+                
+                # --- 修正: 像 update_policy() 一样分块 DataProto ---
+                num_micro_batches_for_this_batch = (data_proto.batch.batch_size[0] + ppo_micro_batch_size_per_gpu - 1) // ppo_micro_batch_size_per_gpu
+                if num_micro_batches_for_this_batch == 0:
+                    continue
+                    
+                all_tensor_keys = list(data_proto.batch.keys())
+                all_non_tensor_keys = list(data_proto.non_tensor_batch.keys())
+                
+                micro_batches = data_proto.select(all_tensor_keys, all_non_tensor_keys).chunk(num_micro_batches_for_this_batch)
+                # --- 修正结束 ---
 
-                for micro_batch in micro_batches:
-                    # micro_batch 现在是一个 TensorDict
-
-                    # 将当前微批次中的所有张量移动到 GPU
-                    micro_batch = micro_batch.to(get_torch_device().current_device())
+                for micro_batch_proto in micro_batches: # <-- 修正: micro_batch_proto is a DataProto
+                    
+                    # --- 修正: 转换为 dict 以支持 VLM ---
+                    micro_batch_dict = {
+                        **micro_batch_proto.batch.to(get_torch_device().current_device()),
+                        **micro_batch_proto.non_tensor_batch
+                    }
+                    # --- 修正结束 ---
 
                     entropy, log_prob = self._forward_micro_batch(
-                        micro_batch=micro_batch,
+                        micro_batch=micro_batch_dict, # <-- 修正
                         temperature=temperature,
                         calculate_entropy=(entropy_coeff != 0.0)
                     )
                     
-                    response_length = micro_batch["responses"].size(1)
-                    if multi_turn and "loss_mask" in micro_batch:
-                        response_mask = micro_batch["loss_mask"][:, -response_length:]
+                    response_length = micro_batch_dict["responses"].size(1) # <-- 修正
+                    
+                    if multi_turn and "loss_mask" in micro_batch_dict: # <-- 修正
+                        response_mask = micro_batch_dict["loss_mask"][:, -response_length:] # <-- 修正
                     else:
-                        response_mask = micro_batch["attention_mask"][:, -response_length:]
+                        response_mask = micro_batch_dict["attention_mask"][:, -response_length:] # <-- 修正
 
                     pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = compute_policy_loss(
                         # --- ✅ [CCAPO V2] 修正：使用 'rollout_log_probs' (来自 STDB/Online) ---
-                        old_log_prob=micro_batch["rollout_log_probs"],
+                        old_log_prob=micro_batch_dict["rollout_log_probs"], # <-- 修正
                         log_prob=log_prob,
-                        advantages=micro_batch["advantages"],
+                        advantages=micro_batch_dict["advantages"], # <-- 修正
                         response_mask=response_mask,
                         cliprange=clip_ratio,
                         cliprange_low=clip_ratio_low,

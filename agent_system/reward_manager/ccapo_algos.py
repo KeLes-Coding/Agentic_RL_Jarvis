@@ -6,8 +6,41 @@ import collections
 from typing import List, Dict, Any
 from sentence_transformers import util
 import logging
+import os # <-- ✅ [日志] 新增
 
+# --- 1. 标准日志器 (用于 STDOUT / 主日志) ---
 logger = logging.getLogger(__name__)
+
+# --- 2. ✅ [日志] 专用文件日志器 (用于 logger/CCAPO/ccapo_operations.log) ---
+ccapo_file_logger = logging.getLogger("CCAPO_FILE")
+ccapo_file_logger.setLevel(logging.INFO) # 捕获 INFO 及以上级别
+ccapo_file_logger.propagate = False      # 防止重复记录到 root logger
+
+# 仅在日志器没有处理器时才添加，以防止重复
+if not ccapo_file_logger.handlers:
+    try:
+        log_dir = "logger/CCAPO"
+        os.makedirs(log_dir, exist_ok=True)
+        log_file = os.path.join(log_dir, "ccapo_operations.log")
+        
+        # 创建文件处理器 (追加模式)
+        file_handler = logging.FileHandler(log_file, mode='a', encoding='utf-8')
+        
+        # 创建格式化器
+        formatter = logging.Formatter(
+            '%(asctime)s - [CCAPO_FILE] - %(levelname)s - %(message)s',
+            datefmt='%Y-%m-%d %H:%M:%S'
+        )
+        file_handler.setFormatter(formatter)
+        
+        # 添加处理器
+        ccapo_file_logger.addHandler(file_handler)
+        ccapo_file_logger.info("--- CCAPO 专用文件日志器已初始化 ---")
+        
+    except Exception as e:
+        logger.error(f"[CCAPO] 无法创建专用文件日志器: {e}")
+# --- 日志设置结束 ---
+
 
 # --- 辅助函数：分组 ---
 def _group_steps_by_traj(steps_list: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
@@ -69,22 +102,22 @@ def _calculate_R_tau(g_calc_trajs: Dict[str, List[Dict[str, Any]]], config):
         if R_core == 1.0:
             # 只有有效成功才考虑效率
             # M_steps = (1.0 - total_steps / config.max_steps)
-            # print(f"Traj {traj_uid}: total_steps={total_steps}, M_steps={M_steps}")
+            # print(f"Traj {traj_uid}: total_steps={total_steps}, M_steps={M_steps}") # <-- ✅ [日志] 替换
             # M_token = (1.0 - total_tokens / config.max_tokens)
-            # print(f"Traj {traj_uid}: total_tokens={total_tokens}, M_token={M_token}")
+            # print(f"Traj {traj_uid}: total_tokens={total_tokens}, M_token={M_token}") # <-- ✅ [日志] 替换
             # # 确保效率乘数不为负
             # M_steps = max(0.0, M_steps)
-            # print(f"Traj {traj_uid}: Clipped M_steps={M_steps}")
+            # print(f"Traj {traj_uid}: Clipped M_steps={M_steps}") # <-- ✅ [日志] 替换
             # M_token = max(0.0, M_token)
-            # print(f"Traj {traj_uid}: Clipped M_token={M_token}")
+            # print(f"Traj {traj_uid}: Clipped M_token={M_token}") # <-- ✅ [日志] 替换
 
             m_steps_ratio = total_steps / config.max_steps
             m_token_ratio = total_tokens / config.max_tokens
 
             M_steps = (max(0.0, 1.0 - m_steps_ratio))**0.5
-            print(f"Traj {traj_uid}: total_steps={total_steps}, m_steps_ratio={m_steps_ratio:.2f}, M_steps={M_steps:.4f} (sqrt scaled)")
+            ccapo_file_logger.info(f"[R_tau] Traj {traj_uid}: total_steps={total_steps}, m_steps_ratio={m_steps_ratio:.2f}, M_steps={M_steps:.4f} (sqrt scaled)") # <-- ✅ [日志] 替换
             M_token = (max(0.0, 1.0 - m_token_ratio))**0.5
-            print(f"Traj {traj_uid}: total_tokens={total_tokens}, m_token_ratio={m_token_ratio:.2f}, M_token={M_token:.4f} (sqrt scaled)")
+            ccapo_file_logger.info(f"[R_tau] Traj {traj_uid}: total_tokens={total_tokens}, m_token_ratio={m_token_ratio:.2f}, M_token={M_token:.4f} (sqrt scaled)") # <-- ✅ [日志] 替换
         
             R_tau = R_core * M_steps * M_token
         # --- 新版 CCAPO 逻辑结束 ---
@@ -92,7 +125,7 @@ def _calculate_R_tau(g_calc_trajs: Dict[str, List[Dict[str, Any]]], config):
         for step in steps:
             step['R_tau'] = R_tau
             step['R_core'] = R_core # 存储 R_core 供 R_step 使用
-            print(f"Traj {traj_uid} Step {step.get('step_index', 0)}: R_tau={R_tau}, R_core={R_core}")
+            ccapo_file_logger.info(f"[R_tau] Traj {traj_uid} Step {step.get('step_index', 0)}: R_tau={R_tau}, R_core={R_core}") # <-- ✅ [日志] 替换
 
 # --- Sec 4: 宏观轨迹优势 A_traj ---
 def _calculate_A_traj(g_calc_steps: List[Dict[str, Any]]):
@@ -124,10 +157,10 @@ def _calculate_R_format_penalty(g_calc_steps: List[Dict[str, Any]], config):
         
         if action_status.startswith('FORMAT_ERROR'):
             R_format_penalty = config.penalty_format_error
-            print(f"Step {step.get('step_index', 0)}: FORMAT_ERROR detected, applying penalty {R_format_penalty}")
+            ccapo_file_logger.info(f"[R_format] Step {step.get('step_index', 0)}: FORMAT_ERROR detected, applying penalty {R_format_penalty}") # <-- ✅ [日志] 替换
         elif action_status.startswith('FAILURE'):
             R_format_penalty = config.penalty_failure
-            print(f"Step {step.get('step_index', 0)}: FAILURE detected, applying penalty {R_format_penalty}")
+            ccapo_file_logger.info(f"[R_format] Step {step.get('step_index', 0)}: FAILURE detected, applying penalty {R_format_penalty}") # <-- ✅ [日志] 替换
             
         step['R_format_penalty'] = R_format_penalty
 
@@ -145,7 +178,7 @@ def _calculate_R_novelty_bonus(g_calc_steps: List[Dict[str, Any]], config):
             action_type = step.get('action_type')
             if action_type:
                 ActionSuccessCount[action_type] += 1
-                print(f"Counting success for action '{action_type}': total now {ActionSuccessCount[action_type]}")
+                ccapo_file_logger.info(f"[R_novelty] Counting success for action '{action_type}': total now {ActionSuccessCount[action_type]}") # <-- ✅ [日志] 替换
     
     # 2. 遍历所有步骤，计算 R_novelty_bonus
     for step in g_calc_steps:
@@ -156,7 +189,7 @@ def _calculate_R_novelty_bonus(g_calc_steps: List[Dict[str, Any]], config):
             if action_type:
                 count = ActionSuccessCount[action_type]
                 R_novelty = config.base_bonus / (count**0.5 + 1e-6)
-                print(f"Calculating R_novelty_bonus for action '{action_type}' with count {count}: {R_novelty}")
+                ccapo_file_logger.info(f"[R_novelty] Calculating R_novelty_bonus for action '{action_type}' with count {count}: {R_novelty}") # <-- ✅ [日志] 替换
         
         step['R_novelty_bonus'] = R_novelty
 
@@ -194,7 +227,7 @@ def _calculate_R_step_success(g_calc_steps: List[Dict[str, Any]], g_calc_trajs: 
             if step.get('action_success', False):
                 current_successful_step_t += 1
                 k_norm = current_successful_step_t / n_success if n_success > 0 else 0
-                print(f"Traj {traj_uid} Step {step.get('step_index', 0)}: k_norm={k_norm}, n_success={n_success}, current_successful_step_t={current_successful_step_t}")
+                ccapo_file_logger.info(f"[R_success] Traj {traj_uid} Step {step.get('step_index', 0)}: k_norm={k_norm}, n_success={n_success}, current_successful_step_t={current_successful_step_t}") # <-- ✅ [日志] 替换
                 
                 stage = 'Late'
                 if k_norm <= 0.33: stage = 'Early'
@@ -225,7 +258,7 @@ def _calculate_R_step_success(g_calc_steps: List[Dict[str, Any]], g_calc_trajs: 
         S_utility = P_success_given_action / (P_success_global + 1e-6)
         
         I_action_cache[key] = S_necessity * S_utility
-        print(f"Action '{key[0]}' Stage '{key[1]}': S_necessity={S_necessity}, S_utility={S_utility}, I_action={I_action_cache[key]}")
+        ccapo_file_logger.info(f"[R_success] Action '{key[0]}' Stage '{key[1]}': S_necessity={S_necessity}, S_utility={S_utility}, I_action={I_action_cache[key]}") # <-- ✅ [日志] 替换
 
     # --- Sec 5.1.3 & 5.1: 仅计算 R_core_raw ---
     for step in g_calc_steps:
@@ -248,7 +281,7 @@ def _calculate_R_step_success(g_calc_steps: List[Dict[str, Any]], g_calc_trajs: 
         
         # --- ✅ [CCAPO V2] 修改: 只存储 R_core_raw ---
         step['R_core_raw'] = i_action * q_efficiency
-        print(f"Step {step.get('step_index', 0)}: Q_step={q_step}, Q_economy={step['Q_economy']}, I_action={i_action}, R_core_raw={step['R_core_raw']}")
+        ccapo_file_logger.info(f"[R_success] Step {step.get('step_index', 0)}: Q_step={q_step}, Q_economy={step['Q_economy']}, I_action={i_action}, R_core_raw={step['R_core_raw']}") # <-- ✅ [日志] 替换
         # (移除 R_step 的计算)
 
 # --- Sec 5.2: 微观步骤奖励 (失败轨迹) ---
@@ -283,7 +316,7 @@ def _calculate_R_step_fail(g_calc_steps: List[Dict[str, Any]], g_buffer_steps: L
         idx_counter += 1
 
     if not stdb_thoughts_to_embed:
-        logger.warning("[CCAPO V2] STDB (G_buffer) 为空或无有效 (thought, action) 对。跳过 R_match_raw 计算。")
+        ccapo_file_logger.warning("[R_fail] STDB (G_buffer) 为空或无有效 (thought, action) 对。跳过 R_match_raw 计算。") # <-- ✅ [日志] 替换
         return
         
     stdb_embeddings = embedding_model.encode(stdb_thoughts_to_embed, convert_to_tensor=True)
@@ -314,7 +347,7 @@ def _calculate_R_step_fail(g_calc_steps: List[Dict[str, Any]], g_buffer_steps: L
         idx_counter += 1
         
     if not fail_steps_to_embed:
-        logger.debug("[CCAPO V2] 没有需要匹配的失败步骤。")
+        ccapo_file_logger.info("[R_fail] 没有需要匹配的失败步骤。") # <-- ✅ [日志] 替换
         return
         
     fail_embeddings = embedding_model.encode(fail_steps_to_embed, convert_to_tensor=True)
@@ -363,7 +396,8 @@ def compute_ccapo_advantages(g_calc_steps: List[Dict[str, Any]], g_online_steps:
     计算 CCAPO 奖励和优势的主函数。 (✅ [CCAPO V3] 修改: 解耦格式惩罚)
     修改 g_calc_steps 列表，为其添加 'R_tau', 'A_traj', 'R_step', 'A_step', 'advantages'。
     """
-    logger.info(f"[CCAPO V3] 开始计算优势。G_calc 步骤数: {len(g_calc_steps)}, G_online 步骤数: {len(g_online_steps)}")
+    ccapo_file_logger.info(f"--- [CCAPO V3] 开始计算优势 ---") # <-- ✅ [日志] 替换
+    ccapo_file_logger.info(f"G_calc 步骤数: {len(g_calc_steps)}, G_online 步骤数: {len(g_online_steps)}")
     
     g_calc_trajs = _group_steps_by_traj(g_calc_steps)
     g_buffer_steps = [s for s in g_calc_steps if s.get('is_buffer_data', False)]
@@ -384,7 +418,7 @@ def compute_ccapo_advantages(g_calc_steps: List[Dict[str, Any]], g_online_steps:
     success_rate = online_success_count / (online_trajs_count + 1e-6)
     w_N = 1.0 - success_rate # 动态 w_N
     
-    logger.info(f"[CCAPO V3] lambda_SR (有效成功率): {success_rate:.4f}, w_N: {w_N:.4f}")
+    ccapo_file_logger.info(f"[CCAPO V3] lambda_SR (有效成功率): {success_rate:.4f}, w_N: {w_N:.4f}") # <-- ✅ [日志] 替换
 
     # --- ✅ [CCAPO V3] 关键修正：初始化原始分量键 ---
     # 确保 R_core_raw 和 R_match_raw 在 *所有* 步骤中都存在，以防止 collate_fn 错误
@@ -463,6 +497,6 @@ def compute_ccapo_advantages(g_calc_steps: List[Dict[str, Any]], g_online_steps:
         step['advantages'] = step.get('A_traj', 0.0) + config.omega * step.get('A_step', 0.0)
         # 移除了调试 print 语句
     
-    logger.info(f"[CCAPO V3] 优势计算完成 (已解耦格式惩罚)。")
+    ccapo_file_logger.info(f"[CCAPO V3] 优势计算完成 (已解耦格式惩罚)。") # <-- ✅ [日志] 替换
     
     return g_calc_steps, success_rate

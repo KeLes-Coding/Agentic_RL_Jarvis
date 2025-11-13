@@ -310,6 +310,22 @@ class SuccessTrajectoryDatabase:
         这会从 summary.json 和 /step_N/step_details.json 中重新组合轨迹。
         """
         
+        # ======================= ✅ 日志升级：内部辅助函数 ✅ =======================
+        def _log_data_presence(key: str, data: Any, context: str):
+            """检查数据是否存在并记录到 STDB 文件日志。"""
+            if data is None:
+                self.file_logger.warning(f"[{context}] 缺失数据: '{key}' 未在 step_details.json 中找到。")
+                return []
+            elif isinstance(data, list) and not data:
+                # 允许空列表，但发出警告
+                self.file_logger.warning(f"[{context}] 数据为空: '{key}' 是一个空列表[]。")
+                return []
+            else:
+                # 使用 DEBUG 级别来避免日志刷屏
+                self.file_logger.debug(f"[{context}] 成功加载数据: '{key}'")
+                return data
+        # =========================================================================
+
         # --- 1. 加载轨迹级(Macro)数据 ---
         summary_path = os.path.join(log_dir_path, "summary.json")
         if not os.path.exists(summary_path):
@@ -352,26 +368,38 @@ class SuccessTrajectoryDatabase:
                 
             with open(step_detail_path, 'r', encoding='utf-8') as f:
                 step_data = json.load(f)
+            
+            # ======================= ✅ 日志升级：定义日志上下文 ✅ =======================
+            log_ctx = f"STDB._load(traj_uid={traj_uid}, step_{i})"
+            # =========================================================================
 
             # R_step, A_step, R_tau, A_tau 等将在 Phase 3 计算
             # 我们只加载计算它们所需的原始数据
             
             # 将 log_probs 从 list 转回 tensor
-            log_probs_list = step_data.get('rollout_log_probs')
+            log_probs_list = _log_data_presence('rollout_log_probs', step_data.get('rollout_log_probs'), log_ctx)
             if isinstance(log_probs_list, list):
                 rollout_log_probs = torch.tensor(log_probs_list)
             else:
                 rollout_log_probs = torch.tensor([]) # 占位
             
-            # ======================= ✅ [ 修复 G_Buffer Bug ] =======================
+            # ======================= ✅ [ 修复 G_Buffer Bug ] + ✅ 日志升级 =======================
             # 重新水合 PPO 更新所需的张量
-            # (我们假设它们是长整型，因为它们是 token IDs)
-            input_ids = torch.tensor(step_data.get('input_ids', []), dtype=torch.long)
-            attention_mask = torch.tensor(step_data.get('attention_mask', []), dtype=torch.long)
-            position_ids = torch.tensor(step_data.get('position_ids', []), dtype=torch.long)
-            responses = torch.tensor(step_data.get('responses', []), dtype=torch.long)
-            # =====================================================================
+            self.file_logger.debug(f"[{log_ctx}] 正在重新水合 G_Buffer Tensors...")
             
+            input_ids_data = _log_data_presence('input_ids', step_data.get('input_ids'), log_ctx)
+            input_ids = torch.tensor(input_ids_data, dtype=torch.long)
+            
+            attention_mask_data = _log_data_presence('attention_mask', step_data.get('attention_mask'), log_ctx)
+            attention_mask = torch.tensor(attention_mask_data, dtype=torch.long)
+            
+            position_ids_data = _log_data_presence('position_ids', step_data.get('position_ids'), log_ctx)
+            position_ids = torch.tensor(position_ids_data, dtype=torch.long)
+            
+            responses_data = _log_data_presence('responses', step_data.get('responses'), log_ctx)
+            responses = torch.tensor(responses_data, dtype=torch.long)
+            # =================================================================================
+
             rehydrated_step = {
                 # 轨迹级(Macro)数据
                 'traj_task_completed': traj_task_completed,

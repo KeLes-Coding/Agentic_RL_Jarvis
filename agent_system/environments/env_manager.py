@@ -554,6 +554,8 @@ class JarvisEnvironmentManager(EnvironmentManagerBase):
         self.last_token_usage: List[dict] = None
         self.last_confidence: List[dict] = None
         self.last_log_probs: List[torch.Tensor] = None # <--- ✅ [CCAPO] 新增
+        # ======================= ✅ [ 修复 G_Buffer Bug ] =======================
+        self.last_tensors: List[dict] = None # <--- ✅ 新增：暂存 PPO 张量
         # ===================================================================================
 
     # --- 🗑️ 移除: 不再需要此方法，配置由底层 envs.py 管理 ---
@@ -574,6 +576,13 @@ class JarvisEnvironmentManager(EnvironmentManagerBase):
     def set_last_step_log_probs(self, log_probs_list: List[torch.Tensor]): # <--- ✅ [CCAPO] 新增
         """从外部（rollout_loop）接收并暂存当前步骤的对数概率。"""
         self.last_log_probs = log_probs_list
+
+    # ================================================================================
+
+    # ======================= ✅ [ 修复 G_Buffer Bug ] =======================
+    def set_last_step_tensors(self, tensors_list: List[dict]): # <--- ✅ 新增
+        """从外部 (rollout_loop) 接收并暂存 G_Buffer 所需的核心张量。"""
+        self.last_tensors = tensors_list
     # ================================================================================
 
     def _initialize_loggers_for_new_run(self):
@@ -657,6 +666,12 @@ class JarvisEnvironmentManager(EnvironmentManagerBase):
                 
                 if self.last_log_probs and i < len(self.last_log_probs): # <--- ✅ [CCAPO] 新增
                     step_data["rollout_log_probs"] = self.last_log_probs[i]
+
+                # ======================= ✅ [ 修复 G_Buffer Bug ] =======================
+                # 将暂存的 PPO 张量 (来自 set_last_step_tensors) 复制到 step_data
+                if self.last_tensors and i < len(self.last_tensors):
+                    step_data.update(self.last_tensors[i])
+                # =====================================================================
 
                 self.info_pool_managers[i].record_step(step_data)
 
