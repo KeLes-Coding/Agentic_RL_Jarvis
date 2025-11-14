@@ -308,18 +308,23 @@ class SuccessTrajectoryDatabase:
         """
         按需从磁盘加载轨迹数据（“软链接”解析）。
         这会从 summary.json 和 /step_N/step_details.json 中重新组合轨迹。
+        (✅ [CCAPO V4] 升级日志：检查所有关键字段)
         """
         
         # ======================= ✅ 日志升级：内部辅助函数 ✅ =======================
         def _log_data_presence(key: str, data: Any, context: str):
             """检查数据是否存在并记录到 STDB 文件日志。"""
             if data is None:
-                self.file_logger.warning(f"[{context}] 缺失数据: '{key}' 未在 step_details.json 中找到。")
-                return []
+                self.file_logger.warning(f"[{context}] 缺失数据: '{key}' 未在 step_details.json 中找到 (值为 None)。")
+                return data # 返回 None 以便下游处理
             elif isinstance(data, list) and not data:
                 # 允许空列表，但发出警告
                 self.file_logger.warning(f"[{context}] 数据为空: '{key}' 是一个空列表[]。")
-                return []
+                return data # 返回 []
+            elif isinstance(data, dict) and not data:
+                # 允许空字典，但发出警告
+                self.file_logger.warning(f"[{context}] 数据为空: '{key}' 是一个空字典{{}}。")
+                return data # 返回 {}
             else:
                 # 使用 DEBUG 级别来避免日志刷屏
                 self.file_logger.debug(f"[{context}] 成功加载数据: '{key}'")
@@ -339,10 +344,8 @@ class SuccessTrajectoryDatabase:
         traj_total_steps = summary_data.get('step_count', 0)
         traj_total_tokens = summary_data.get('token_usage', {}).get('total_tokens', 0)
 
-        # ======================= ✅ [ 修复 KeyError: 'traj_uid' ] =======================
-        # log_dir_path 的最后一部分就是 traj_uid
         traj_uid = os.path.basename(log_dir_path)
-        # ======================= 修复结束 =======================
+        self.file_logger.info(f"[STDB._load] 开始加载 Traj_UID: {traj_uid} (共 {traj_total_steps} 个步骤)")
         
         # --- 2. 加载步骤级(Micro)数据 ---
         loaded_steps = []
@@ -360,46 +363,54 @@ class SuccessTrajectoryDatabase:
                 except Exception as e:
                     self.file_logger.warning(f"读取 {step_detail_path} 时出错: {e}")
             
+        self.file_logger.debug(f"[STDB._load] Traj {traj_uid}: 预计算 n_success = {traj_n_success_steps}")
+            
         # 2.2 加载每一步
         for i in range(1, traj_total_steps + 1): # 假设 step_count 是从0开始的
             step_detail_path = os.path.join(log_dir_path, f"step_{i}", "step_details.json")
             if not os.path.exists(step_detail_path):
+                self.file_logger.warning(f"[STDB._load] Traj {traj_uid}: 找不到 step_{i}/step_details.json，跳过此步骤。")
                 continue
                 
             with open(step_detail_path, 'r', encoding='utf-8') as f:
                 step_data = json.load(f)
             
-            # ======================= ✅ 日志升级：定义日志上下文 ✅ =======================
             log_ctx = f"STDB._load(traj_uid={traj_uid}, step_{i})"
-            # =========================================================================
 
-            # R_step, A_step, R_tau, A_tau 等将在 Phase 3 计算
-            # 我们只加载计算它们所需的原始数据
+            # ======================= ✅ 日志升级：检查所有字段 ✅ =======================
+            # 步骤级(Micro)数据
+            step_index = _log_data_presence('step_number', step_data.get('step_number', i), log_ctx)
+            thought = _log_data_presence('thought', step_data.get('thought'), log_ctx)
+            parsed_action = _log_data_presence('parsed_action', step_data.get('parsed_action'), log_ctx)
+            action_type = _log_data_presence('action_type', step_data.get('action_type'), log_ctx)
+            action_success = _log_data_presence('action_success', step_data.get('action_success'), log_ctx) # bool
+            step_token_usage = _log_data_presence('token_usage', step_data.get('token_usage'), log_ctx)
+            confidence_metrics = _log_data_presence('confidence_metrics', step_data.get('confidence_metrics'), log_ctx)
+            action_status = _log_data_presence('action_status', step_data.get('action_status'), log_ctx)
             
-            # 将 log_probs 从 list 转回 tensor
+            # 核心 RL 数据
             log_probs_list = _log_data_presence('rollout_log_probs', step_data.get('rollout_log_probs'), log_ctx)
+            
+            # G_Buffer Bug 修复数据
+            self.file_logger.debug(f"[{log_ctx}] 正在重新水合 G_Buffer Tensors...")
+            input_ids_data = _log_data_presence('input_ids', step_data.get('input_ids'), log_ctx)
+            attention_mask_data = _log_data_presence('attention_mask', step_data.get('attention_mask'), log_ctx)
+            position_ids_data = _log_data_presence('position_ids', step_data.get('position_ids'), log_ctx)
+            responses_data = _log_data_presence('responses', step_data.get('responses'), log_ctx)
+            # ======================= 日志升级结束 ✅ =======================
+
+            # --- 转换数据 ---
+            
             if isinstance(log_probs_list, list):
                 rollout_log_probs = torch.tensor(log_probs_list)
             else:
-                rollout_log_probs = torch.tensor([]) # 占位
+                rollout_log_probs = torch.tensor([]) 
             
-            # ======================= ✅ [ 修复 G_Buffer Bug ] + ✅ 日志升级 =======================
-            # 重新水合 PPO 更新所需的张量
-            self.file_logger.debug(f"[{log_ctx}] 正在重新水合 G_Buffer Tensors...")
+            input_ids = torch.tensor(input_ids_data if input_ids_data else [], dtype=torch.long)
+            attention_mask = torch.tensor(attention_mask_data if attention_mask_data else [], dtype=torch.long)
+            position_ids = torch.tensor(position_ids_data if position_ids_data else [], dtype=torch.long)
+            responses = torch.tensor(responses_data if responses_data else [], dtype=torch.long)
             
-            input_ids_data = _log_data_presence('input_ids', step_data.get('input_ids'), log_ctx)
-            input_ids = torch.tensor(input_ids_data, dtype=torch.long)
-            
-            attention_mask_data = _log_data_presence('attention_mask', step_data.get('attention_mask'), log_ctx)
-            attention_mask = torch.tensor(attention_mask_data, dtype=torch.long)
-            
-            position_ids_data = _log_data_presence('position_ids', step_data.get('position_ids'), log_ctx)
-            position_ids = torch.tensor(position_ids_data, dtype=torch.long)
-            
-            responses_data = _log_data_presence('responses', step_data.get('responses'), log_ctx)
-            responses = torch.tensor(responses_data, dtype=torch.long)
-            # =================================================================================
-
             rehydrated_step = {
                 # 轨迹级(Macro)数据
                 'traj_task_completed': traj_task_completed,
@@ -408,25 +419,24 @@ class SuccessTrajectoryDatabase:
                 'traj_n_success_steps': traj_n_success_steps,
                 
                 # 步骤级(Micro)数据
-                'step_index': step_data.get('step_number', i),
-                'thought': step_data.get('thought', ''),
-                'parsed_action': step_data.get('parsed_action', ''),
-                'action_type': step_data.get('action_type', ''),
-                'action_success': step_data.get('action_success', False),
-                'step_token_usage': step_data.get('token_usage', {}),
-                'step_confidence': step_data.get('confidence_metrics', {}).get('average_confidence', 0.0),
-                # --- ✅ [CCAPO V3] 关键修正：加载 action_status ---
-                'action_status': step_data.get('action_status', ''),
+                'step_index': step_index,
+                'thought': thought if thought is not None else '',
+                'parsed_action': parsed_action if parsed_action is not None else '',
+                'action_type': action_type if action_type is not None else '',
+                'action_success': action_success if action_success is not None else False,
+                'step_token_usage': step_token_usage if step_token_usage is not None else {},
+                'step_confidence': (confidence_metrics.get('average_confidence', 0.0) 
+                                    if confidence_metrics is not None else 0.0),
+                'action_status': action_status if action_status is not None else '',
                 
                 # 核心 RL 数据
                 'rollout_log_probs': rollout_log_probs, # $\pi_{\theta_{stored}}$
                 
-                # ======================= ✅ [ 修复 G_Buffer Bug ] =======================
+                # G_Buffer Bug
                 'input_ids': input_ids,
                 'attention_mask': attention_mask,
                 'position_ids': position_ids,
                 'responses': responses,
-                # =====================================================================
 
                 # 标识符
                 'log_dir_path': log_dir_path,
@@ -435,4 +445,5 @@ class SuccessTrajectoryDatabase:
             }
             loaded_steps.append(rehydrated_step)
             
+        self.file_logger.info(f"[STDB._load] Traj {traj_uid}: 加载完成 (加载了 {len(loaded_steps)} 个步骤)。")
         return loaded_steps
