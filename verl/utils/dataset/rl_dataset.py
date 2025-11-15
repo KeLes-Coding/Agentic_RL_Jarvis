@@ -412,7 +412,8 @@ class RLHFDataset(Dataset):
             final_item["full_prompts"] = raw_prompt  # array of strings
 
         # add index for each prompt
-        index = original_row.get("extra_info", {}).get("index", 0)
+        # --- ❗️ [STDB 修复] 移除无效的 'index' 默认值 ---
+        index = original_row.get("extra_info", {}).get("index", 0) 
         tools_kwargs = original_row.get("extra_info", {}).get("tools_kwargs", {})
         need_tools_kwargs = original_row.get("extra_info", {}).get("need_tools_kwargs", self.need_tools_kwargs)
         if need_tools_kwargs and not tools_kwargs:
@@ -423,18 +424,19 @@ class RLHFDataset(Dataset):
         # 1. 尝试从 parquet 根级别获取 'prompt_index' (这已在上面的 for 循环中完成)
         if "prompt_index" not in final_item:
             self.file_logger.debug(f"Item {item}: 'prompt_index' not in root, checking 'index'")
+            
             # 2. 如果没有，使用 'index' (也可能在 parquet 根级别)
             if "index" in final_item:
                 final_item["prompt_index"] = final_item["index"]
                 self.file_logger.debug(f"Item {item}: Using root 'index' for prompt_index.")
             else:
-                # 3. 如果还没有，使用 'extra_info.index'
-                final_item["prompt_index"] = index
-                self.file_logger.debug(f"Item {item}: Using 'extra_info.index' for prompt_index.")
+                # 3. 如果还没有，使用 __getitem__ 传入的 'item' (这是最可靠的 unique ID)
+                final_item["prompt_index"] = item 
+                self.file_logger.debug(f"Item {item}: No 'prompt_index' or 'index' in data. Using dataset item index ({item}) as prompt_index.")
         else:
              self.file_logger.debug(f"Item {item}: Found 'prompt_index' in root.")
 
-        # (我们不再需要 final_item["index"] = index，因为它现在被 final_item["prompt_index"] 取代)
+        # (我们不再需要 final_item["index"] = index)
         final_item["tools_kwargs"] = tools_kwargs
         
         

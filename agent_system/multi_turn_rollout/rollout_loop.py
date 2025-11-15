@@ -24,7 +24,7 @@ import uuid
 from verl.models.transformers.qwen2_vl import get_rope_index
 from agent_system.multi_turn_rollout.utils import process_image, to_list_of_dict, torch_to_numpy, filter_group_data
 from agent_system.environments import EnvironmentManagerBase
-from typing import List, Dict
+from typing import List, Dict, Any
 
 # ======================= ✅ 1. 新增：ROLLOUT 专用文件日志器 ✅ =======================
 import os
@@ -88,6 +88,8 @@ class TrajectoryCollector:
         item: int,
         gen_batch: DataProto,
         obs: Dict,
+        prompt_index: Any,      # <-- ✅ [STDB 修复] 新增
+        prompt_vector: Any,     # <-- ✅ [STDB 修复] 新增
     ):
         """
         Process a single observation sample, organizing environment observations (text and/or images) 
@@ -97,6 +99,8 @@ class TrajectoryCollector:
             item (int): Sample index in the batch
             gen_batch (DataProto): Batch data containing original prompts
             obs (Dict): Environment observation, may contain 'text', 'image', 'anchor' keys
+            prompt_index (Any): [STDB 修复] The prompt_index for this item
+            prompt_vector (Any): [STDB 修复] The prompt_vector for this item
         
         Returns:
             dict: Contains processed input data such as input_ids, attention_mask, etc.
@@ -226,6 +230,9 @@ class TrajectoryCollector:
             'data_source': data_source,
             # --- 新增: 将 ground_truth_answer 添加到样本字典中 ---
             'ground_truth_answer': ground_truth_answer,
+            # --- ✅ [STDB 修复] 将传入的索引添加到 row_dict ---
+            'prompt_index': prompt_index,
+            'prompt_vector': prompt_vector,
         })
 
         if self.config.data.get('return_raw_chat', False):
@@ -258,6 +265,16 @@ class TrajectoryCollector:
         batch_size = len(gen_batch.batch['input_ids'])
         processed_samples = []
         
+        # --- ✅ [STDB 修复] 提取一次, 供所有样本使用 ---
+        prompt_index_list = gen_batch.non_tensor_batch.get('prompt_index', [None] * batch_size)
+        prompt_vector_tensor = gen_batch.batch.get('prompt_vector', None)
+        
+        if prompt_vector_tensor is None:
+            self.file_logger.warning(f"[preprocess_batch] 'prompt_vector' not found in gen_batch.batch. STDB data will be incomplete.")
+        if any(p is None for p in prompt_index_list):
+            self.file_logger.warning(f"[preprocess_batch] 'prompt_index' not found in gen_batch.non_tensor_batch. STDB data will be incomplete.")
+        # --- 修复结束 ---
+
         # Process each sample in parallel
         for item in range(batch_size):
             # Extract per-sample observations
@@ -265,6 +282,9 @@ class TrajectoryCollector:
                 item=item,
                 gen_batch=gen_batch,
                 obs=obs,
+                # --- ✅ [STDB 修复] 传入 STDB 索引 ---
+                prompt_index=prompt_index_list[item],
+                prompt_vector=prompt_vector_tensor[item] if prompt_vector_tensor is not None else None
             )
             processed_samples.append(processed)
         
@@ -469,22 +489,39 @@ class TrajectoryCollector:
         tasks_for_this_batch = []
         try:
             # 确保 gen_batch.non_tensor_batch 及其键存在
-            if hasattr(gen_batch, 'non_tensor_batch') and gen_batch.non_tensor_batch and 'ground_truth_answer' in gen_batch.non_tensor_batch:
+            if (hasattr(gen_batch, 'non_tensor_batch') and gen_batch.non_tensor_batch and 
+                'ground_truth_answer' in gen_batch.non_tensor_batch and 
+                'prompt_index' in gen_batch.non_tensor_batch): # <-- ✅ 检查 prompt_index
+                
                 raw_prompts = gen_batch.non_tensor_batch['raw_prompt']
                 tasks_list = [item[0]['content'] for item in raw_prompts]
                 ground_truth_answers = gen_batch.non_tensor_batch['ground_truth_answer']
-
+                
+                # --- ✅ [STDB 修复] 提取 prompt_index 和 prompt_vector ---
+                prompt_index_list = gen_batch.non_tensor_batch['prompt_index']
+                prompt_vector_tensor = gen_batch.batch.get('prompt_vector')
+                
+                if prompt_vector_tensor is None:
+                    self.file_logger.error("!!! [vanilla_multi_turn_loop] 'prompt_vector' is missing from gen_batch.batch! STDB will fail. !!!")
+                
                 for i in range(len(gen_batch)):
                     # 为每个环境创建一个包含任务描述和参考答案的字典
-                    tasks_for_this_batch.append({
+                    task_data = {
                         "task": tasks_list[i],
-                        "ground_truth_answer": ground_truth_answers[i]
-                    })
-                print("--- [rollout_loop.py] 已成功准备任务和参考答案用于环境重置。 ---")
-                self.file_logger.info(f"已准备 {len(tasks_for_this_batch)} 个任务用于环境重置。")
+                        "ground_truth_answer": ground_truth_answers[i],
+                        "prompt_index": prompt_index_list[i], # <-- ✅ [STDB 修复]
+                    }
+                    
+                    if prompt_vector_tensor is not None:
+                         task_data["prompt_vector"] = prompt_vector_tensor[i] # <-- ✅ [STDB 修复]
+                    
+                    tasks_for_this_batch.append(task_data)
+
+                print("--- [rollout_loop.py] 已成功准备任务、答案、prompt_index 和 prompt_vector 用于环境重置。 ---")
+                self.file_logger.info(f"已准备 {len(tasks_for_this_batch)} 个任务 (含 STDB 索引) 用于环境重置。")
             else:
-                print("警告: 在 gen_batch 中未找到 'ground_truth_answer' 或 'raw_prompt'。环境将以无任务信息的方式重置。")
-                self.file_logger.warning("在 gen_batch 中未找到 'ground_truth_answer' 或 'raw_prompt'。")
+                print("警告: 在 gen_batch 中未找到 'ground_truth_answer', 'raw_prompt' 或 'prompt_index'。环境将以无任务信息的方式重置。")
+                self.file_logger.warning(f"在 gen_batch 中未找到 'ground_truth_answer', 'raw_prompt' 或 'prompt_index' (non_tensor_batch keys: {list(gen_batch.non_tensor_batch.keys())})。STDB 将失败。")
                 tasks_for_this_batch = [{} for _ in range(len(gen_batch))]
 
         except (KeyError, IndexError, TypeError) as e:
@@ -495,6 +532,8 @@ class TrajectoryCollector:
         
         # 这个修改假设 envs (EnvironmentManager) 的 reset 方法已被更新，
         # 可以接收 tasks 列表，并在内部处理日志初始化、prompt构建和底层环境的重置。
+        # 并且, envs.py 内部会把 "prompt_index" 和 "prompt_vector" 存储起来，
+        # 并在每次调用 record_step 时自动附加它们。
         obs, infos = envs.reset(tasks=tasks_for_this_batch)
         # ====================================================================================
 
@@ -532,6 +571,8 @@ class TrajectoryCollector:
         if hasattr(envs, 'info_pool_managers') and hasattr(envs, 'tasks'):
             for i in range(len(infos)):
                 if i in envs.info_pool_managers:
+                    # ✅ [STDB 修复] 确保在 record_step 时传递了 reset 期间设置的 infos
+                    # (假设 envs.reset 已经将 prompt_index/vector 放入了 infos[i])
                     step_data = {
                         "task": envs.tasks[i],
                         "thought": "Episode started.",
@@ -542,6 +583,14 @@ class TrajectoryCollector:
                         "llm_prompt": "N/A",
                         "raw_llm_response": "N/A"
                     }
+                    
+                    # ✅ [STDB 修复] 
+                    # 显式地将 reset 时应该知道的信息（来自 tasks_for_this_batch）
+                    # 传递给 info_pool。这是必要的，因为 envs.py 我们无法修改。
+                    if i < len(tasks_for_this_batch):
+                        step_data["prompt_index"] = tasks_for_this_batch[i].get("prompt_index")
+                        step_data["prompt_vector"] = tasks_for_this_batch[i].get("prompt_vector")
+                    
                     envs.info_pool_managers[i].record_step(step_data)
 
         # Trajectory collection loop
@@ -558,6 +607,7 @@ class TrajectoryCollector:
 
             batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
             # --- ✅ 新增: 从将要 pop 的 keys 中移除 'ground_truth_answer'，确保它保留在 batch 中 ---
+            # --- ✅ [STDB 修复] 也不 pop 'prompt_index' 或 'prompt_vector' ---
             non_tensor_batch_keys_to_pop = ["raw_prompt_ids"]
             if "multi_modal_data" in batch.non_tensor_batch:
                 non_tensor_batch_keys_to_pop.append("multi_modal_data")
@@ -664,6 +714,29 @@ class TrajectoryCollector:
                 # 暂存 PPO 核心张量
                 if hasattr(envs, "set_last_step_tensors"):
                     envs.set_last_step_tensors(tensors_for_env_list)
+                # =====================================================================
+                
+                # ======================= ✅ [ 修复 STDB Bug ] =======================
+                # 暂存 STDB 索引信息 (这是必须的，因为 envs.py 不会自动传递)
+                if hasattr(envs, "set_last_step_stdb_info"):
+                    stdb_info_list = []
+                    
+                    # --- ✅ [STDB 修复] 从当前的 'batch' 对象中提取索引/向量 ---
+                    # (不再使用 'tasks_for_this_batch'，因为它只适用于 Step 0)
+                    current_prompt_index_list = batch.non_tensor_batch.get('prompt_index', [None] * batch_size)
+                    current_prompt_vector_tensor = batch.batch.get('prompt_vector', None)
+                    
+                    if current_prompt_vector_tensor is None:
+                         self.file_logger.error(f"!!! [vanilla_multi_turn_loop] Step {_step+1}: 'prompt_vector' not found in current step's batch! STDB will fail. !!!")
+                    if any(p is None for p in current_prompt_index_list):
+                         self.file_logger.error(f"!!! [vanilla_multi_turn_loop] Step {_step+1}: 'prompt_index' not found in current step's batch! STDB will fail. !!!")
+
+                    for i in range(batch_size):
+                        stdb_info_list.append({
+                            "prompt_index": current_prompt_index_list[i],
+                            "prompt_vector": current_prompt_vector_tensor[i] if current_prompt_vector_tensor is not None else None
+                        })
+                    envs.set_last_step_stdb_info(stdb_info_list)
                 # =====================================================================
 
             except Exception as e:
