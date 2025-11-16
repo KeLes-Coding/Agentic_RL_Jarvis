@@ -83,8 +83,8 @@ python3 -m verl.trainer.main_ppo \
     env.jarvis.jarvis_config_path=agent_system/environments/env_package/jarvis/jarvis_v2/config.yaml \
     trainer.critic_warmup=0 \
     trainer.logger='[console,swanlab]' \
-    trainer.project_name='verl_agent_jarvis' \
-    trainer.experiment_name='grpo_qwen2.5_vl_2.5b' \
+    trainer.project_name='verl_agent_jarvis_CCAPO' \
+    trainer.experiment_name='CCAPO_qwen2.5_vl_2.5b' \
     trainer.n_gpus_per_node=2 \
     trainer.nnodes=1 \
     trainer.save_freq=5 \

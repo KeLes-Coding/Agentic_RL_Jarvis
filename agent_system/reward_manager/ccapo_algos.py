@@ -497,7 +497,8 @@ def compute_ccapo_advantages(g_calc_steps: List[Dict[str, Any]], g_online_steps:
             online_success_count += 1
             
     success_rate = online_success_count / (online_trajs_count + 1e-6)
-    w_N = 1.0 - success_rate # 动态 w_N
+    # w_N = 1.0 - success_rate # 动态 w_N
+    w_N = 0.5 # 静态 w_N
     
     ccapo_file_logger.info(f"  [w_N] Online 有效成功率 (lambda_SR): {online_success_count} / {online_trajs_count} = {success_rate:.4f}")
     ccapo_file_logger.info(f"  [w_N] 动态新颖度权重 w_N = 1.0 - SR = {w_N:.4f}")

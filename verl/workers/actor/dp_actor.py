@@ -63,6 +63,8 @@ class DataParallelPPOActor(BasePPOActor):
         )
         self.device_name = get_device_name()
 
+        self.smoothed_lambda_sr = 0.5 # 0.5 是一个中性的起始值
+
     def _forward_micro_batch(self, micro_batch, temperature, calculate_entropy=False) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Returns:
@@ -545,24 +547,35 @@ class DataParallelPPOActor(BasePPOActor):
         
         # --- ✅ [CCAPO V3] 记录详细信号 (包含 V3 键、直方图和比例) ---
         try:
-            metrics_to_log = ccapo_algos.collections.defaultdict(list)
+            # --- START: 仪表盘丰富 ---
+            # 1. 初始化所有 G_online 数据的收集器
+            online_step_rewards = []         # (微观) R_step
+            online_step_advantages = []      # (微观) A_step
+            online_step_token_costs = []     # (效率) step_token_usage
             
-            # --- ✅ [CCAPO V2] 新增：用于原始分量的专用列表 ---
+            online_traj_rewards = {}         # (宏观) R_tau (使用 traj_uid 去重)
+            online_traj_advantages = {}      # (宏观) A_traj (使用 traj_uid 去重)
+            online_traj_total_steps = {}     # (效率) traj_total_steps
+            online_traj_total_tokens = {}    # (效率) traj_total_tokens
+            
+            # (已存在) 原始信号收集器
             raw_core_values = []
             raw_match_values = []
-            # --- 结束 ---
-
-            # --- ✅ [CCAPO V4] 新增：用于比例统计的计数器 ---
+            
+            # (已存在) 比例计数器
             count_total_steps = 0
             count_success = 0
             count_format_error = 0
             count_exec_failure = 0
-            # --- 结束 ---
             
+            # (已存在) 用于旧直方图的收集器 (保留)
+            metrics_to_log = ccapo_algos.collections.defaultdict(list)
+            # --- END: 仪表盘丰富 ---
+
             # 我们只记录 G_online 的信号，以匹配 PPO 损失
             for step in online_steps_final: 
                 
-                # --- ✅ [CCAPO V4] 累加比例统计 ---
+                # --- (已存在) 比例统计 ---
                 count_total_steps += 1
                 if step.get('action_success', False):
                     count_success += 1
@@ -572,30 +585,46 @@ class DataParallelPPOActor(BasePPOActor):
                     count_format_error += 1
                 elif status.startswith('FAILURE'):
                     count_exec_failure += 1
-                # --- 结束 ---
+                # --- (已存在) 比例统计结束 ---
 
-                # 标准化/最终分数
+                # --- (已存在) 旧的直方图记录 (保留) ---
                 metrics_to_log['R_tau'].append(step.get('R_tau', 0.0))
                 metrics_to_log['A_traj'].append(step.get('A_traj', 0.0))
                 metrics_to_log['R_step'].append(step.get('R_step', 0.0))
                 metrics_to_log['A_step'].append(step.get('A_step', 0.0))
-                metrics_to_log['advantages'].append(step.get('advantages', 0.0)) # 记录最终优势
-                
-                # --- ✅ [CCAPO V3] 修正：记录新的原始分量 ---
+                metrics_to_log['advantages'].append(step.get('advantages', 0.0))
                 metrics_to_log['R_novelty_bonus'].append(step.get('R_novelty_bonus', 0.0))
                 metrics_to_log['R_format_penalty'].append(step.get('R_format_penalty', 0.0))
-                # --- 结束 V3 修正 ---
+                # --- (已存在) 旧的直方图记录结束 ---
+
+                # --- START: 仪表盘丰富 (数据收集) ---
+                # 1. 收集微观(Step)数据
+                online_step_rewards.append(step.get('R_step', 0.0))
+                online_step_advantages.append(step.get('A_step', 0.0))
                 
-                # --- ✅ [CCAPO V2] 仅在适用时添加原始分量 ---
+                # 'TokenCost' 在 ccapo_algos.py 的 _calculate_R_step_success 中计算
+                online_step_token_costs.append(step.get('TokenCost', 0.0)) 
+
+                # 2. 收集宏观(Trajectory)数据 (使用字典自动去重)
+                traj_uid = step.get('traj_uid')
+                if traj_uid:
+                    online_traj_rewards[traj_uid] = step.get('R_tau', 0.0)
+                    online_traj_advantages[traj_uid] = step.get('A_traj', 0.0)
+                    # 'traj_total_steps' 和 'traj_total_tokens' 来自环境/rollout
+                    online_traj_total_steps[traj_uid] = step.get('traj_total_steps', 0)
+                    online_traj_total_tokens[traj_uid] = step.get('traj_total_tokens', 0)
+                # --- END: 仪表盘丰富 (数据收集) ---
+                
+                # (已存在) 原始信号
                 if 'R_core_raw' in step: # 仅 R_core == 1.0 的步骤
                     raw_core_values.append(step.get('R_core_raw', 0.0))
                 
                 if 'R_match_raw' in step: # 仅 R_core == -1.0 的步骤
                     raw_match_values.append(step.get('R_match_raw', 0.0))
-                # --- 结束 ---
+                # --- (已存在) 原始信号结束 ---
 
             
-            # 记录 G_online 的 mean/std/hist
+            # --- (已存在) 旧的直方图日志记录 (保留) ---
             for key, values in metrics_to_log.items():
                 if values:
                     metrics[f'ccapo/online_{key}_mean'] = ccapo_algos.np.mean(values)
@@ -603,7 +632,7 @@ class DataParallelPPOActor(BasePPOActor):
                     # ✅ [新增] 添加直方图
                     metrics[f'ccapo/online_{key}_hist'] = ccapo_algos.np.array(values, dtype=float)
 
-            # --- ✅ [CCAPO V4] 计算并记录比例 ---
+            # --- (已存在) 比例日志记录 ---
             epsilon = 1e-6
             metrics['ccapo_proportions/online_success_rate'] = count_success / (count_total_steps + epsilon)
             metrics['ccapo_proportions/online_format_error_rate'] = count_format_error / (count_total_steps + epsilon)
@@ -618,10 +647,39 @@ class DataParallelPPOActor(BasePPOActor):
             metrics['ccapo_counts/online_success'] = count_success
             metrics['ccapo_counts/online_format_error'] = count_format_error
             metrics['ccapo_counts/online_exec_failure'] = count_exec_failure
-            # --- 结束 ---
+            # --- (已存在) 比例日志记录结束 ---
 
-            # --- ✅ [CCAPO V2] 记录新的原始分量 (如果存在) ---
-            # 我们使用 'ccapo_raw' 前缀来区分
+            # --- START: 仪表盘丰富 (日志记录) ---
+            
+            # 辅助函数，用于记录 mean/min/max/hist
+            def log_stats(metrics_dict, prefix, values_list):
+                if not values_list:
+                    metrics_dict[f"{prefix}_mean"] = 0.0
+                    metrics_dict[f"{prefix}_min"] = 0.0
+                    metrics_dict[f"{prefix}_max"] = 0.0
+                    # metrics_dict[f"{prefix}_hist"] = ccapo_algos.np.array([], dtype=float) # 可选：记录空直方图
+                    return
+                
+                values_np = ccapo_algos.np.array(values_list, dtype=float)
+                metrics_dict[f"{prefix}_mean"] = ccapo_algos.np.mean(values_np)
+                metrics_dict[f"{prefix}_min"] = ccapo_algos.np.min(values_np)
+                metrics_dict[f"{prefix}_max"] = ccapo_algos.np.max(values_np)
+                metrics_dict[f"{prefix}_hist"] = values_np # 也记录直方图
+
+            # 1. 记录微观(Step)指标
+            log_stats(metrics, "ccapo_step/online_reward_R_step", online_step_rewards)
+            log_stats(metrics, "ccapo_step/online_advantage_A_step", online_step_advantages)
+            log_stats(metrics, "ccapo_efficiency/online_step_token_cost", online_step_token_costs)
+
+            # 2. 记录宏观(Trajectory)指标
+            log_stats(metrics, "ccapo_traj/online_reward_R_tau", list(online_traj_rewards.values()))
+            log_stats(metrics, "ccapo_traj/online_advantage_A_traj", list(online_traj_advantages.values()))
+            log_stats(metrics, "ccapo_efficiency/online_traj_total_steps", list(online_traj_total_steps.values()))
+            log_stats(metrics, "ccapo_efficiency/online_traj_total_tokens", list(online_traj_total_tokens.values()))
+            
+            # --- END: 仪表盘丰富 (日志记录) ---
+
+            # --- (已存在) 原始信号日志记录 (保留) ---
             if raw_core_values:
                 metrics[f'ccapo_raw/online_R_core_raw_mean'] = ccapo_algos.np.mean(raw_core_values)
                 metrics[f'ccapo_raw/online_R_core_raw_std'] = ccapo_algos.np.std(raw_core_values)
@@ -637,7 +695,7 @@ class DataParallelPPOActor(BasePPOActor):
             else:
                 metrics[f'ccapo_raw/online_R_match_raw_mean'] = 0.0
                 metrics[f'ccapo_raw/online_R_match_raw_std'] = 0.0
-            # --- 结束 ---
+            # --- (已存在) 原始信号日志记录结束 ---
 
             # (可选) 记录 G_buffer 信号
             if buffer_steps_final:
@@ -690,15 +748,88 @@ class DataParallelPPOActor(BasePPOActor):
 
             # 2. 准备所有要处理的数据
             batches_to_process = []
-            if G_online_batch_final and G_online_batch_final.batch.batch_size[0] > 0:
+            has_online = G_online_batch_final and G_online_batch_final.batch.batch_size[0] > 0
+            has_buffer = G_buffer_batch_final and G_buffer_batch_final.batch.batch_size[0] > 0
+
+            # --- START: [Bug修复] 解决 G_buffer 为空时的权重问题 ---
+            # online_weight = lambda_sr
+            # buffer_weight = 1.0 - lambda_sr
+
+            # if has_online and not has_buffer:
+            #     # 只有 Online 数据，权重必须为 1.0 (允许从失败中学习)
+            #     online_weight = 1.0
+            #     # buffer_weight 保持 (1.0 - lambda_sr)，但不会被使用
+            # elif not has_online and has_buffer:
+            #     # 只有 Buffer 数据，权重必须为 1.0
+            #     buffer_weight = 1.0
+            #     # online_weight 保持 lambda_sr，但不会被使用
+            # elif not has_online and not has_buffer:
+            #     # 没有数据，什么也不做 (在下面处理)
+            #     pass
+            # # else: (has_online and has_buffer)
+            #     # 两者都有，保持 lambda_sr 动态权重
+            #     # online_weight = lambda_sr
+            #     # buffer_weight = 1.0 - lambda_sr
+
+            # 1. 从配置中获取平滑因子和权重范围
+            # (你需要在你的 ccapo config 中定义它们)
+            smoothing_factor = ccapo_config.get("lambda_smoothing_factor", 0.05) # e.g., 0.05 代表慢速更新
+            min_weight = ccapo_config.get("buffer_min_weight", 0.2)       # 你建议的 0.2
+            max_weight = ccapo_config.get("buffer_max_weight", 0.8)       # 你建议的 0.8
+
+            # 2. 更新平滑的 lambda_sr (EMA)
+            # lambda_sr 是 *当前批次* 的在线成功率
+            self.smoothed_lambda_sr = (smoothing_factor * lambda_sr) + \
+                                    (1.0 - smoothing_factor) * self.smoothed_lambda_sr
+
+            # 3. 使用平滑后的 sr_for_weighting 来计算权重
+            sr_for_weighting = self.smoothed_lambda_sr 
+
+            # 4. 线性插值 (Scaling):
+            # sr=0 -> buffer_weight=min_weight
+            # sr=1 -> buffer_weight=max_weight
+            buffer_weight = min_weight + (max_weight - min_weight) * sr_for_weighting
+            online_weight = 1.0 - buffer_weight # 自动在 [1-max_w, 1-min_w] (即 0.2-0.8) 
+
+            # 5. 记录平滑后的值，这非常重要！
+            append_to_dict(metrics, {
+                "actor/lambda_sr_raw": lambda_sr, # 原始的、振荡的 sr
+                "actor/lambda_sr_smoothed": sr_for_weighting, # 平滑后的 sr
+                "actor/weight_online": online_weight,
+                "actor/weight_buffer": buffer_weight,
+            })
+
+            # 6. 处理特殊情况 (例如 STDB 为空)
+            batches_to_process = []
+            has_online = G_online_batch_final and G_online_batch_final.batch.batch_size[0] > 0
+            has_buffer = G_buffer_batch_final and G_buffer_batch_final.batch.batch_size[0] > 0
+
+            if has_online and not has_buffer:
+                # 方案一：STDB 为空，强制100%关注 online
+                online_weight = 1.0
+                buffer_weight = 0.0
+            elif not has_online and has_buffer:
+                # 方案二：G_online 为空 (不应发生)，强制100%关注 buffer
+                online_weight = 0.0
+                buffer_weight = 1.0
+            elif not has_online and not has_buffer:
+                # 没有数据，跳过
+                logger.warning("[CCAPO] G_online 和 G_buffer 均为空。跳过更新。")
+                pass
+            # else: (has_online and has_buffer)
+                # 两者都有，使用上面计算的 [方案二] 平滑权重
+                # online_weight 和 buffer_weight 保持不变
+
+            if has_online:
                 batches_to_process.append(
-                    (G_online_batch_final, (1.0 - lambda_sr), "online") # <-- 修正: 传递 DataProto
+                    (G_online_batch_final, online_weight, "online")
                 )
-            
-            if G_buffer_batch_final and G_buffer_batch_final.batch.batch_size[0] > 0:
-                 batches_to_process.append(
-                    (G_buffer_batch_final, lambda_sr, "buffer") # <-- 修正: 传递 DataProto
+
+            if has_buffer:
+                batches_to_process.append(
+                    (G_buffer_batch_final, buffer_weight, "buffer")
                 )
+            # --- END: [Bug修复] ---
 
             if not batches_to_process:
                 logger.warning("[CCAPO] 没有数据可供更新。跳过此 epoch。")
