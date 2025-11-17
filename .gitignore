@@ -141,4 +141,5 @@ quick_test.py
 
 tools/
 logger/
+errors/
 

@@ -466,6 +466,48 @@ def _calculate_A_step(g_calc_steps: List[Dict[str, Any]]):
         step['A_step'] = a_step
         ccapo_file_logger.debug(f"  [A_step] [Traj {step.get('traj_uid')}, t={step.get('step_index')}]: R_step={r_step:.4f} -> A_step={a_step:.4f}")
 
+# --- [新函数] Sec 5 & Sec 1: 局部分离的优势计算 ---
+def _calculate_final_advantages_for_subset(steps_subset: List[Dict[str, Any]], omega: float, subset_name: str):
+    """
+    [GEM FIX V2/V3]
+    计算 A_traj, A_step, 和最终标准化的 Advantages *局部*
+    为给定的步骤子集 (例如 G_online 或 G_buffer)。
+    这修复了“漏洞二 (信号扭曲)”和“漏洞三 (双重标准化)”。
+    """
+    ccapo_file_logger.info(f"--- [CCAPO] Phase 9 ({subset_name}): 为 {len(steps_subset)} 个步骤计算局部优势 ---")
+    if not steps_subset:
+        ccapo_file_logger.info(f"  [{subset_name}_Adv] 子集为空，跳过。")
+        return
+
+    # 1. 局部计算 A_traj (基于此子集的 R_tau 统计)
+    #    (日志记录在 _calculate_A_traj 内部)
+    _calculate_A_traj(steps_subset)
+    
+    # 2. 局部计算 A_step (基于此子集的 R_step 统计)
+    #    (日志记录在 _calculate_A_step 内部)
+    _calculate_A_step(steps_subset)
+    
+    # 3. [修复漏洞三] 计算原始 A_final = A_traj + omega * A_step
+    all_A_final_raw = []
+    for step in steps_subset:
+        a_traj = step.get('A_traj', 0.0)
+        a_step = step.get('A_step', 0.0)
+        a_final_raw = a_traj + omega * a_step
+        step['A_final_raw'] = a_final_raw
+        all_A_final_raw.append(a_final_raw)
+        
+    # 4. [修复漏洞三] 局部标准化最终优势
+    mean_A_final = np.mean(all_A_final_raw)
+    std_A_final = np.std(all_A_final_raw) + 1e-6
+    ccapo_file_logger.info(f"  [{subset_name}_Adv] 原始 A_final 分布: mean={mean_A_final:.4f}, std={std_A_final:.4f}")
+
+    for step in steps_subset:
+        # 将最终的、标准化的优势写入 'advantages' 键
+        step['advantages'] = (step['A_final_raw'] - mean_A_final) / std_A_final
+        ccapo_file_logger.debug(f"  [{subset_name}_Adv] [Traj {step.get('traj_uid')}, t={step.get('step_index')}]: "
+                              f"A_final = A_traj({step.get('A_traj', 0.0):.4f}) + o({omega:.2f}) * A_step({step.get('A_step', 0.0):.4f}) "
+                              f"==> Raw={step['A_final_raw']:.4f} "
+                              f"==> Norm_Adv={step['advantages']:.4f}")
 
 # --- 主函数 ---
 def compute_ccapo_advantages(g_calc_steps: List[Dict[str, Any]], g_online_steps: List[Dict[str, Any]], embedding_model, config):
@@ -473,18 +515,22 @@ def compute_ccapo_advantages(g_calc_steps: List[Dict[str, Any]], g_online_steps:
     计算 CCAPO 奖励和优势的主函数。 (✅ [CCAPO V3] 修改: 解耦格式惩罚)
     修改 g_calc_steps 列表，为其添加 'R_tau', 'A_traj', 'R_step', 'A_step', 'advantages'。
     (✅ [CCAPO V4] 升级日志)
+    (✅ [Gem] 修复漏洞 2 和 3：分离优势计算)
     """
     ccapo_file_logger.info(f"================ [CCAPO V4] 开始计算优势 ================")
     ccapo_file_logger.info(f"G_calc 步骤数: {len(g_calc_steps)}, G_online 步骤数: {len(g_online_steps)}")
     
     g_calc_trajs = _group_steps_by_traj(g_calc_steps)
+    # [GEM 修复] g_buffer_steps 必须从 g_calc_steps 过滤出来，
+    # 因为 g_online_steps 可能不包含 g_buffer_steps (例如在 collate_fn 之后)
     g_buffer_steps = [s for s in g_calc_steps if s.get('is_buffer_data', False)]
     ccapo_file_logger.info(f"G_calc 轨迹数: {len(g_calc_trajs)}, G_buffer 步骤数: {len(g_buffer_steps)}")
     
-    # --- 1. Sec 4: R_tau, R_core 和 A_traj ---
-    ccapo_file_logger.info("--- [CCAPO] Phase 1: 计算 R_tau, R_core, A_traj ---")
+    # --- 1. Sec 4: R_tau, R_core (统一计算) ---
+    ccapo_file_logger.info("--- [CCAPO] Phase 1: 统一计算 R_tau, R_core ---")
+    # [GEM 修复] R_tau 和 R_core 在 G_calc 上统一计算
     _calculate_R_tau(g_calc_trajs, config)
-    _calculate_A_traj(g_calc_steps) # (A_traj 的日志已在 _calculate_R_tau 中)
+    # [GEM 修复] _calculate_A_traj(g_calc_steps) 已删除 (必须分离)
     
     # --- 2. Sec 7: 计算 SR (lambda_SR) 和 w_N ---
     ccapo_file_logger.info("--- [CCAPO] Phase 2: 计算 SR (lambda_SR) 和 w_N (来自 G_online) ---")
@@ -492,56 +538,53 @@ def compute_ccapo_advantages(g_calc_steps: List[Dict[str, Any]], g_online_steps:
     online_trajs_count = len(online_trajs)
     online_success_count = 0
     for traj_uid, steps in online_trajs.items():
-        # --- ✅ [CCAPO V2] 修改: 根据 R_core == 1.0 判断有效成功 ---
         if steps and steps[0].get('R_core') == 1.0:
             online_success_count += 1
             
     success_rate = online_success_count / (online_trajs_count + 1e-6)
-    # w_N = 1.0 - success_rate # 动态 w_N
-    w_N = 0.5 # 静态 w_N
+    
+    # --- [Gem 修复] 保留您在上一步中添加的动态 w_N ---
+    max_w_N = config.get("max_w_N", 0.8) # 从 config 读取
+    min_w_N = config.get("min_w_N", 0.2) # 从 config 读取
+    w_N = min_w_N + (max_w_N - min_w_N) * (1.0 - success_rate)
+    # --- 修复结束 ---
     
     ccapo_file_logger.info(f"  [w_N] Online 有效成功率 (lambda_SR): {online_success_count} / {online_trajs_count} = {success_rate:.4f}")
-    ccapo_file_logger.info(f"  [w_N] 动态新颖度权重 w_N = 1.0 - SR = {w_N:.4f}")
+    ccapo_file_logger.info(f"  [w_N] 动态新颖度权重 w_N = {min_w_N:.1f} + ({max_w_N-min_w_N:.1f})*(1-{success_rate:.2f}) = {w_N:.4f}")
 
+    # --- 3. Sec 5: R_step (原始组件 - 统一计算) ---
+    # (这部分保持不变, 它们都在 G_calc 级别上运行，这符合您的 GRPO 理念)
+    ccapo_file_logger.info("--- [CCAPO] Phase 3-8: 统一计算 R_step (所有组件) ---")
+    
     # --- ✅ [CCAPO V3] 关键修正：初始化原始分量键 ---
-    # 确保 R_core_raw 和 R_match_raw 在 *所有* 步骤中都存在，以防止 collate_fn 错误
     for step in g_calc_steps:
         step['R_core_raw'] = 0.0
         step['R_match_raw'] = 0.0
-    # --- 修正结束 ---
-
-    # --- 3. Sec 5: R_step (原始组件) ---
-    # (Phase 3.1 和 3.2 在其各自的函数内部记录日志)
+    
+    # 3.1 R_format_penalty (G_calc)
     _calculate_R_format_penalty(g_calc_steps, config)
     
-    # 3.2 R_novelty_bonus (仅成功动作) - ✅ [CCAPO V3] 变更
+    # 3.2 R_novelty_bonus (G_calc)
     _calculate_R_novelty_bonus(g_calc_steps, config)
     
-    # 3.3 R_core_raw (仅 R_core == 1.0 步骤)
-    # (此函数现在将 *覆盖* 上面设置的 0.0)
+    # 3.3 R_core_raw (G_calc)
     _calculate_R_step_success(g_calc_steps, g_calc_trajs, config)
 
-    # --- 4. Sec 5: Z-Score 标准化 (除 R_format_penalty 和 R_match_raw) ---
-    ccapo_file_logger.info("--- [CCAPO] Phase 4: 标准化 R_core_raw 和 R_novelty_bonus ---")
-    
-    # 4.1 Z_novelty (所有步骤)
+    # --- 4. Sec 5: Z-Score (G_calc) ---
+    # (这部分保持不变, 它们都在 G_calc 级别上运行)
     raw_novelty_all = [s.get('R_novelty_bonus', 0.0) for s in g_calc_steps]
     z_novelty_all = _standardize(raw_novelty_all)
     ccapo_file_logger.info(f"  [Z_novelty] R_novelty (G_calc) 分布: mean={np.mean(raw_novelty_all):.4f}, std={np.std(raw_novelty_all):.4f}")
     
-    # 4.2 Z_core (仅 R_core == 1.0 步骤)
     raw_core_success = [s.get('R_core_raw', 0.0) for s in g_calc_steps if s.get('R_core') == 1.0]
     z_core_success = _standardize(raw_core_success)
     ccapo_file_logger.info(f"  [Z_core] R_core_raw (R_core=1.0) 分布: mean={np.mean(raw_core_success):.4f}, std={np.std(raw_core_success):.4f} (来自 {len(raw_core_success)} 个步骤)")
     
-    # --- 5. Sec 5.1: 组合 R_step (成功和捷径轨迹) ---
-    # (必须在 R_step_fail 之前计算, 因为 R_step_fail 依赖 G_buffer 中的 R_step)
+    # --- 5. Sec 5.1: 组合 R_step (G_calc) ---
     core_idx = 0
     ccapo_file_logger.info("  [R_step] 组合 R_step (R_core=1.0 和 R_core=0.0):")
     for i, step in enumerate(g_calc_steps):
-        step['Z_novelty'] = z_novelty_all[i] # 存下 Z_novelty 供 R_step_fail 使用
-        
-        # ✅ [CCAPO V3] 提取 R_format_penalty (硬惩罚，不标准化)
+        step['Z_novelty'] = z_novelty_all[i]
         R_format_penalty = step.get('R_format_penalty', 0.0)
 
         if step.get('R_core') == 1.0:
@@ -552,25 +595,20 @@ def compute_ccapo_advantages(g_calc_steps: List[Dict[str, Any]], g_online_steps:
                                   f"==> {step['R_step']:.4f}")
             core_idx += 1
         elif step.get('R_core') == 0.0:
-            # R_step (shortcut) = 0 + R_format_penalty
             step['R_step'] = 0.0 + R_format_penalty
             ccapo_file_logger.debug(f"    [Traj {step.get('traj_uid')}, t={step.get('step_index')}] (R_core=0.0): "
                                   f"R_step = 0.0 + R_format({R_format_penalty:.4f}) "
                                   f"==> {step['R_step']:.4f}")
     
-    # --- 6. Sec 5.2: R_match_raw (仅 R_core == -1.0 步骤) ---
-    # (这必须在 G_buffer 步骤的 R_step 填充后运行)
-    # (G_buffer 中的 R_step 此时已包含 R_format_penalty, 这是OK的,
-    # 因为惩罚总是负的, 会使匹配到的分数更低, 这符合逻辑。)
-    # (此函数现在将 *覆盖* 上面设置的 0.0)
+    # --- 6. Sec 5.2: R_match_raw (G_calc) ---
     _calculate_R_step_fail(g_calc_steps, g_buffer_steps, embedding_model, config)
     
-    # --- 7. Sec 5: Z-Score 标准化 (R_match_raw) ---
+    # --- 7. Sec 5: Z-Score (G_calc) ---
     raw_match_fail = [s.get('R_match_raw', 0.0) for s in g_calc_steps if s.get('R_core') == -1.0]
     z_match_fail = _standardize(raw_match_fail)
     ccapo_file_logger.info(f"  [Z_match] R_match_raw (R_core=-1.0) 分布: mean={np.mean(raw_match_fail):.4f}, std={np.std(raw_match_fail):.4f} (来自 {len(raw_match_fail)} 个步骤)")
 
-    # --- 8. Sec 5.2: 组合 R_step (失败轨迹) ---
+    # --- 8. Sec 5.2: 组合 R_step (G_calc) ---
     match_idx = 0
     ccapo_file_logger.info("  [R_step] 组合 R_step (R_core=-1.0):")
     for step in g_calc_steps:
@@ -583,21 +621,26 @@ def compute_ccapo_advantages(g_calc_steps: List[Dict[str, Any]], g_online_steps:
                                   f"==> {step['R_step']:.4f}")
             match_idx += 1
     
-    # --- 9. Sec 5: A_step (标准化最终的 R_step) ---
-    # (日志记录在 _calculate_A_step 内部)
-    _calculate_A_step(g_calc_steps)
+    # --- [GEM 修复] 阶段 9 & 10：分离优势计算 ---
+    # [GEM 修复] _calculate_A_step(g_calc_steps) 已删除
+    # [GEM 修复] 旧的 Phase 10 (A_final 循环) 已删除
+
+    # --- 9. Sec 5 & Sec 1: 局部分离的优势计算 ---
+    # 我们现在在 G_online 和 G_buffer 上分别调用新的辅助函数
     
-    # --- 10. Sec 1: A_final ---
-    ccapo_file_logger.info("--- [CCAPO] Phase 6: 计算 A_final (Advantage) ---")
-    for step in g_calc_steps:
-        a_traj = step.get('A_traj', 0.0)
-        a_step = step.get('A_step', 0.0)
-        omega = config.omega
-        step['advantages'] = a_traj + omega * a_step
-        ccapo_file_logger.debug(f"  [Adv] [Traj {step.get('traj_uid')}, t={step.get('step_index')}]: "
-                              f"A_final = A_traj({a_traj:.4f}) + omega({omega:.2f}) * A_step({a_step:.4f}) "
-                              f"==> {step['advantages']:.4f}")
+    omega = config.omega
+    
+    # 9.1 为 G_online 计算局部优势
+    _calculate_final_advantages_for_subset(g_online_steps, omega, "Online")
+    
+    # 9.2 为 G_buffer 计算局部优势
+    _calculate_final_advantages_for_subset(g_buffer_steps, omega, "Buffer")
+    
+    # --- [GEM 修复] 结束 ---
     
     ccapo_file_logger.info(f"================ [CCAPO V4] 优势计算完成 ================")
     
+    # g_calc_steps 列表现在已被原地修改
+    # G_online 和 G_buffer 中的步骤（它们是 g_calc_steps 的子集）
+    # 现在都有了它们各自的、局部标准化的 'advantages' 键
     return g_calc_steps, success_rate

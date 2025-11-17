@@ -731,12 +731,12 @@ class DataParallelPPOActor(BasePPOActor):
         # --- 结束记录 ---
 
 
-        # --- 5. PPO 循环 ---
+       # --- 5. PPO 循环 ---
         for epoch in range(self.config.ppo_epochs):
 
             self.actor_optimizer.zero_grad()
 
-            # --- START: 修正后的微批次和梯度累积逻辑 ---
+            # --- START: ✅ [Gem 修复] 动态权重逻辑 ---
 
             # 1. 确定微批次大小
             ppo_micro_batch_size_per_gpu = self.config.ppo_micro_batch_size_per_gpu
@@ -744,81 +744,60 @@ class DataParallelPPOActor(BasePPOActor):
                 logger.warning("[CCAPO] ppo_micro_batch_size_per_gpu 未设置, 默认为 1。")
                 ppo_micro_batch_size_per_gpu = 1
             
-            # (注意: 我们假设不使用 use_dynamic_bsz，因为您的配置中未启用)
-
-            # 2. 准备所有要处理的数据
-            batches_to_process = []
-            has_online = G_online_batch_final and G_online_batch_final.batch.batch_size[0] > 0
-            has_buffer = G_buffer_batch_final and G_buffer_batch_final.batch.batch_size[0] > 0
-
-            # --- START: [Bug修复] 解决 G_buffer 为空时的权重问题 ---
-            # online_weight = lambda_sr
-            # buffer_weight = 1.0 - lambda_sr
-
-            # if has_online and not has_buffer:
-            #     # 只有 Online 数据，权重必须为 1.0 (允许从失败中学习)
-            #     online_weight = 1.0
-            #     # buffer_weight 保持 (1.0 - lambda_sr)，但不会被使用
-            # elif not has_online and has_buffer:
-            #     # 只有 Buffer 数据，权重必须为 1.0
-            #     buffer_weight = 1.0
-            #     # online_weight 保持 lambda_sr，但不会被使用
-            # elif not has_online and not has_buffer:
-            #     # 没有数据，什么也不做 (在下面处理)
-            #     pass
-            # # else: (has_online and has_buffer)
-            #     # 两者都有，保持 lambda_sr 动态权重
-            #     # online_weight = lambda_sr
-            #     # buffer_weight = 1.0 - lambda_sr
-
-            # 1. 从配置中获取平滑因子和权重范围
-            # (你需要在你的 ccapo config 中定义它们)
-            smoothing_factor = ccapo_config.get("lambda_smoothing_factor", 0.05) # e.g., 0.05 代表慢速更新
-            min_weight = ccapo_config.get("buffer_min_weight", 0.2)       # 你建议的 0.2
-            max_weight = ccapo_config.get("buffer_max_weight", 0.8)       # 你建议的 0.8
-
+            # --- 1. [Gem 修复] 定义您期望的权重范围 ---
+            # 从 ccapo_config 读取，如果未定义则使用您建议的默认值
+            min_online_weight = ccapo_config.get("min_online_weight", 0.3)
+            max_online_weight = ccapo_config.get("max_online_weight", 0.7)
+            
+            # lambda_sr 是当前批次的在线成功率
+            # 我们使用平滑后的 SR (self.smoothed_lambda_sr) 来防止剧烈振荡
+            smoothing_factor = ccapo_config.get("lambda_smoothing_factor", 0.5)
+            
             # 2. 更新平滑的 lambda_sr (EMA)
             # lambda_sr 是 *当前批次* 的在线成功率
             self.smoothed_lambda_sr = (smoothing_factor * lambda_sr) + \
-                                    (1.0 - smoothing_factor) * self.smoothed_lambda_sr
-
-            # 3. 使用平滑后的 sr_for_weighting 来计算权重
+                                     (1.0 - smoothing_factor) * self.smoothed_lambda_sr
+            
             sr_for_weighting = self.smoothed_lambda_sr 
+            # sr_for_weighting = lambda_sr 
 
-            # 4. 线性插值 (Scaling):
-            # sr=0 -> buffer_weight=min_weight
-            # sr=1 -> buffer_weight=max_weight
-            buffer_weight = min_weight + (max_weight - min_weight) * sr_for_weighting
-            online_weight = 1.0 - buffer_weight # 自动在 [1-max_w, 1-min_w] (即 0.2-0.8) 
+            # 3. [Gem 修复] 实现您设想的 (0.4 -> 0.6) 缩放
+            # SR=0.0 -> online_weight = 0.4
+            # SR=1.0 -> online_weight = 0.6
+            online_weight = min_online_weight + (max_online_weight - min_online_weight) * sr_for_weighting
+            buffer_weight = 1.0 - online_weight
 
-            # 5. 记录平滑后的值，这非常重要！
+            # 4. 记录权重
             append_to_dict(metrics, {
-                "actor/lambda_sr_raw": lambda_sr, # 原始的、振荡的 sr
-                "actor/lambda_sr_smoothed": sr_for_weighting, # 平滑后的 sr
-                "actor/weight_online": online_weight,
-                "actor/weight_buffer": buffer_weight,
+                "actor/lambda_sr_raw": lambda_sr,
+                "actor/lambda_sr_smoothed": sr_for_weighting,
+                "actor/weight_online": online_weight, # [日志] 现在 SR 越高, 此值越高
+                "actor/weight_buffer": buffer_weight, # [日志] 现在 SR 越高, 此值越低
             })
 
-            # 6. 处理特殊情况 (例如 STDB 为空)
+            # 5. [Gem 修复] 处理特殊情况 (例如 STDB 为空)
             batches_to_process = []
             has_online = G_online_batch_final and G_online_batch_final.batch.batch_size[0] > 0
             has_buffer = G_buffer_batch_final and G_buffer_batch_final.batch.batch_size[0] > 0
 
             if has_online and not has_buffer:
-                # 方案一：STDB 为空，强制100%关注 online
+                # [关键] STDB 为空, 必须 100% 关注 online
                 online_weight = 1.0
                 buffer_weight = 0.0
+                append_to_dict(metrics, {"actor/weight_note": "STDB_empty_force_online_1.0"})
             elif not has_online and has_buffer:
-                # 方案二：G_online 为空 (不应发生)，强制100%关注 buffer
+                # (理论上不应发生, 但作为保护) G_online 为空, 100% 关注 buffer
                 online_weight = 0.0
                 buffer_weight = 1.0
+                append_to_dict(metrics, {"actor/weight_note": "Online_empty_force_buffer_1.0"})
             elif not has_online and not has_buffer:
                 # 没有数据，跳过
                 logger.warning("[CCAPO] G_online 和 G_buffer 均为空。跳过更新。")
                 pass
             # else: (has_online and has_buffer)
-                # 两者都有，使用上面计算的 [方案二] 平滑权重
+                # 两者都有, 使用上面计算的动态权重
                 # online_weight 和 buffer_weight 保持不变
+                append_to_dict(metrics, {"actor/weight_note": "Dynamic_weight_active"})
 
             if has_online:
                 batches_to_process.append(
@@ -829,25 +808,24 @@ class DataParallelPPOActor(BasePPOActor):
                 batches_to_process.append(
                     (G_buffer_batch_final, buffer_weight, "buffer")
                 )
-            # --- END: [Bug修复] ---
+            # --- END: [Gem 修复] ---
 
             if not batches_to_process:
                 logger.warning("[CCAPO] 没有数据可供更新。跳过此 epoch。")
                 continue
 
-            # 3. 计算总的梯度累积步数
+            # (保持不变) 
             total_micro_batches = sum(
-                (data_proto.batch.batch_size[0] + ppo_micro_batch_size_per_gpu - 1) // ppo_micro_batch_size_per_gpu # <-- 修正
-                for data_proto, _, _ in batches_to_process # <-- 修正
+                (data_proto.batch.batch_size[0] + ppo_micro_batch_size_per_gpu - 1) // ppo_micro_batch_size_per_gpu
+                for data_proto, _, _ in batches_to_process
             )
 
             if total_micro_batches == 0:
                 continue
 
-            total_loss_accumulator = 0.0 # 用于日志记录
+            total_loss_accumulator = 0.0
 
-            # 4. 循环处理 G_online 和 G_buffer
-            for data_proto, loss_weight, name in batches_to_process: # <-- 修正
+            for data_proto, loss_weight, name in batches_to_process:
                 
                 # 5. 将每个批次分割成微批次
                 
@@ -855,14 +833,14 @@ class DataParallelPPOActor(BasePPOActor):
                 num_micro_batches_for_this_batch = (data_proto.batch.batch_size[0] + ppo_micro_batch_size_per_gpu - 1) // ppo_micro_batch_size_per_gpu
                 if num_micro_batches_for_this_batch == 0:
                     continue
-                    
+                        
                 all_tensor_keys = list(data_proto.batch.keys())
                 all_non_tensor_keys = list(data_proto.non_tensor_batch.keys())
                 
                 micro_batches = data_proto.select(all_tensor_keys, all_non_tensor_keys).chunk(num_micro_batches_for_this_batch)
                 # --- 修正结束 ---
 
-                for micro_batch_proto in micro_batches: # <-- 修正: micro_batch_proto is a DataProto
+                for micro_batch_proto in micro_batches:
                     
                     # --- 修正: 转换为 dict 以支持 VLM ---
                     micro_batch_dict = {
@@ -872,23 +850,23 @@ class DataParallelPPOActor(BasePPOActor):
                     # --- 修正结束 ---
 
                     entropy, log_prob = self._forward_micro_batch(
-                        micro_batch=micro_batch_dict, # <-- 修正
+                        micro_batch=micro_batch_dict,
                         temperature=temperature,
                         calculate_entropy=(entropy_coeff != 0.0)
                     )
                     
-                    response_length = micro_batch_dict["responses"].size(1) # <-- 修正
+                    response_length = micro_batch_dict["responses"].size(1)
                     
-                    if multi_turn and "loss_mask" in micro_batch_dict: # <-- 修正
-                        response_mask = micro_batch_dict["loss_mask"][:, -response_length:] # <-- 修正
+                    if multi_turn and "loss_mask" in micro_batch_dict:
+                        response_mask = micro_batch_dict["loss_mask"][:, -response_length:]
                     else:
-                        response_mask = micro_batch_dict["attention_mask"][:, -response_length:] # <-- 修正
+                        response_mask = micro_batch_dict["attention_mask"][:, -response_length:]
 
                     pg_loss, pg_clipfrac, ppo_kl, pg_clipfrac_lower = compute_policy_loss(
-                        # --- ✅ [CCAPO V2] 修正：使用 'rollout_log_probs' (来自 STDB/Online) ---
-                        old_log_prob=micro_batch_dict["rollout_log_probs"], # <-- 修正
+                        # [注意] 这里仍然使用 'rollout_log_probs'
+                        old_log_prob=micro_batch_dict["rollout_log_probs"],
                         log_prob=log_prob,
-                        advantages=micro_batch_dict["advantages"], # <-- 修正
+                        advantages=micro_batch_dict["advantages"], # <-- [Gem 修复] 使用我们计算的最终优势
                         response_mask=response_mask,
                         cliprange=clip_ratio,
                         cliprange_low=clip_ratio_low,
@@ -901,18 +879,18 @@ class DataParallelPPOActor(BasePPOActor):
                     if entropy_coeff != 0.0 and entropy is not None:
                         entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=loss_agg_mode)
                         policy_loss = policy_loss - entropy_loss * entropy_coeff
-                        if epoch == 0: # 只记录一次
+                        if epoch == 0:
                             append_to_dict(metrics, {f"actor/entropy_loss_{name}": entropy_loss.detach().item()})
 
-                    # 6. 缩放损失：应用 CCAPO 权重 (lambda_sr) 和梯度累积缩放
+                    # 6. 缩放损失：应用 CCAPO 权重 (online_weight/buffer_weight) 和梯度累积缩放
                     scaled_loss = (loss_weight * policy_loss) / total_micro_batches
                     
-                    # 7. 反向传播（累积梯度）
+                    # 7. 反向传播
                     scaled_loss.backward()
 
-                    total_loss_accumulator += policy_loss.detach().item() * loss_weight # 记录未缩放的损失
+                    total_loss_accumulator += policy_loss.detach().item() * loss_weight
                     
-                    if epoch == 0: # 只在第一次 epoch 记录
+                    if epoch == 0:
                         append_to_dict(metrics, {
                             f"actor/pg_loss_{name}": pg_loss.detach().item(),
                             f"actor/pg_clipfrac_{name}": pg_clipfrac.detach().item(),
@@ -923,10 +901,10 @@ class DataParallelPPOActor(BasePPOActor):
             # 在处理完所有微批次（online 和 buffer）后，执行一次优化器步骤
             grad_norm = self._optimizer_step()
             
-            if epoch == 0: # 只在第一次 epoch 记录
+            if epoch == 0:
                 append_to_dict(metrics, {
-                    "actor/total_loss": total_loss_accumulator, # 记录总损失
-                    "actor/lambda_sr": lambda_sr,
+                    "actor/total_loss": total_loss_accumulator,
+                    # "actor/lambda_sr": lambda_sr, # 已在权重计算中记录
                     "actor/grad_norm": grad_norm.detach().item()
                 })
             
