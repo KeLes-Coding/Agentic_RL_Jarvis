@@ -654,7 +654,7 @@ class ActorRolloutRefWorker(Worker):
                 # 假设它在 self.config.algorithm.ccapo
                 ccapo_config = self.config.algorithm.ccapo
                 
-                metrics, trajs_for_stdb = self.actor.update_policy_ccapo(
+                metrics, trajs_for_stdb, debug_notes = self.actor.update_policy_ccapo(
                     G_online_batch=G_online_batch,
                     G_buffer_batch=G_buffer_batch,
                     embedding_model=self.embedding_model,
@@ -675,7 +675,12 @@ class ActorRolloutRefWorker(Worker):
             self.actor_lr_scheduler.step()
 
             # 5. 准备输出
-            output = DataProto(meta_info={"metrics": metrics, "online_trajs_for_stdb": trajs_for_stdb})
+            # [修复] 将 debug_notes 放在 metrics 旁边，而不是内部
+            output = DataProto(meta_info={
+                "metrics": metrics, 
+                "online_trajs_for_stdb": trajs_for_stdb,
+                "debug_notes": debug_notes # <-- 放在这里
+            })
             
             output = self.ulysses_sharding_manager.postprocess_data(data=output)
             output = output.to("cpu")

@@ -1,5 +1,8 @@
 # verl/workers/actor/dp_actor.py
 
+import json # <-- ✅ [V3 新增]
+import collections # <-- ✅ [V3 新增]
+from typing import List, Tuple, Dict, Union, Any # <-- ✅ [V3 新增]
 import itertools
 import logging
 import os
@@ -454,6 +457,97 @@ class DataParallelPPOActor(BasePPOActor):
                 append_to_dict(metrics, data)
         self.actor_optimizer.zero_grad()
         return metrics
+
+    # ======================= ✅ [V12 升级] 奖励回写方法 =======================
+    def save_reward_components_to_disk(self, steps_list: List[Dict[str, Any]]):
+        """
+        1. 将微观奖励 (R_step, etc.) 写回 step_details.json
+        2. 将宏观奖励 (R_tau, R_core, A_traj) 写回 summary.json (方便查看器快速索引)
+        """
+        if not self.config.get("save_reward_components", True):
+            return
+
+        logger.info(f"[Reward Write-Back] 开始回写奖励 (Steps & Summary)...")
+        
+        # 1. 按 log_dir_path 分组 (这就代表了一条完整的轨迹)
+        steps_by_traj = collections.defaultdict(list)
+        for step in steps_list:
+            if 'log_dir_path' in step:
+                log_dir_path = str(step['log_dir_path'])
+                steps_by_traj[log_dir_path].append(step)
+        
+        reward_keys_step = [
+            'R_step', 'A_step', 'advantages', 'A_final_raw',
+            'R_core_raw', 'R_match_raw', 'R_novelty_bonus', 'R_format_penalty', 
+            'Z_novelty', 'b_stage', 'TokenCost', 'Q_economy'
+        ]
+        
+        # 宏观键 (只需从第0步提取一次，存入 summary)
+        reward_keys_macro = ['R_tau', 'R_core', 'A_traj', 'traj_total_steps', 'traj_total_tokens']
+
+        updated_steps = 0
+        updated_summaries = 0
+
+        for log_dir_path, steps in steps_by_traj.items():
+            # --- A. 更新各个 Step 的 details ---
+            # (保持原有逻辑，略微优化)
+            first_step = steps[0] if steps else None
+            
+            for step in steps:
+                try:
+                    step_idx = int(step['step_index'].item()) if hasattr(step['step_index'], 'item') else int(step['step_index'])
+                    detail_path = os.path.join(log_dir_path, f"step_{step_idx}", "step_details.json")
+                    
+                    if os.path.exists(detail_path):
+                        # 读取
+                        with open(detail_path, 'r', encoding='utf-8') as f:
+                            data = json.load(f)
+                        
+                        # 更新
+                        if "reward_components" not in data: data["reward_components"] = {}
+                        
+                        for k in reward_keys_step + reward_keys_macro: # 将所有已知的键都放入组件
+                            if k in step:
+                                val = step[k]
+                                if hasattr(val, 'item'): val = val.item()
+                                data["reward_components"][k] = val
+                        
+                        # 写入
+                        with open(detail_path, 'w', encoding='utf-8') as f:
+                            json.dump(data, f, indent=4, ensure_ascii=False)
+                        updated_steps += 1
+                except Exception:
+                    pass # 忽略单个步骤的错误
+
+            # --- B. [V12 新增] 更新 summary.json ---
+            if first_step:
+                try:
+                    summary_path = os.path.join(log_dir_path, "summary.json")
+                    if os.path.exists(summary_path):
+                        with open(summary_path, 'r', encoding='utf-8') as f:
+                            summary_data = json.load(f)
+                        
+                        # 准备宏观数据
+                        if "rl_metrics" not in summary_data: summary_data["rl_metrics"] = {}
+                        
+                        has_macro_update = False
+                        for k in reward_keys_macro:
+                            if k in first_step:
+                                val = first_step[k]
+                                if hasattr(val, 'item'): val = val.item()
+                                summary_data["rl_metrics"][k] = val
+                                has_macro_update = True
+                        
+                        # 只有在确实有数据时才写入
+                        if has_macro_update:
+                            with open(summary_path, 'w', encoding='utf-8') as f:
+                                json.dump(summary_data, f, indent=4, ensure_ascii=False)
+                            updated_summaries += 1
+                except Exception as e:
+                    logger.warning(f"[Reward Write-Back] 更新 Summary 失败 ({log_dir_path}): {e}")
+
+        logger.info(f"[Reward Write-Back] 完成。Steps: {updated_steps}, Summaries: {updated_summaries}")
+    # ======================= 结束 =======================
     
     @GPUMemoryLogger(role="dp actor (CCAPO)", logger=logger)
     def update_policy_ccapo(self, G_online_batch: DataProto, G_buffer_batch: DataProto, embedding_model, ccapo_config: DictConfig):
@@ -490,6 +584,11 @@ class DataParallelPPOActor(BasePPOActor):
             ccapo_config
         )
         
+        # ======================= ✅ [V3 新增] 奖励回写调用 =======================
+        # 在数据仍然完整 (G_calc) 且在 Worker 上时，将其写回磁盘
+        self.save_reward_components_to_disk(g_calc_steps_with_adv)
+        # ======================= ✅ [V3 新增] 结束 =======================
+
         # --- 3. 重新组合为 DataProto (仍在 GPU 上) ---
         # 过滤出 G_online 并重新 collate
         # --- ✅ [CCAPO V3] 修正：从 g_calc_steps_with_adv (修改后的列表) 中过滤 ---
@@ -549,14 +648,14 @@ class DataParallelPPOActor(BasePPOActor):
         try:
             # --- START: 仪表盘丰富 ---
             # 1. 初始化所有 G_online 数据的收集器
-            online_step_rewards = []         # (微观) R_step
-            online_step_advantages = []      # (微观) A_step
-            online_step_token_costs = []     # (效率) step_token_usage
+            online_step_rewards = []        # (微观) R_step
+            online_step_advantages = []     # (微观) A_step
+            online_step_token_costs = []    # (效率) step_token_usage
             
-            online_traj_rewards = {}         # (宏观) R_tau (使用 traj_uid 去重)
-            online_traj_advantages = {}      # (宏观) A_traj (使用 traj_uid 去重)
-            online_traj_total_steps = {}     # (效率) traj_total_steps
-            online_traj_total_tokens = {}    # (效率) traj_total_tokens
+            online_traj_rewards = {}        # (宏观) R_tau (使用 traj_uid 去重)
+            online_traj_advantages = {}     # (宏观) A_traj (使用 traj_uid 去重)
+            online_traj_total_steps = {}    # (效率) traj_total_steps
+            online_traj_total_tokens = {}   # (效率) traj_total_tokens
             
             # (已存在) 原始信号收集器
             raw_core_values = []
@@ -767,12 +866,44 @@ class DataParallelPPOActor(BasePPOActor):
             online_weight = min_online_weight + (max_online_weight - min_online_weight) * sr_for_weighting
             buffer_weight = 1.0 - online_weight
 
-            # 4. 记录权重
+            # # 4. 记录权重
+            # append_to_dict(metrics, {
+            #     "actor/lambda_sr_raw": lambda_sr,
+            #     "actor/lambda_sr_smoothed": sr_for_weighting,
+            #     "actor/weight_online": online_weight, # [日志] 现在 SR 越高, 此值越高
+            #     "actor/weight_buffer": buffer_weight, # [日志] 现在 SR 越高, 此值越低
+            # })
+
+            # # 5. [Gem 修复] 处理特殊情况 (例如 STDB 为空)
+            # batches_to_process = []
+            # has_online = G_online_batch_final and G_online_batch_final.batch.batch_size[0] > 0
+            # has_buffer = G_buffer_batch_final and G_buffer_batch_final.batch.batch_size[0] > 0
+
+            # if has_online and not has_buffer:
+            #     # [关键] STDB 为空, 必须 100% 关注 online
+            #     online_weight = 1.0
+            #     buffer_weight = 0.0
+            #     append_to_dict(metrics, {"actor/weight_note": "STDB_empty_force_online_1.0"})
+            # elif not has_online and has_buffer:
+            #     # (理论上不应发生, 但作为保护) G_online 为空, 100% 关注 buffer
+            #     online_weight = 0.0
+            #     buffer_weight = 1.0
+            #     append_to_dict(metrics, {"actor/weight_note": "Online_empty_force_buffer_1.0"})
+            # elif not has_online and not has_buffer:
+            #     # 没有数据，跳过
+            #     logger.warning("[CCAPO] G_online 和 G_buffer 均为空。跳过更新。")
+            #     pass
+            # # else: (has_online and has_buffer)
+            #     # 两者都有, 使用上面计算的动态权重
+            #     # online_weight 和 buffer_weight 保持不变
+            #     append_to_dict(metrics, {"actor/weight_note": "Dynamic_weight_active"})
+            debug_notes = {} # <-- [修复] 创建一个单独的字典
+    
             append_to_dict(metrics, {
                 "actor/lambda_sr_raw": lambda_sr,
                 "actor/lambda_sr_smoothed": sr_for_weighting,
-                "actor/weight_online": online_weight, # [日志] 现在 SR 越高, 此值越高
-                "actor/weight_buffer": buffer_weight, # [日志] 现在 SR 越高, 此值越低
+                "actor/weight_online": online_weight, 
+                "actor/weight_buffer": buffer_weight,
             })
 
             # 5. [Gem 修复] 处理特殊情况 (例如 STDB 为空)
@@ -781,23 +912,18 @@ class DataParallelPPOActor(BasePPOActor):
             has_buffer = G_buffer_batch_final and G_buffer_batch_final.batch.batch_size[0] > 0
 
             if has_online and not has_buffer:
-                # [关键] STDB 为空, 必须 100% 关注 online
                 online_weight = 1.0
                 buffer_weight = 0.0
-                append_to_dict(metrics, {"actor/weight_note": "STDB_empty_force_online_1.0"})
+                debug_notes["actor/weight_note"] = "STDB_empty_force_online_1.0" # <-- [修复] 存入新字典
             elif not has_online and has_buffer:
-                # (理论上不应发生, 但作为保护) G_online 为空, 100% 关注 buffer
                 online_weight = 0.0
                 buffer_weight = 1.0
-                append_to_dict(metrics, {"actor/weight_note": "Online_empty_force_buffer_1.0"})
+                debug_notes["actor/weight_note"] = "Online_empty_force_buffer_1.0" # <-- [修复] 存入新字典
             elif not has_online and not has_buffer:
-                # 没有数据，跳过
                 logger.warning("[CCAPO] G_online 和 G_buffer 均为空。跳过更新。")
                 pass
-            # else: (has_online and has_buffer)
-                # 两者都有, 使用上面计算的动态权重
-                # online_weight 和 buffer_weight 保持不变
-                append_to_dict(metrics, {"actor/weight_note": "Dynamic_weight_active"})
+            else: # (has_online and has_buffer)
+                debug_notes["actor/weight_note"] = "Dynamic_weight_active" # <-- [修复] 存入新字典
 
             if has_online:
                 batches_to_process.append(
@@ -930,5 +1056,5 @@ class DataParallelPPOActor(BasePPOActor):
                 cpu_steps.append(cpu_step)
             cpu_trajs_for_stdb[traj_uid] = cpu_steps
 
-        return metrics, cpu_trajs_for_stdb
+        return metrics, cpu_trajs_for_stdb, debug_notes
     # --- 结束 CCAPO 方法 ---

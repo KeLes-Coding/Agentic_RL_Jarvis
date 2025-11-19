@@ -9,6 +9,7 @@ import re
 import openai
 import subprocess 
 from concurrent.futures import ThreadPoolExecutor, Future # <<< 新增：导入线程池
+import base64  # <<< ✅ 升级：新增导入 base64 >>>
 
 try:
     from PIL import Image
@@ -19,16 +20,48 @@ from .jarvis_v2.jarvis.modules.observer import Observer
 from .jarvis_v2.jarvis.modules.actuator import Actuator
 from .jarvis_v2.agent_manager import discover_devices
 
-def _evaluate_with_llm(summary: str, ground_truth: str, llm_config: Dict[str, Any]) -> bool:
+def _evaluate_with_llm(
+    summary: str, 
+    ground_truth: str, 
+    final_layout: str,              # <<< ✅ 升级：新增参数
+    final_image_bytes: bytes,       # <<< ✅ 升级：新增参数
+    llm_config: Dict[str, Any]
+) -> bool:
     """
     使用外部LLM评估任务摘要与参考答案。
+    <<< 升级：现在还会传入最终的截图和界面布局，以验证 summary 是否基于当前屏幕状态。>>>
     """
     # --- 增强健壮性：在调用API前检查输入 ---
     if not summary or not ground_truth:
         print("警告: LLM评估因为 summary 或 ground_truth 为空而被跳过。")
         return False
+    
+    # --- ✅ 升级：新增检查 final_layout 和 final_image_bytes ---
+    if not final_layout:
+        print("警告: LLM评估因为 final_layout (界面布局) 为空而被跳过。")
+        return False
+    if not final_image_bytes:
+        print("警告: LLM评估因为 final_image_bytes (最终截图) 为空而被跳过。")
+        return False
+    
     if not llm_config or not all(k in llm_config for k in ['key', 'url', 'model']):
         print("警告: LLM评估因为 llm_config 配置不完整而被跳过。")
+        return False
+
+    # --- ✅ 升级：将图像字节编码为 Base64 ---
+    try:
+        image_b64 = base64.b64encode(final_image_bytes).decode('utf-8')
+        
+        # 简单的 MIME 类型嗅探
+        if final_image_bytes.startswith(b'\x89PNG'):
+            image_mime_type = "image/png"
+        else:
+            image_mime_type = "image/jpeg" # 默认为 JPEG (因为压缩配置默认为 JPEG)
+        
+        image_url = f"data:{image_mime_type};base64,{image_b64}"
+        
+    except Exception as e:
+        print(f"LLM评估期间编码图像失败: {e}")
         return False
 
     try:
@@ -37,26 +70,66 @@ def _evaluate_with_llm(summary: str, ground_truth: str, llm_config: Dict[str, An
             base_url=llm_config.get('url'),
         )
 
-        prompt = f"""
-请根据提供的参考答案，评估以下任务摘要是否成功地完成了最初的提示。
-仅回答 "True" 或 "False"。
+        # --- ✅ 升级：构建新的多模态 Prompt ---
+        prompt_text = f"""
+请扮演一个严格的评估助手。你需要根据 "参考答案" 和 "最终屏幕截图/布局" 来评估 "任务摘要"。
 
-提示的参考答案: {ground_truth}
-任务摘要: {summary}
+评估标准 (必须同时满足):
+1.  **正确性**: "任务摘要" 必须与 "参考答案" 相符。
+2.  **一致性**: "任务摘要" 必须可以从 "最终屏幕截图/布局" 中得到印证。例如，如果摘要是 "价格是$50"，那么屏幕上必须显示$50。如果摘要是 "操作已完成"，屏幕必须显示成功的状态。
+
+请评估以下内容：
+
+[参考答案]
+{ground_truth}
+
+[任务摘要]
+{summary}
+
+[最终屏幕截图/布局]
+(请参考附加的截图和下面的文本布局)
+{final_layout}
+
+---
+评估结果：
+"任务摘要" 是否同时满足 **正确性** 和 **一致性**？
+请仅回答 "True" 或 "False"。
 """
+        # --- ✅ 升级：构建多模态 messages 列表 ---
+        messages = [
+            {"role": "system", "content": "你是一个评估任务完成情况的助手。你需要结合图像和文本信息来判断任务是否真正完成了。"},
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": prompt_text
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": image_url,
+                            "detail": "low" # 使用 "low" 以节省 token 和加快速度
+                        }
+                    }
+                ]
+            }
+        ]
 
         response = client.chat.completions.create(
-            model=llm_config['model'],
-            messages=[
-                {"role": "system", "content": "你是一个评估任务完成情况的助手。"},
-                {"role": "user", "content": prompt}
-            ],
+            model=llm_config['model'], # 确保这个模型 (例如 gpt-4o, qwen-vl-max) 支持 VLM
+            messages=messages,
             temperature=0,
+            max_tokens=10, # 只需要 True/False
         )
         content = response.choices[0].message.content.strip()
         return content.lower() == 'true'
     except Exception as e:
-        print(f"LLM评估期间出错: {e}")
+        # 检查是否是 OpenAI API 错误，提示用户模型可能不支持 VLM
+        if "vision" in str(e).lower() or "image" in str(e).lower():
+            print(f"LLM评估期间出错: {e}. (提示: 您配置的模型 '{llm_config['model']}' 可能不支持图像/视觉输入。)")
+        else:
+            print(f"LLM评估期间出错: {e}")
         return False
 
 
@@ -322,8 +395,14 @@ class JarvisMultiDeviceEnv:
 
         return {"image": obs_images, "text": obs_texts}, infos
 
-    # ======================= ✅ 新方法：封装 `finish` 动作的处理逻辑 ✅ =======================
-    def _handle_finish_action(self, action_str: str, serial: str) -> Tuple[float, bool]:
+    # ======================= ✅ 修改：_handle_finish_action 方法签名和调用 ✅ =======================
+    def _handle_finish_action(
+        self, 
+        action_str: str, 
+        serial: str, 
+        final_layout: str,              # <<< ✅ 升级：新增参数
+        final_image_bytes: bytes        # <<< ✅ 升级：新增参数
+    ) -> Tuple[float, bool]:
         """
         处理 finish 动作，包括解析、评估和奖励计算。
         返回 (奖励, 任务是否完成) 的元组。
@@ -364,12 +443,18 @@ class JarvisMultiDeviceEnv:
                 print(f"--- [设备: {serial}] 警告: 缺少 'llm_config'，无法进行LLM评估。奖励设为0。 ---")
                 return 0.0, False
 
-            # 5. 使用带重试机制的LLM评估
-            task_completed = _evaluate_with_llm(summary, ground_truth, self.llm_config)
+            # 5. --- ✅ 升级：使用带重试机制和 VLM 的 LLM 评估 ---
+            task_completed = _evaluate_with_llm(
+                summary, 
+                ground_truth, 
+                final_layout,          # <<< ✅ 升级：传入
+                final_image_bytes,     # <<< ✅ 升级：传入
+                self.llm_config
+            )
 
             # 6. 根据评估结果设置奖励
             reward = 1.0 if task_completed else 0.0
-            print(f"--- [设备: {serial}] 'finish' 动作评估完成。Summary: '{summary}'. 任务是否成功: {task_completed}, 奖励: {reward} ---")
+            print(f"--- [设备: {serial}] 'finish' 动作评估完成 (VLM)。Summary: '{summary}'. 任务是否成功: {task_completed}, 奖励: {reward} ---")
 
             return reward, task_completed
 
@@ -429,7 +514,7 @@ class JarvisMultiDeviceEnv:
         return feedback
     # ====================================================================================
 
-    # <<< 新增：用于并行 step 的辅助方法 >>>
+    # <<< ✅ 升级：修改 _step_device 方法以传递 VLM 所需信息 ✅ >>>
     def _step_device(self, serial: str, action_str: str) -> Tuple[np.ndarray, str, float, bool, Dict]:
         """
         (辅助函数) 在单独的线程中执行单个设备的 step。
@@ -456,7 +541,7 @@ class JarvisMultiDeviceEnv:
                 screenshots_bytes = [screenshots_bytes] if screenshots_bytes else []
 
             final_image_array = None
-            compressed_bytes_post_action = None
+            compressed_bytes_post_action = None # <<< ✅ 升级：这是 VLM 需要的截图
             if screenshots_bytes:
                 first_shot_bytes = screenshots_bytes[0]
                 compressed_bytes_post_action = self._compress_single_image(first_shot_bytes)
@@ -472,7 +557,7 @@ class JarvisMultiDeviceEnv:
 
             feedback_prefix = ""
 
-            # ======================= ✅ 修改：调用新的 feedback 生成方法 ✅ =======================
+            # ======================= (这部分 feedback 逻辑不变) =======================
             if action_str.startswith("format_error") or not action_success:
                 feedback_prefix = self._get_targeted_feedback(action_str, status)
             # ===============================================================================
@@ -487,7 +572,7 @@ class JarvisMultiDeviceEnv:
                 feedback_prefix += swipe_reminder
 
             image_placeholders = "<image>\n"
-            obs_text_content = post_action_obs_data.get("simplified_elements_str", "")
+            obs_text_content = post_action_obs_data.get("simplified_elements_str", "") # <<< ✅ 升级：这是 VLM 需要的布局
             final_obs_text = f"{feedback_prefix}{image_placeholders}{obs_text_content}"
 
             done = False
@@ -496,7 +581,13 @@ class JarvisMultiDeviceEnv:
 
             if action_str.startswith("finish"):
                 done = True
-                reward, task_completed = self._handle_finish_action(action_str, serial)
+                # --- ✅ 升级：传入 VLM 所需的参数 ---
+                reward, task_completed = self._handle_finish_action(
+                    action_str, 
+                    serial, 
+                    obs_text_content,                 # 传入
+                    compressed_bytes_post_action    # 传入
+                )
 
             elif not action_success:
                 # 动作失败的惩罚

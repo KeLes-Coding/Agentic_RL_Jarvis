@@ -219,7 +219,16 @@ class InfoPoolManager:
                     details["prompt_vector"] = "Error: Not serializable"
             # =====================================================================
 
+            # --- ✅ [V8 升级] 添加 log_dir_path 并为奖励组件创建占位符 ---
+            # 记录 log_dir_path 以便调试
+            details["log_dir_path"] = self.log_dir
             
+            # 为 dp_actor.py 稍后写回的奖励组件创建一个专用占位符
+            details["reward_components"] = {
+                "note": "Reward components will be populated here after calculation by dp_actor."
+            }
+            # --- 结束 [V8 升级] ---
+
             with open(os.path.join(step_dir, "step_details.json"), "w", encoding="utf-8") as f:
                 json.dump(details, f, indent=4, ensure_ascii=False)
 

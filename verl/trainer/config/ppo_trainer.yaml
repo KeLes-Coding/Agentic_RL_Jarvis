@@ -230,6 +230,8 @@ custom_reward_function:
   path: null
   name: compute_score
 
+save_reward_components: True
+
 algorithm:
   gamma: 1.0
   lam: 1.0
