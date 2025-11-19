@@ -458,95 +458,105 @@ class DataParallelPPOActor(BasePPOActor):
         self.actor_optimizer.zero_grad()
         return metrics
 
-    # ======================= ✅ [V12 升级] 奖励回写方法 =======================
+    # ======================= ✅ [V11 升级] 奖励回写 (含 summary.json 同步) =======================
     def save_reward_components_to_disk(self, steps_list: List[Dict[str, Any]]):
         """
-        1. 将微观奖励 (R_step, etc.) 写回 step_details.json
-        2. 将宏观奖励 (R_tau, R_core, A_traj) 写回 summary.json (方便查看器快速索引)
+        将内存中计算出的奖励分数写回到磁盘。
+        1. 更新 step_details.json (微观/组件)。
+        2. [V11 新增] 同步更新 summary.json (宏观)，以便 Viewer 快速扫描。
         """
         if not self.config.get("save_reward_components", True):
             return
 
-        logger.info(f"[Reward Write-Back] 开始回写奖励 (Steps & Summary)...")
+        logger.info(f"[Reward Write-Back] 开始回写 {len(steps_list)} 个步骤的奖励...")
         
-        # 1. 按 log_dir_path 分组 (这就代表了一条完整的轨迹)
+        # 1. 按 log_dir_path 分组
         steps_by_traj = collections.defaultdict(list)
         for step in steps_list:
-            if 'log_dir_path' in step:
+            if 'log_dir_path' in step and 'step_index' in step:
                 log_dir_path = str(step['log_dir_path'])
                 steps_by_traj[log_dir_path].append(step)
         
-        reward_keys_step = [
+        # 2. 定义要保存的键
+        # 宏观键 (同步到 summary.json)
+        macro_keys = ['R_tau', 'R_core', 'A_traj']
+        # 所有键 (保存到 step_details.json)
+        reward_keys_to_save = macro_keys + [
             'R_step', 'A_step', 'advantages', 'A_final_raw',
-            'R_core_raw', 'R_match_raw', 'R_novelty_bonus', 'R_format_penalty', 
-            'Z_novelty', 'b_stage', 'TokenCost', 'Q_economy'
+            'R_core_raw', 'R_match_raw', 'R_novelty_bonus', 'R_format_penalty',
+            'Z_novelty', 'b_stage', 
+            'TokenCost', 'Q_economy',
+            # [新增] 详细参数
+            'S_necessity', 'S_utility', 'I_action', 'Q_step'
         ]
+
+        updated_count = 0
         
-        # 宏观键 (只需从第0步提取一次，存入 summary)
-        reward_keys_macro = ['R_tau', 'R_core', 'A_traj', 'traj_total_steps', 'traj_total_tokens']
-
-        updated_steps = 0
-        updated_summaries = 0
-
         for log_dir_path, steps in steps_by_traj.items():
-            # --- A. 更新各个 Step 的 details ---
-            # (保持原有逻辑，略微优化)
-            first_step = steps[0] if steps else None
+            # 标志位：是否已处理过该轨迹的 summary (避免重复 IO)
+            summary_updated = False 
             
             for step in steps:
                 try:
-                    step_idx = int(step['step_index'].item()) if hasattr(step['step_index'], 'item') else int(step['step_index'])
-                    detail_path = os.path.join(log_dir_path, f"step_{step_idx}", "step_details.json")
+                    step_index_val = step['step_index']
+                    step_index = step_index_val.item() if hasattr(step_index_val, 'item') else int(step_index_val)
                     
-                    if os.path.exists(detail_path):
-                        # 读取
-                        with open(detail_path, 'r', encoding='utf-8') as f:
-                            data = json.load(f)
-                        
-                        # 更新
-                        if "reward_components" not in data: data["reward_components"] = {}
-                        
-                        for k in reward_keys_step + reward_keys_macro: # 将所有已知的键都放入组件
-                            if k in step:
-                                val = step[k]
+                    # --- A. 更新 step_details.json ---
+                    step_detail_path = os.path.join(log_dir_path, f"step_{step_index}", "step_details.json")
+                    
+                    if os.path.exists(step_detail_path):
+                        # 准备 payload
+                        reward_payload = {}
+                        for key in reward_keys_to_save:
+                            if key in step:
+                                val = step[key]
                                 if hasattr(val, 'item'): val = val.item()
-                                data["reward_components"][k] = val
+                                if hasattr(val, 'dtype'): val = float(val)
+                                reward_payload[key] = val
                         
-                        # 写入
-                        with open(detail_path, 'w', encoding='utf-8') as f:
-                            json.dump(data, f, indent=4, ensure_ascii=False)
-                        updated_steps += 1
-                except Exception:
-                    pass # 忽略单个步骤的错误
+                        # 读取 -> 更新 -> 写入
+                        with open(step_detail_path, 'r', encoding='utf-8') as f:
+                            s_data = json.load(f)
+                        
+                        if "reward_components" not in s_data:
+                            s_data["reward_components"] = {}
+                        s_data["reward_components"].update(reward_payload)
+                        s_data["reward_components"]["note"] = "Populated by dp_actor (V11)"
 
-            # --- B. [V12 新增] 更新 summary.json ---
-            if first_step:
-                try:
-                    summary_path = os.path.join(log_dir_path, "summary.json")
-                    if os.path.exists(summary_path):
-                        with open(summary_path, 'r', encoding='utf-8') as f:
-                            summary_data = json.load(f)
+                        with open(step_detail_path, 'w', encoding='utf-8') as f:
+                            json.dump(s_data, f, indent=4, ensure_ascii=False)
                         
-                        # 准备宏观数据
-                        if "rl_metrics" not in summary_data: summary_data["rl_metrics"] = {}
-                        
-                        has_macro_update = False
-                        for k in reward_keys_macro:
-                            if k in first_step:
-                                val = first_step[k]
-                                if hasattr(val, 'item'): val = val.item()
-                                summary_data["rl_metrics"][k] = val
-                                has_macro_update = True
-                        
-                        # 只有在确实有数据时才写入
-                        if has_macro_update:
-                            with open(summary_path, 'w', encoding='utf-8') as f:
-                                json.dump(summary_data, f, indent=4, ensure_ascii=False)
-                            updated_summaries += 1
+                        updated_count += 1
+
+                        # --- B. [V11 新增] 更新 summary.json (仅需做一次，且通常在 Step 0 有宏观数据) ---
+                        if not summary_updated and step_index == 0:
+                            summary_path = os.path.join(log_dir_path, "summary.json")
+                            if os.path.exists(summary_path):
+                                # 提取宏观数据
+                                macro_payload = {}
+                                for k in macro_keys:
+                                    if k in reward_payload:
+                                        macro_payload[k] = reward_payload[k]
+                                
+                                if macro_payload:
+                                    with open(summary_path, 'r', encoding='utf-8') as f:
+                                        sum_data = json.load(f)
+                                    
+                                    # 将宏观分数写入 summary 的根层级或专用字段
+                                    if "reward_summary" not in sum_data:
+                                        sum_data["reward_summary"] = {}
+                                    sum_data["reward_summary"].update(macro_payload)
+                                    
+                                    with open(summary_path, 'w', encoding='utf-8') as f:
+                                        json.dump(sum_data, f, indent=4, ensure_ascii=False)
+                                    
+                                    summary_updated = True
+
                 except Exception as e:
-                    logger.warning(f"[Reward Write-Back] 更新 Summary 失败 ({log_dir_path}): {e}")
+                    logger.warning(f"[Write-Back] 更新失败 (Traj: {log_dir_path}, Step: {step_index}): {e}")
 
-        logger.info(f"[Reward Write-Back] 完成。Steps: {updated_steps}, Summaries: {updated_summaries}")
+        if updated_count > 0:
+             logger.info(f"[Reward Write-Back] 完成。更新了 {updated_count} 个步骤文件。")
     # ======================= 结束 =======================
     
     @GPUMemoryLogger(role="dp actor (CCAPO)", logger=logger)
