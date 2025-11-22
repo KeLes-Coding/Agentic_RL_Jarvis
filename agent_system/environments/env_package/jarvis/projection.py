@@ -37,6 +37,14 @@ def jarvis_projection(text_actions: List[str]) -> Tuple[List[str], np.ndarray, L
             thought = data.get("thought", "Missing 'thought' key in JSON.")
             action = data.get("action", "format_error(reason='Missing action key in JSON')")
             
+            # --- ✅ 新增：类型健壮性检查 (解决 AttributeError) ✅ ---
+            # 如果 action 存在但不是字符串（例如 LLM 返回了 {"action": {...}}），强制转为错误信息
+            # 这一步防止了后续调用 .startswith() 时发生崩溃
+            if action is not None and not isinstance(action, str):
+                # 将非字符串的 action 内容转为字符串以便 debug，并标记为格式错误
+                action = f"format_error(reason='Invalid action type: expected str but got {type(action).__name__}. Content: {str(action)}')"
+            # --- ✅ 新增结束 ✅ ---
+
             # 如果 thought 或 action 为空，也视为一种格式错误
             if not thought or not action:
                  action = f"format_error(reason='Empty thought or action value in JSON')"

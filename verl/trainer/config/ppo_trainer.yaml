@@ -271,6 +271,11 @@ algorithm:
     w_match: 1.0                # R_match (失败轨迹) 权重
     similarity_threshold: 0.9   # R_match 余弦相似度阈值
 
+    # [新增] Action Granularity Control
+    # False: 使用模糊类型 (如 "click"), 泛化性强但可能有歧义
+    # True: 使用具体动作 (如 "click(uid=123)"), 消除歧义但初期数据稀疏
+    use_fine_grained_action: True
+
     # R_format_novelty (Sec 5.3)
     w_N: 0.1                    # R_format_novelty 的权重
     base_bonus: 0.1             # R_format_novelty 的基础奖励
