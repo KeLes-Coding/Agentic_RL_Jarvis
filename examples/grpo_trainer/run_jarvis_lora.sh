@@ -30,7 +30,7 @@ echo "设置完成。"
 # 这将确保每个训练批次只包含一个任务
 train_data_size=1
 val_data_size=4
-group_size=4
+group_size=8
 
 # We only use data preparation to indicate the modality and the data size.
 # python3 -m examples.data_preprocess.prepare \
@@ -41,7 +41,7 @@ group_size=4
 echo "开始执行训练任务..."
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=ccapo \
-    data.train_files=/home/zzh/Workspace/verl-agent/data/atomic_tasks_list_wiki_test_train.parquet \
+    data.train_files=/home/zzh/Workspace/verl-agent/data/atomic_tasks_list_wiki_same_test_train.parquet \
     data.val_files=/home/zzh/Workspace/verl-agent/data/atomic_tasks_list_wiki_val.parquet \
     data.train_batch_size=$train_data_size \
     data.val_batch_size=$val_data_size \
@@ -88,8 +88,8 @@ python3 -m verl.trainer.main_ppo \
     trainer.n_gpus_per_node=2 \
     trainer.nnodes=1 \
     trainer.save_freq=5 \
-    trainer.test_freq=10 \
-    trainer.total_epochs=10 \
+    trainer.test_freq=100 \
+    trainer.total_epochs=20 \
     trainer.val_before_train=False \
     actor_rollout_ref.model.lora_rank=32 \
     actor_rollout_ref.model.lora_alpha=64 \

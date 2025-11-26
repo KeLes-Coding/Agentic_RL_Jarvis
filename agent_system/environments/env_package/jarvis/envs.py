@@ -76,7 +76,7 @@ def _evaluate_with_llm(
 
 评估标准 (必须同时满足):
 1.  **正确性**: "任务摘要" 必须与 "参考答案" 相符。
-2.  **一致性**: "任务摘要" 必须可以从 "最终屏幕截图/布局" 中得到印证。例如，如果摘要是 "价格是$50"，那么屏幕上必须显示$50。如果摘要是 "操作已完成"，屏幕必须显示成功的状态。
+2.  **一致性**: "任务摘要" 必须可以从 最终屏幕截图或者是界面布局 中得到印证。例如，如果摘要是 "价格是$50"，那么屏幕或者是界面布局上必须显示$50。如果摘要是 "操作已完成"，屏幕或者是界面布局必须显示成功的状态。
 
 请评估以下内容：
 
@@ -668,63 +668,98 @@ class JarvisMultiDeviceEnv:
         return observations, np.array(rewards, dtype=np.float32), np.array(dones, dtype=bool), infos
 
     def _dispatch_action(self, actuator: Actuator, serial: str, action_str: str, elements: list) -> str:
-        print(f"--- [设备: {serial}] 正在分发动作: '{action_str}' ---")
+        # print(f"--- [设备: {serial}] 正在分发动作: '{action_str}' ---") # 训练时可以注释掉减少日志
         try:
+            # 1. 优先处理来自上游的格式错误标记
             if action_str.startswith("format_error"):
                 return f"FORMAT_ERROR: {action_str.split('reason=')[1][:-1]}"
 
-            original_action_name = action_str.split("(")[0].strip()
-            action_name = original_action_name
+            # 2. 基础解析：分离 动作名 和 参数
+            # 严格假设格式为 "action_name(params)" 或 "action_name"
+            if "(" in action_str:
+                action_name = action_str.split("(")[0].strip()
+                # 提取括号内的内容，不进行复杂的正则匹配，只取两头
+                params_str = action_str[len(action_name) + 1 :].strip().rstrip(")")
+            else:
+                action_name = action_str.strip()
+                params_str = ""
 
+            # 3. 特殊动作处理
             if action_name == "finish":
                 return "SUCCESS"
-            if action_name == "click":
-                action_name = "tap"
-
-            params_str = action_str[len(original_action_name) + 1 : -1] if "(" in action_str else ""
-
+            
+            # 检查是否需要元素列表
             if action_name in ["tap", "input_text", "drag", "clear_text"] and not elements:
                 return "FAILURE_NO_ELEMENTS"
 
-            def extract_uid(param_part):
-                numbers = re.findall(r'\d+', param_part)
-                if not numbers:
-                    raise ValueError(f"Cannot find a valid integer UID in parameter '{param_part}'")
-                return int(numbers[0])
-
+            # 4. 动作分发 (Strict Mode)
+            result = False
+            
             if action_name == "tap":
-                result = actuator.tap(extract_uid(params_str), elements)
+                # [RL Strict] 直接转换为 int，如果包含非数字字符(如 tap(id=12))将抛出 ValueError
+                uid = int(params_str.strip())
+                result = actuator.tap(uid, elements)
+
             elif action_name == "input_text":
+                # [RL Strict] 严格要求用逗号分隔: uid, text
+                if "," not in params_str:
+                    raise ValueError("input_text requires 2 arguments: uid, text")
                 uid_part, text_part = params_str.split(",", 1)
-                text = text_part.strip()
-                if text.startswith("text="):
-                    text = text[len("text="):]
-                text = text.strip("'\"")
-                result = actuator.input_text(extract_uid(uid_part), text, elements)
+                
+                uid = int(uid_part.strip())
+                # 只去除首尾的引号，不处理 text= 前缀
+                text = text_part.strip().strip("'\"") 
+                result = actuator.input_text(uid, text, elements)
+
             elif action_name == "swipe":
+                if "," not in params_str:
+                     raise ValueError("swipe requires 2 arguments: direction, magnitude")
                 direction_part, magnitude_part = params_str.split(",", 1)
+                
                 direction = direction_part.strip().strip("'\"")
                 magnitude = magnitude_part.strip().strip("'\"")
                 result = actuator.swipe(direction, magnitude)
+
             elif action_name == "drag":
+                if "," not in params_str:
+                     raise ValueError("drag requires 2 arguments: start_uid, end_uid")
                 start_part, end_part = params_str.split(",", 1)
-                result = actuator.drag(extract_uid(start_part), extract_uid(end_part), elements)
+                
+                # [RL Strict] 两个参数都必须直接是整数
+                result = actuator.drag(int(start_part.strip()), int(end_part.strip()), elements)
+
             elif action_name == "clear_text":
-                result = actuator.clear_text(extract_uid(params_str), elements)
+                uid = int(params_str.strip())
+                result = actuator.clear_text(uid, elements)
+
             elif action_name == "enter":
                 result = actuator.enter()
+
             elif action_name == "back":
                 result = actuator.back()
+
             elif action_name == "home":
                 result = actuator.home()
+
             elif action_name == "wait":
-                result = actuator.wait(float(params_str))
+                # 保持对浮点数的支持
+                result = actuator.wait(float(params_str.strip()))
+
             else:
+                print(f"--- [设备: {serial}] 警告: 未知动作 '{action_name}' ---")
                 return f"UNKNOWN_ACTION: '{action_name}' is not a valid action."
 
             status = "SUCCESS" if result else "FAILURE"
             print(f"--- [设备: {serial}] 动作 '{action_name}' 执行状态: {status} ---")
             return status
+
+        except ValueError as e:
+            # 捕获 int转换失败、解包失败等 Python 基础错误
+            # 这会将错误信息反馈给 RL，使其学习到格式错误
+            error_message = f"ARGUMENT_ERROR: {str(e)}. Check your action format."
+            print(f"--- [设备: {serial}] 参数解析错误: {error_message} (Action: {action_str}) ---")
+            return error_message
+            
         except Exception as e:
             error_message = f"EXECUTION_ERROR: {repr(e)}"
             print(f"--- [设备: {serial}] 动作 '{action_str}' 执行时出错: {error_message} ---")

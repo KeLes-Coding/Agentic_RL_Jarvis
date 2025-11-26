@@ -269,7 +269,7 @@ algorithm:
     w_in: 0.02                  # Q_economy input token 权重
     alpha_step: 0.2             # Q_step 权重
     w_match: 1.0                # R_match (失败轨迹) 权重
-    similarity_threshold: 0.9   # R_match 余弦相似度阈值
+    similarity_threshold: 0.8   # R_match 余弦相似度阈值
 
     # [新增] Action Granularity Control
     # False: 使用模糊类型 (如 "click"), 泛化性强但可能有歧义
@@ -277,10 +277,10 @@ algorithm:
     use_fine_grained_action: True
 
     # R_format_novelty (Sec 5.3)
-    w_N: 0.1                    # R_format_novelty 的权重
-    base_bonus: 0.1             # R_format_novelty 的基础奖励
-    penalty_format_error: -1.0  # JSON 格式错误的惩罚
-    penalty_failure: -0.5       # 动作执行失败 (非 JSON 错误) 的惩罚
+    w_N: 0.2                    # R_format_novelty 的权重
+    base_bonus: 0.2             # R_format_novelty 的基础奖励
+    penalty_format_error: -2.0  # JSON 格式错误的惩罚
+    penalty_failure: -1.0       # 动作执行失败 (非 JSON 错误) 的惩罚
     
     # A_final (Sec 1)
     omega: 1.0                  # 微观优势 A_step 的权重

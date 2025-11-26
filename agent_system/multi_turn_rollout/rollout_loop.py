@@ -482,68 +482,145 @@ class TrajectoryCollector:
             ) -> DataProto:
         """
         为物理设备环境优化的轨迹收集循环。
+        支持自动分批 (Chunking) 和强制类型解码。
         """
-        self.file_logger.info(f"--- [vanilla_multi_turn_loop] 开始 (Batch size: {len(gen_batch)}) ---")
-        
-        # ======================= ✅ 1. 准备并传递任务信息给 reset 方法 ✅ =======================
+        # 1. 获取当前物理环境的实际数量
+        if hasattr(envs, "__len__"):
+            num_envs = len(envs)
+        elif hasattr(envs, "num_envs"):
+            num_envs = envs.num_envs
+        else:
+            num_envs = 99999 
+
+        input_batch_size = len(gen_batch)
+        self.file_logger.info(f"--- [vanilla_multi_turn_loop] 开始 (Input Batch: {input_batch_size}, Available Envs: {num_envs}) ---")
+
+        # ======================= ✅ 自动分批处理 (Chunking) =======================
+        if input_batch_size > num_envs:
+            self.file_logger.info(f"[自动分批] 输入 batch ({input_batch_size}) 超过环境数 ({num_envs})。正在切分执行...")
+            
+            total_batch_list = []
+            total_infos = []
+            total_rewards = []
+            total_lengths = []
+            total_success_list = []
+            total_uids = []
+
+            import math
+            num_chunks = math.ceil(input_batch_size / num_envs)
+
+            for i in range(num_chunks):
+                start_idx = i * num_envs
+                end_idx = min((i + 1) * num_envs, input_batch_size)
+                
+                self.file_logger.info(f"--- 执行分批 Chunk {i+1}/{num_chunks} (索引 {start_idx} - {end_idx}) ---")
+                
+                sub_gen_batch = gen_batch[start_idx:end_idx]
+                
+                res = self.vanilla_multi_turn_loop(
+                    gen_batch=sub_gen_batch,
+                    actor_rollout_wg=actor_rollout_wg,
+                    envs=envs
+                )
+                
+                total_batch_list.extend(res[0])
+                total_infos.extend(res[1])
+                total_rewards.append(res[2])
+                total_lengths.append(res[3])
+                total_success_list.append(res[4])
+                total_uids.append(res[5])
+
+            merged_rewards = np.concatenate(total_rewards, axis=0)
+            merged_lengths = np.concatenate(total_lengths, axis=0)
+            merged_uids = np.concatenate(total_uids, axis=0)
+            
+            merged_success = {}
+            if total_success_list:
+                for key in total_success_list[0].keys():
+                    merged_success[key] = np.concatenate([s[key] for s in total_success_list], axis=0)
+
+            self.file_logger.info(f"--- [vanilla_multi_turn_loop] 所有分批执行完毕。合并后总数: {len(total_batch_list)} ---")
+            return total_batch_list, total_infos, merged_rewards, merged_lengths, merged_success, merged_uids
+        # ======================= 分批逻辑结束 =======================
+
+        # ======================= ✅ 1. 准备并传递任务信息给 reset 方法 =======================
         tasks_for_this_batch = []
         try:
-            # 确保 gen_batch.non_tensor_batch 及其键存在
             if (hasattr(gen_batch, 'non_tensor_batch') and gen_batch.non_tensor_batch and 
                 'ground_truth_answer' in gen_batch.non_tensor_batch and 
-                'prompt_index' in gen_batch.non_tensor_batch): # <-- ✅ 检查 prompt_index
+                'prompt_index' in gen_batch.non_tensor_batch):
                 
                 raw_prompts = gen_batch.non_tensor_batch['raw_prompt']
-                tasks_list = [item[0]['content'] for item in raw_prompts]
                 ground_truth_answers = gen_batch.non_tensor_batch['ground_truth_answer']
-                
-                # --- ✅ [STDB 修复] 提取 prompt_index 和 prompt_vector ---
                 prompt_index_list = gen_batch.non_tensor_batch['prompt_index']
                 prompt_vector_tensor = gen_batch.batch.get('prompt_vector')
                 
                 if prompt_vector_tensor is None:
                     self.file_logger.error("!!! [vanilla_multi_turn_loop] 'prompt_vector' is missing from gen_batch.batch! STDB will fail. !!!")
                 
+                # ======================= ✅ [关键修复] 健壮的任务提取与解码逻辑 =======================
                 for i in range(len(gen_batch)):
-                    # 为每个环境创建一个包含任务描述和参考答案的字典
+                    item = raw_prompts[i]
+                    task_content = ""
+                    
+                    # 情况A: Item 是 Chat List (列表或对象数组)
+                    if isinstance(item, list) and len(item) > 0 and isinstance(item[0], dict) and 'content' in item[0]:
+                        task_content = item[0]['content']
+                    # 情况B: Item 是 Numpy 封装的 List
+                    elif isinstance(item, np.ndarray) and item.size == 1 and isinstance(item.item(), list):
+                         inner_list = item.item()
+                         if len(inner_list) > 0 and 'content' in inner_list[0]:
+                             task_content = inner_list[0]['content']
+                    # 情况C: Item 直接是字符串或字节
+                    else:
+                        task_content = item
+
+                    # 🚨 [核心修复]: 强制解码 bytes -> str
+                    if isinstance(task_content, (bytes, np.bytes_)):
+                        try:
+                            task_content = task_content.decode('utf-8')
+                        except Exception as e:
+                            self.file_logger.error(f"解码任务内容失败: {e}")
+                            task_content = str(task_content) # 降级处理
+                    
+                    # 确保是字符串
+                    task_content = str(task_content)
+
+                    # 构建任务数据
                     task_data = {
-                        "task": tasks_list[i],
+                        "task": task_content,
                         "ground_truth_answer": ground_truth_answers[i],
-                        "prompt_index": prompt_index_list[i], # <-- ✅ [STDB 修复]
+                        "prompt_index": prompt_index_list[i],
                     }
                     
                     if prompt_vector_tensor is not None:
-                         task_data["prompt_vector"] = prompt_vector_tensor[i] # <-- ✅ [STDB 修复]
+                         task_data["prompt_vector"] = prompt_vector_tensor[i]
                     
                     tasks_for_this_batch.append(task_data)
+                # =================================================================================
 
                 print("--- [rollout_loop.py] 已成功准备任务、答案、prompt_index 和 prompt_vector 用于环境重置。 ---")
                 self.file_logger.info(f"已准备 {len(tasks_for_this_batch)} 个任务 (含 STDB 索引) 用于环境重置。")
             else:
-                print("警告: 在 gen_batch 中未找到 'ground_truth_answer', 'raw_prompt' 或 'prompt_index'。环境将以无任务信息的方式重置。")
-                self.file_logger.warning(f"在 gen_batch 中未找到 'ground_truth_answer', 'raw_prompt' 或 'prompt_index' (non_tensor_batch keys: {list(gen_batch.non_tensor_batch.keys())})。STDB 将失败。")
+                self.file_logger.warning(f"在 gen_batch 中未找到必要的 key。STDB 将失败。")
                 tasks_for_this_batch = [{} for _ in range(len(gen_batch))]
 
-        except (KeyError, IndexError, TypeError) as e:
+        except Exception as e:
+            import traceback
             print(f"严重警告: 准备任务信息时出错: {e}")
-            self.file_logger.error(f"准备任务信息时出错: {e}")
-            # 如果出错，创建一个空列表以避免崩溃
+            self.file_logger.error(f"准备任务信息时出错: {e}\n{traceback.format_exc()}")
             tasks_for_this_batch = [{} for _ in range(len(gen_batch))]
         
-        # 这个修改假设 envs (EnvironmentManager) 的 reset 方法已被更新，
-        # 可以接收 tasks 列表，并在内部处理日志初始化、prompt构建和底层环境的重置。
-        # 并且, envs.py 内部会把 "prompt_index" 和 "prompt_vector" 存储起来，
-        # 并在每次调用 record_step 时自动附加它们。
+        # 重置环境
         obs, infos = envs.reset(tasks=tasks_for_this_batch)
         # ====================================================================================
 
         lenght_obs = len(obs['text']) if obs['text'] is not None else len(obs['image'])
-
-        # 对于物理环境，我们期望批次大小与环境数直接匹配。
-        # 不再使用 gen_batch.repeat()，因为它适用于可无限实例化的模拟环境。
-        assert len(gen_batch.batch) == lenght_obs, \
-            f"对于物理设备环境，初始数据批次大小 ({len(gen_batch.batch)}) 必须与检测到的设备数 ({lenght_obs}) 完全匹配。" \
-            "请检查你的 data.train_batch_size 和 data.val_batch_size 配置。"
+        effective_batch_size = min(len(gen_batch.batch['input_ids']), lenght_obs)
+        
+        if effective_batch_size < len(gen_batch.batch['input_ids']):
+             self.file_logger.warning(f"注意：Env 返回的 obs ({lenght_obs}) 少于输入的 batch ({len(gen_batch)})。将截断 batch。")
+             gen_batch = gen_batch[:effective_batch_size]
 
         batch_size = len(gen_batch.batch['input_ids'])
         batch_output = None
@@ -567,12 +644,9 @@ class TrajectoryCollector:
         episode_rewards = np.zeros(batch_size, dtype=np.float32)
 
         # 记录 reset 这一步（作为 step 0）
-        # 注意：这里的 'task' 依赖于 envs 对象正确地存储了任务信息
         if hasattr(envs, 'info_pool_managers') and hasattr(envs, 'tasks'):
             for i in range(len(infos)):
                 if i in envs.info_pool_managers:
-                    # ✅ [STDB 修复] 确保在 record_step 时传递了 reset 期间设置的 infos
-                    # (假设 envs.reset 已经将 prompt_index/vector 放入了 infos[i])
                     step_data = {
                         "task": envs.tasks[i],
                         "thought": "Episode started.",
@@ -584,9 +658,6 @@ class TrajectoryCollector:
                         "raw_llm_response": "N/A"
                     }
                     
-                    # ✅ [STDB 修复] 
-                    # 显式地将 reset 时应该知道的信息（来自 tasks_for_this_batch）
-                    # 传递给 info_pool。这是必要的，因为 envs.py 我们无法修改。
                     if i < len(tasks_for_this_batch):
                         step_data["prompt_index"] = tasks_for_this_batch[i].get("prompt_index")
                         step_data["prompt_vector"] = tasks_for_this_batch[i].get("prompt_vector")
@@ -606,8 +677,6 @@ class TrajectoryCollector:
             print("="*50 + "\n")
 
             batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
-            # --- ✅ 新增: 从将要 pop 的 keys 中移除 'ground_truth_answer'，确保它保留在 batch 中 ---
-            # --- ✅ [STDB 修复] 也不 pop 'prompt_index' 或 'prompt_vector' ---
             non_tensor_batch_keys_to_pop = ["raw_prompt_ids"]
             if "multi_modal_data" in batch.non_tensor_batch:
                 non_tensor_batch_keys_to_pop.append("multi_modal_data")
@@ -616,11 +685,7 @@ class TrajectoryCollector:
             if "tools_kwargs" in batch.non_tensor_batch:
                 non_tensor_batch_keys_to_pop.append("tools_kwargs")
             
-            # ======================= ✅ 日志：检查 pop 前的 gen_batch 键 =======================
             self.file_logger.info(f"[vanilla_multi_turn_loop] Step {_step+1}: 准备 pop batch。")
-            self.file_logger.info(f"  - batch.batch keys (pop 前): {list(batch.batch.keys())}")
-            self.file_logger.info(f"  - batch.non_tensor_batch keys (pop 前): {list(batch.non_tensor_batch.keys())}")
-            # =========================================================================
 
             batch_input = batch.pop(
                 batch_keys=batch_keys_to_pop,
@@ -641,7 +706,7 @@ class TrajectoryCollector:
                 print(f"  [环境 {i}]: {response}")
             print("*"*50 + "\n")
 
-            # ======================= ✅ [CCAPO] 计算并暂存 Token、置信度、对数概率 ✅ =======================
+            # ======================= ✅ [CCAPO] 计算并暂存 Token、置信度、对数概率 =======================
             try:
                 # 1. 计算 Token
                 input_token_counts = torch.sum(batch_input.batch["attention_mask"], dim=1)
@@ -650,31 +715,20 @@ class TrajectoryCollector:
 
                 # 2. 计算置信度
                 log_probs = batch.batch['rollout_log_probs']
-                # 注意：这里的 mask 需要精确对应 `log_probs` 张量的形状
                 response_mask = batch.batch["attention_mask"][:, -log_probs.shape[1]:]
                 
-                # 屏蔽掉 padding token 的 log_probs
                 masked_log_probs = log_probs * response_mask
-                # 对每个样本的有效 log_probs 求和
                 sum_of_log_probs = torch.sum(masked_log_probs, dim=1)
-                # 计算每个样本的有效 token 数量
                 num_of_tokens = torch.sum(response_mask, dim=1)
-                # 避免除以零
                 num_of_tokens[num_of_tokens == 0] = 1
-                # 计算平均对数概率
                 average_log_probs = sum_of_log_probs / num_of_tokens
-                # 转换为平均概率（置信度）
                 average_confidence = torch.exp(average_log_probs)
 
                 # 3. 准备传递给 env_manager 的数据
                 token_usage_list = []
                 confidence_metrics_list = []
-                log_probs_list = [] # <--- ✅ [CCAPO] 新增
-                
-                # ======================= ✅ [ 修复 G_Buffer Bug ] =======================
-                # 我们需要传递 PPO 更新所需的所有张量
+                log_probs_list = [] 
                 tensors_for_env_list = []
-                # =====================================================================
                 
                 for i in range(batch_size):
                     token_usage_list.append({
@@ -686,64 +740,45 @@ class TrajectoryCollector:
                         "average_log_probability": average_log_probs[i].item(),
                         "average_confidence": average_confidence[i].item(),
                     })
-                    # <--- ✅ [CCAPO] 收集每个样本的 log_probs 张量 (Sec 6.1)
                     log_probs_list.append(log_probs[i])
                     
-                    # ======================= ✅ [ 修复 G_Buffer Bug ] =======================
-                    # 收集 PPO 更新所需的核心张量
-                    # batch_input 包含 input_ids, attention_mask, position_ids
-                    # batch 包含 responses (因为它是 batch_input.union(batch_output))
                     tensors_for_env_list.append({
                         "input_ids": batch.batch["input_ids"][i],
                         "attention_mask": batch.batch["attention_mask"][i],
                         "position_ids": batch.batch["position_ids"][i],
                         "responses": batch.batch["responses"][i],
                     })
-                    # =====================================================================
                 
                 # 4. 暂存数据
                 if hasattr(envs, "set_last_step_token_usage"):
                     envs.set_last_step_token_usage(token_usage_list)
                 if hasattr(envs, "set_last_step_confidence"):
                     envs.set_last_step_confidence(confidence_metrics_list)
-                # <--- ✅ [CCAPO] 暂存 log_probs
                 if hasattr(envs, "set_last_step_log_probs"):
                     envs.set_last_step_log_probs(log_probs_list)
-                
-                # ======================= ✅ [ 修复 G_Buffer Bug ] =======================
-                # 暂存 PPO 核心张量
                 if hasattr(envs, "set_last_step_tensors"):
                     envs.set_last_step_tensors(tensors_for_env_list)
-                # =====================================================================
                 
-                # ======================= ✅ [ 修复 STDB Bug ] =======================
-                # 暂存 STDB 索引信息 (这是必须的，因为 envs.py 不会自动传递)
+                # 暂存 STDB 索引信息
                 if hasattr(envs, "set_last_step_stdb_info"):
                     stdb_info_list = []
-                    
-                    # --- ✅ [STDB 修复] 从当前的 'batch' 对象中提取索引/向量 ---
-                    # (不再使用 'tasks_for_this_batch'，因为它只适用于 Step 0)
                     current_prompt_index_list = batch.non_tensor_batch.get('prompt_index', [None] * batch_size)
                     current_prompt_vector_tensor = batch.batch.get('prompt_vector', None)
                     
                     if current_prompt_vector_tensor is None:
                          self.file_logger.error(f"!!! [vanilla_multi_turn_loop] Step {_step+1}: 'prompt_vector' not found in current step's batch! STDB will fail. !!!")
-                    if any(p is None for p in current_prompt_index_list):
-                         self.file_logger.error(f"!!! [vanilla_multi_turn_loop] Step {_step+1}: 'prompt_index' not found in current step's batch! STDB will fail. !!!")
-
+                    
                     for i in range(batch_size):
                         stdb_info_list.append({
                             "prompt_index": current_prompt_index_list[i],
                             "prompt_vector": current_prompt_vector_tensor[i] if current_prompt_vector_tensor is not None else None
                         })
                     envs.set_last_step_stdb_info(stdb_info_list)
-                # =====================================================================
 
             except Exception as e:
                 import traceback
                 print(f"!!!!!! [Rollout Step: {_step+1}] 计算 Token 和置信度时出错: {e} !!!!!!")
                 self.file_logger.error(f"[vanilla_multi_turn_loop] Step {_step+1}: 计算 Token 和置信度时出错: {e}\n{traceback.format_exc()}")
-                print(traceback.format_exc())
             # ==============================================================================
 
             next_obs, rewards, dones, infos = envs.step(text_actions)
@@ -761,26 +796,21 @@ class TrajectoryCollector:
             episode_rewards += torch_to_numpy(rewards) * torch_to_numpy(active_masks)
             episode_lengths[active_masks] += 1
 
-            assert len(rewards) == batch_size, f"env should return rewards for all environments, got {len(rewards)} rewards for {batch_size} environments"
             batch.non_tensor_batch['rewards'] = torch_to_numpy(rewards, is_object=True)
             batch.non_tensor_batch['active_masks'] = torch_to_numpy(active_masks, is_object=True)
 
             batch_list: list[dict] = to_list_of_dict(batch)
             for i in range(batch_size):
-                # 只为 active (is_done=False) 的环境添加数据
                 if active_masks[i]:
                     total_batch_list[i].append(batch_list[i])
-                    total_infos[i].append(infos[i]) # <--- ✅ [CCAPO] 必须收集 infos
+                    total_infos[i].append(infos[i])
 
-                    # ======================= ✅ [CCAPO V3] 关键修正：在此处检查并终结 ✅ =======================
-                    # 如果这个环境 *刚刚* 终结 (dones[i] is True) 并且它仍在 info_pool 中
+                    # ======================= ✅ [CCAPO V3] 检查并终结 =======================
                     if dones[i] and hasattr(envs, 'info_pool_managers') and i in envs.info_pool_managers:
-                        
-                        task_completed = infos[i].get("won", False) # 'won' 来自 _step_device
+                        task_completed = infos[i].get("won", False)
                         status = "SUCCESS" if task_completed else "FAILURE"
                         summary_text = "Task finished by agent." if task_completed else "Task failed during execution."
                         
-                        print(f"--- [rollout_loop.py] 正在为自然终结的环境 {i} (Status: {status}) 终结日志 ---")
                         self.file_logger.info(f"[vanilla_multi_turn_loop] Step {_step+1}: 环境 {i} (uid={traj_uid[i]}) 自然终结 (Status: {status})。")
                         
                         final_summary = envs.info_pool_managers[i].finalize_run(
@@ -790,11 +820,7 @@ class TrajectoryCollector:
                             task=envs.tasks[i],
                             task_completed=task_completed 
                         )
-                        
-                        # 将 final_summary 注入到我们刚刚 .append() 的 info 中
                         total_infos[i][-1]['final_summary'] = final_summary
-                        
-                        # 终结后从池中移除
                         envs.info_pool_managers.pop(i, None)
                     # ===================================================================================
 
@@ -807,21 +833,14 @@ class TrajectoryCollector:
         if not is_done.all():
             self.file_logger.info(f"[vanilla_multi_turn_loop] 达到 Max Steps ({self.config.env.max_steps})。")
 
-        # ======================= ✅ 2. 修复超时的终结逻辑 ✅ =======================
-        # 确保因超时而结束的轨迹也被正确终结
+        # ======================= ✅ 2. 修复超时的终结逻辑 =======================
         for i in range(batch_size):
-            # 如果环境没有被标记为 'done' (is_done[i] is False)，说明它是因达到 max_steps 而超时的
-            # 同时检查 info_pool_managers 是否存在且包含该环境的 manager
             if not is_done[i] and hasattr(envs, 'info_pool_managers') and i in envs.info_pool_managers:
-                print(f"--- [rollout_loop.py] 正在为超时的环境 {i} 强制终结日志 ---")
                 self.file_logger.warning(f"[vanilla_multi_turn_loop] 环境 {i} (uid={traj_uid[i]}) 超时。强制终结。")
                 final_status = "TIMEOUT"
                 summary_text = f"Task stopped due to reaching max steps ({self.config.env.max_steps})."
 
-                # 检查 info_pool_managers[i] 是否仍然存在
                 if i in envs.info_pool_managers:
-                    # 使用新的 finalize_run 签名，task_completed 明确设置为 False
-                    # ✅ [CCAPO] 捕获 finalize_run 的返回
                     final_summary = envs.info_pool_managers[i].finalize_run(
                         status=final_status,
                         summary=summary_text,
@@ -829,11 +848,9 @@ class TrajectoryCollector:
                         task=envs.tasks[i],
                         task_completed=False 
                     )
-                    # ✅ [CCAPO] 将 final_summary 存入最后一步的 info
                     if total_infos[i]:
                         total_infos[i][-1]['final_summary'] = final_summary
                     
-                    # 终结后从池中移除
                     envs.info_pool_managers.pop(i, None)
         # ========================================================================
 
@@ -844,7 +861,7 @@ class TrajectoryCollector:
             episode_lengths=episode_lengths,
         )
         self.file_logger.info(f"--- [vanilla_multi_turn_loop] 结束 ---")
-        return total_batch_list, total_infos, episode_rewards, episode_lengths, success, traj_uid # <--- ✅ [CCAPO] 返回 total_infos
+        return total_batch_list, total_infos, episode_rewards, episode_lengths, success, traj_uid
     
     def dynamic_multi_turn_loop(
             self,

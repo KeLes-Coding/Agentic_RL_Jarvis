@@ -133,12 +133,19 @@ def _calculate_A_traj(g_calc_steps: List[Dict[str, Any]]):
     
     final_advantages = []
     for r_val, adv_val in zip(all_R_tau, raw_advantages):
-        # [Fix 2] 符号保护 (Sign Protection)
-        # 如果原 Reward 是正的(成功)，Advantage 绝不能是负的 (防止冤杀好样本)
-        if r_val > 0.0 and adv_val < 0.0:
-            adv_val = 0.05 # 给予一个微小的正向激励，而不是惩罚
+        # [Fix 2] 符号保护 (Sign Protection) - 智能软着陆策略
         
-        # 如果原 Reward 是负的(失败)，Advantage 绝不能是正的 (防止奖励幻觉)
+        # 情况 A: 成功轨迹 (Reward > 0)，但因为效率低导致 Advantage < 0
+        # 方案: 不强制转正(会导致效率停滞)，也不完全保留负值(会导致SR崩塌)。
+        #       而是乘以一个衰减系数 (e.g., 0.2)。
+        # 效果: 这是一个"温和的批评"。模型知道这比高效路径差，但Adv值
+        #       不会低到让模型觉得这是一次"失败"的尝试。
+        if r_val > 0.0 and adv_val < 0.0:
+            adv_val = adv_val * 0.2 
+        
+        # 情况 B: 失败轨迹 (Reward < 0)，但因为大家都在烂比烂导致 Advantage > 0
+        # 方案: 必须坚决拦截！防止奖励幻觉 (Reward Hallucination)。
+        #       失败就是失败，绝不能给正向激励。
         elif r_val < 0.0 and adv_val > 0.0:
             adv_val = -0.05 # 给予一个微小的负向惩罚
             
@@ -149,14 +156,41 @@ def _calculate_A_traj(g_calc_steps: List[Dict[str, Any]]):
         step['A_traj'] = adv
 
 def _calculate_R_format_penalty(g_calc_steps: List[Dict[str, Any]], config):
-    """计算格式惩罚"""
+    """
+    计算格式惩罚
+    修正逻辑：优先判断 action_success 字段，或者兼容 action_status 为空的情况
+    """
     for step in g_calc_steps:
+        # 1. 获取关键字段
         action_status = step.get('action_status', '')
+        # 注意：日志里的 action_success 是布尔值 true，不是字符串
+        is_success = step.get('action_success', False) 
+        
         penalty = 0.0
-        if action_status.startswith('FORMAT_ERROR'):
+        
+        # 2. 修正判定逻辑
+        # 情况A：直接读取 success 字段 (最稳健)
+        # 情况B：有些系统里 status 为空字符串 "" 也代表没有错误 (根据你的日志看似乎是这样)
+        # 情况C：兼容旧逻辑，防止 status 真的被写成了字符串 "true"
+        if is_success is True or action_status == 'true' or action_status == '':
+            penalty = 0.0
+            
+        # 3. 格式/语法/幻觉错误
+        elif (action_status.startswith('FORMAT_ERROR') or 
+              action_status.startswith('UNKNOWN_ACTION') or 
+              action_status.startswith('ARGUMENT_ERROR')):
             penalty = config.penalty_format_error
-        elif action_status.startswith('FAILURE'):
+            
+        # 4. 执行失败
+        elif (action_status.startswith('FAILURE') or 
+              action_status.startswith('EXECUTION_ERROR')):
             penalty = config.penalty_failure
+            
+        # 5. 兜底策略
+        else:
+            # 此时剩下的确实是未知的异常状态
+            penalty = config.penalty_failure
+
         step['R_format_penalty'] = penalty
 
 def _calculate_R_step_success(g_calc_steps: List[Dict[str, Any]], g_calc_trajs: Dict[str, List[Dict[str, Any]]], config):
@@ -164,6 +198,8 @@ def _calculate_R_step_success(g_calc_steps: List[Dict[str, Any]], g_calc_trajs: 
     [Sec 5.1 Revised] 计算 R_core_raw
     [Feature]: 支持 use_fine_grained_action 开关，切换动作粒度。
     [Fix]: 使用 Trajectory Coverage 公式计算 S_necessity，以适应细粒度带来的稀疏性。
+    [HotFix]: 针对 finish 动作强制使用粗粒度，忽略总结性文本的差异。
+    [🌟 Human-in-the-loop]: 支持处理 is_human_marked 标记，强制拉满 S_nec 和 S_util。
     """
     # 0. 获取粒度开关
     use_fine_grained = getattr(config, 'use_fine_grained_action', False)
@@ -219,14 +255,17 @@ def _calculate_R_step_success(g_calc_steps: List[Dict[str, Any]], g_calc_trajs: 
                 if action_type:
                     # --- [Granularity Logic] 核心切换逻辑 ---
                     if use_fine_grained:
-                        # 使用 parsed_action (包含参数) 构造 Key
-                        # 注意：需要转为字符串以确保可哈希
-                        raw_act = step.get('parsed_action')
-                        if raw_act is not None:
-                            # 格式示例: "click::{'uid': '123'}"
-                            act_identifier = f"{action_type}::{str(raw_act)}"
-                        else:
+                        # [Modified] finish 动作特例处理：
+                        if action_type == 'finish':
                             act_identifier = action_type
+                        elif action_type == 'input_text':
+                            act_identifier = action_type
+                        else:
+                            raw_act = step.get('parsed_action')
+                            if raw_act is not None:
+                                act_identifier = f"{action_type}::{str(raw_act)}"
+                            else:
+                                act_identifier = action_type
                     else:
                         # 仅使用 action_type (模糊匹配)
                         act_identifier = action_type
@@ -234,19 +273,19 @@ def _calculate_R_step_success(g_calc_steps: List[Dict[str, Any]], g_calc_trajs: 
                     key = (act_identifier, stage)
                     all_keys.add(key)
                     
-                    # Utility 统计
+                    # Utility 统计 (即便被标记，也参与统计，作为分母/分子的一部分)
                     utility_stats[key]["total"].add(traj_uid)
                     if is_success_traj:
                         utility_stats[key]["success"].add(traj_uid)
                         
-                        # Necessity 统计 (Trajectory Coverage)
+                        # Necessity 统计
                         if weight > 0 and key not in seen_in_this_traj:
                             necessity_numerator[key] += weight
                             seen_in_this_traj.add(key)
             else:
                 step['b_stage'] = 'N/A'
 
-    # 3. 计算最终指标
+    # 3. 计算最终指标 (统计值)
     total_trajs = len(g_calc_trajs)
     success_trajs = len(traj_uid_list)
     P_succ_global = max(success_trajs / (total_trajs + 1e-6), 0.01)
@@ -255,11 +294,11 @@ def _calculate_R_step_success(g_calc_steps: List[Dict[str, Any]], g_calc_trajs: 
     Debug_params_cache = {}
     
     for key in all_keys:
-        # S_necessity
+        # S_necessity (Statistical)
         w_numerator = necessity_numerator.get(key, 0.0)
         S_necessity = w_numerator / total_success_weight_sum
         
-        # S_utility
+        # S_utility (Statistical)
         n_succ_act = len(utility_stats[key]["success"])
         n_total_act = len(utility_stats[key]["total"])
         P_succ_cond = n_succ_act / (n_total_act + 1e-6)
@@ -269,7 +308,7 @@ def _calculate_R_step_success(g_calc_steps: List[Dict[str, Any]], g_calc_trajs: 
         I_action_cache[key] = S_necessity * S_utility
         Debug_params_cache[key] = (S_necessity, S_utility)
 
-    # 4. 写回
+    # 4. 写回 & 🌟 HITL Override
     for step in g_calc_steps:
         if step.get('R_core') != 1.0: continue
         if not step.get('action_success', False): continue
@@ -280,24 +319,40 @@ def _calculate_R_step_success(g_calc_steps: List[Dict[str, Any]], g_calc_trajs: 
              idx = traj_uid_list.index(traj_uid)
              q_step_local = traj_raw_q_steps[idx]
         
-        # 重复 Granularity Key 构建逻辑以匹配 Cache
+        # 重复 Granularity Key 构建逻辑
         action_type = step.get('action_type')
         stage = step.get('b_stage')
         
         if use_fine_grained:
-            raw_act = step.get('parsed_action')
-            if raw_act is not None:
-                act_identifier = f"{action_type}::{str(raw_act)}"
-            else:
+            if action_type == 'finish':
                 act_identifier = action_type
+            elif action_type == 'input_text':  # <--- 补上这一段
+                act_identifier = action_type
+            else:
+                raw_act = step.get('parsed_action')
+                if raw_act is not None:
+                    act_identifier = f"{action_type}::{str(raw_act)}"
+                else:
+                    act_identifier = action_type
         else:
             act_identifier = action_type
 
         key = (act_identifier, stage)
         
+        # 获取统计计算出的值
         i_action = I_action_cache.get(key, 0.0)
         s_nec, s_util = Debug_params_cache.get(key, (0.0, 0.0))
         
+        # 🌟 [Human-in-the-Loop Override]
+        # 如果该步骤被人工标记为关键，强制覆盖其重要性指标
+        if step.get('is_human_marked', False):
+            s_nec = 1.0 # 必要性拉满
+            s_util = 3.0 # 效用性拉满 (根据上方 clip 逻辑，最大通常为 3.0)
+            i_action = s_nec * s_util # 3.0
+            
+            # 记录日志方便调试 (可选)
+            # ccapo_file_logger.debug(f"[HITL] Step Marked! Overriding: {act_identifier} -> I=3.0")
+
         step['R_core_raw'] = i_action * q_step_local
         step['S_necessity'] = s_nec
         step['S_utility'] = s_util
@@ -307,63 +362,103 @@ def _calculate_R_step_success(g_calc_steps: List[Dict[str, Any]], g_calc_trajs: 
 def _calculate_R_step_fail(g_calc_steps: List[Dict[str, Any]], g_buffer_steps: List[Dict[str, Any]], embedding_model, config):
     """
     [Sec 5.2] 计算 R_match_raw (Embedding Matching)
+    [Modified]: 增加了 action_success 的双向过滤。
+    1. Buffer: 只有 (R_core=1.0 AND action_success=True) 的步骤才会被索引入知识库。
+    2. Online: 只有 (R_core=-1.0 AND action_success=True) 的步骤才有资格被挽救。
     """
-    # 1. 索引 STDB
+    # =========================================================
+    # 1. 索引 STDB (构建成功动作知识库)
+    # =========================================================
     stdb_step_scores = collections.defaultdict(list)
     stdb_thoughts = []
     stdb_map = {} 
     idx = 0
+    
     for step in g_buffer_steps:
+        # 筛选条件 A: 必须来自最终成功的轨迹
         if step.get('R_core') != 1.0: continue
+        
+        # 筛选条件 B [新增]: 步骤本身必须执行成功
+        # (防止将执行报错的坏动作误认为好动作)
+        if not step.get('action_success', False): continue
+
         action = step.get('parsed_action')
         if not action: continue
-        stdb_step_scores[action].append({'score': step.get('R_step', 0.0)})
+        
+        # 确保 Key 统一为字符串 (兼容 Dict 等复杂结构)
+        action_key = str(action)
+        
+        stdb_step_scores[action_key].append({'score': step.get('R_step', 0.0)})
         stdb_thoughts.append(step.get('thought', ''))
-        stdb_map[idx] = (action, len(stdb_step_scores[action]) - 1)
+        stdb_map[idx] = (action_key, len(stdb_step_scores[action_key]) - 1)
         idx += 1
 
     if not stdb_thoughts: return
     
-    # 批量编码 STDB
+    # 批量编码 STDB 中的 Thought
     stdb_embeddings = embedding_model.encode(stdb_thoughts, convert_to_tensor=True)
     for i, emb in enumerate(stdb_embeddings):
-        action, list_idx = stdb_map[i]
-        stdb_step_scores[action][list_idx]['embedding'] = emb
+        action_key, list_idx = stdb_map[i]
+        stdb_step_scores[action_key][list_idx]['embedding'] = emb
 
-    # 2. 准备失败步骤
+    # =========================================================
+    # 2. 准备失败步骤 (筛选待挽救对象)
+    # =========================================================
     fail_steps = []
-    fail_indices = [] # step index in g_calc_steps
+    fail_indices = [] # 记录它在 g_calc_steps 中的原始索引
     
     for i, step in enumerate(g_calc_steps):
+        # 筛选条件 A: 只关注失败的轨迹 (成功的轨迹已有 R_core=1)
         if step.get('R_core') != -1.0: continue
+        
+        # 筛选条件 B [新增]: 步骤本身必须执行成功
+        # (如果这一步本身就崩了，说明模型完全不懂环境机制，不予挽救)
+        if not step.get('action_success', False): continue
+
         action = step.get('parsed_action')
-        if not action or action not in stdb_step_scores: continue
+        if not action: continue
+        
+        action_key = str(action)
+        
+        # 初筛: 这个动作必须在"成功知识库"里出现过
+        # (如果是个没人见过的怪动作，不予挽救)
+        if action_key not in stdb_step_scores: continue
+        
         fail_steps.append(step.get('thought', ''))
         fail_indices.append(i)
         
     if not fail_steps: return
     
-    # 批量编码失败步骤
+    # 批量编码失败步骤的 Thought
     fail_embeddings = embedding_model.encode(fail_steps, convert_to_tensor=True)
 
-    # 3. 匹配
+    # =========================================================
+    # 3. 语义匹配与奖励转移
+    # =========================================================
     for i, emb_t in enumerate(fail_embeddings):
         step_idx = fail_indices[i]
         step = g_calc_steps[step_idx]
-        action = step['parsed_action']
         
-        matches = stdb_step_scores[action]
+        action = step.get('parsed_action')
+        action_key = str(action)
+        
+        # 取出所有做过相同动作(Action Match)的成功案例
+        matches = stdb_step_scores[action_key]
         valid_m = [m for m in matches if 'embedding' in m]
         if not valid_m: continue
             
         comp_embs = torch.stack([m['embedding'] for m in valid_m]).to(emb_t.device)
         comp_scores = torch.tensor([m['score'] for m in valid_m], device=emb_t.device)
         
+        # 计算 Thought 的语义相似度 (Reasoning Match)
         cos_sims = util.cos_sim(emb_t, comp_embs)[0]
+        
+        # 判定: 只有 Reasoning 也高度相似，才认为是同一个策略
         found = torch.where(cos_sims > config.similarity_threshold)[0]
         
         if len(found) > 0:
-            # 取匹配中最高的 R_step
+            # 逻辑: 动作一样，想法一样，且前辈靠这招赢过 -> 给分
+            # 取匹配案例中的最高分赋予当前步骤
             max_score = torch.max(comp_scores[found]).item()
             step['R_match_raw'] = max_score
 
