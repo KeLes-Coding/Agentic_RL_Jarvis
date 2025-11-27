@@ -238,8 +238,8 @@ class SuccessTrajectoryDatabase:
     def get_buffer_trajectories(self, online_batch_steps: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
         获取 G_buffer (Sec 3.2):
-        [Optimization]: 针对每个 Prompt，仅提取 R_tau 最高的那一条成功轨迹 (Best-of-K)。
-        这保证了失败轨迹只会尝试模仿“金标准”操作，而不是模仿平庸的成功操作。
+        根据在线批次中的 prompts，提取 STDB 中的锚点轨迹。
+        实现直接匹配和相似度回退。
         """
         unique_prompts = {} # {prompt_index -> prompt_vector}
         for step in online_batch_steps:
@@ -251,61 +251,54 @@ class SuccessTrajectoryDatabase:
             return []
             
         self.file_logger.info(f"--- 开始获取 G_buffer (请求 {len(unique_prompts)} 个 unique prompts) ---")
+        self.file_logger.debug(f"请求的 prompts: {list(unique_prompts.keys())}")
             
         buffer_log_paths: Set[str] = set()
         
         for prompt_index, prompt_vector in unique_prompts.items():
             
-            # 临时变量，用于存储找到的最佳条目 (score, path)
-            best_entry = None 
-            source_type = "None"
-
             # --- 1. 直接匹配 ---
             if prompt_index in self.db:
-                entries = self.db[prompt_index]
-                if entries:
-                    # [Modified] 不再添加所有 entries，而是找到 R_tau (x[0]) 最大的那个
-                    best_entry = max(entries, key=lambda x: x[0])
-                    source_type = "Direct"
+                self.file_logger.debug(f"Prompt {prompt_index}: 直接命中。添加 {len(self.db[prompt_index])} 条轨迹。")
+                for R_tau, log_dir_path in self.db[prompt_index]:
+                    buffer_log_paths.add(log_dir_path)
             
             # --- 2. 相似度回退 (如果直接匹配失败) ---
             elif self.known_vectors is not None and prompt_vector is not None:
+                logger.debug(f"[STDB] Prompt {prompt_index} 未找到, 执行相似度搜索...")
+                self.file_logger.info(f"Prompt {prompt_index}: 未命中。执行相似度回退...")
                 # 将查询向量移到 CPU 并确保类型正确
                 query_vec = prompt_vector.cpu().float().unsqueeze(0)
+                
+                # 计算余弦相似度
                 similarities = util.cos_sim(query_vec, self.known_vectors)[0]
                 
+                # 找到最佳匹配
                 best_match_tensor_idx = torch.argmax(similarities).item()
                 best_match_prompt_index = self.known_indices[best_match_tensor_idx]
                 
-                entries = self.db.get(best_match_prompt_index, [])
-                if entries:
-                    # [Modified] 同样只取最佳轨迹
-                    best_entry = max(entries, key=lambda x: x[0])
-                    source_type = f"Sim(p={best_match_prompt_index}, s={similarities[best_match_tensor_idx]:.2f})"
-            
-            # --- 3. 处理选中的最佳轨迹 ---
-            if best_entry:
-                best_r_tau, best_path = best_entry
-                buffer_log_paths.add(best_path)
-                self.file_logger.debug(f"Prompt {prompt_index} [{source_type}]: 选中最佳轨迹 (R={best_r_tau:.4f}) -> {os.path.basename(best_path)}")
+                logger.debug(f"     -> 最佳匹配: Prompt {best_match_prompt_index} (相似度: {similarities[best_match_tensor_idx]:.4f})")
+                self.file_logger.info(f"  -> Prompt {prompt_index} 匹配到 {best_match_prompt_index} (相似度: {similarities[best_match_tensor_idx]:.4f})。")
+                
+                # 使用最佳匹配的轨迹
+                for R_tau, log_dir_path in self.db[best_match_prompt_index]:
+                    buffer_log_paths.add(log_dir_path)
             else:
-                self.file_logger.debug(f"Prompt {prompt_index}: 未找到可用轨迹。")
-
+                self.file_logger.warning(f"Prompt {prompt_index}: 未命中，且无法执行相似度搜索 (known_vectors: {self.known_vectors is not None}, prompt_vector: {prompt_vector is not None})")
         
         if not buffer_log_paths:
             self.file_logger.warning(f"未找到任何锚点轨迹。")
             return []
 
         # --- 3. 从磁盘“软链接”加载轨迹 ---
-        # (后续逻辑保持不变，只需加载被筛选出的 buffer_log_paths)
-        logger.info(f"[STDB] 加载 {len(buffer_log_paths)} 条锚点轨迹 (Best-of-Prompt)...")
-        self.file_logger.info(f"将从磁盘加载 {len(buffer_log_paths)} 条唯一的最佳锚点轨迹...")
-        
+        logger.info(f"[STDB] 加载 {len(buffer_log_paths)} 条锚点轨迹...")
+        self.file_logger.info(f"将从磁盘加载 {len(buffer_log_paths)} 条唯一的锚点轨迹...")
         g_buffer_steps: List[Dict[str, Any]] = []
         for log_path in buffer_log_paths:
             try:
                 traj_steps = self._load_trajectory_from_path(log_path)
                 g_buffer_steps.extend(traj_steps)
+                self.file_logger.debug(f"  -> 成功从 {log_path} 加载 {len(traj_steps)} 个步骤。")
             except Exception as e:
                 logger.error(f"[STDB] 无法从 {log_path} 加载轨迹: {e}")
                 self.file_logger.error(f"无法从 {log_path} 加载轨迹: {e}")
