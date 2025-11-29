@@ -88,7 +88,7 @@ The JSON object must contain exactly two keys:
 - `back()`: Press the system back button. No parameters. Example: `back()`
 - `home()`: Press the system home button. No parameters. Example: `home()`
 - `wait(seconds: float)`: Wait for a specified number of seconds. Example: `wait(3.5)`
-- `finish(summary: str)`: Use this action ONLY when the entire task is successfully completed. Provide a brief summary of the completion. Example: `finish(summary='Successfully calculated 123 * 456 and found the answer.')
+- `finish(summary: str)`: Use this action ONLY when the entire task is successfully completed. The `summary` must be extracted **strictly** from the current page's screenshot or structured XML file. **DO NOT** use internal model knowledge or make assumptions not visible on the screen. Example: `finish(summary='Successfully retrieved the specific price $120.')`
 
 --- FINAL REMINDER ---
 Analyze the UI elements and screenshots carefully. Be precise and methodical. Your response MUST be a single, clean JSON object.
