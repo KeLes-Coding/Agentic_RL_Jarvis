@@ -208,9 +208,15 @@ def _calculate_A_traj(g_calc_steps: List[Dict[str, Any]], current_sr: float):
     mean_R = np.mean(all_R_tau)
     std_R = np.std(all_R_tau)
     
-    safe_std = std_R + 0.05 
-    
-    raw_advantages = [(v - mean_R) / safe_std for v in all_R_tau]
+    # 修复单样本/零方差问题
+    if std_R < 1e-6:
+        fallback_adv = 1.0 if mean_R > 0 else -1.0
+        raw_advantages = [fallback_adv for _ in all_R_tau]
+        match_debug_logger.warning(f"  [A_traj] Low variance detected (Std={std_R:.4f}). Forced Adv={fallback_adv}")
+    else:
+        safe_std = std_R + 0.05 
+        raw_advantages = [(v - mean_R) / safe_std for v in all_R_tau]
+
     protection_factor = min(max(current_sr, 0.2), 1.0)
 
     final_advantages = []
@@ -246,196 +252,184 @@ def _calculate_R_format_penalty(g_calc_steps: List[Dict[str, Any]], config):
 
 def _calculate_R_step_success(g_calc_steps: List[Dict[str, Any]], g_calc_trajs: Dict[str, List[Dict[str, Any]]], config):
     """
-    [Sec 5.1 Revised] LCS 序列对齐逻辑 - 全量日志 + 轨迹重建
+    [Sec 5.1 Revised] 基于结构化共识的 LCS 奖励 (Structured Consensus LCS)
+    
+    Update Logic:
+    1. Anchor Selection: Strictly based on min(steps). Token cost is IGNORED for evolution.
+    2. S_necessity Voting: Align all success trajs to Anchor to compute consensus weights.
+    3. Reward Assignment: Match -> S_necessity * Q_step; Mismatch -> -beta.
     """
     use_fine_grained = getattr(config, 'use_fine_grained_action', True)
     beta = getattr(config, 'redundancy_penalty', 0.5)
 
     batch_id = datetime.datetime.now().strftime("%H:%M:%S.%f")
-    match_debug_logger.info(f"\n\n{'='*20} [Batch {batch_id}] Start LCS Calculation (V8.6) {'='*20}")
+    match_debug_logger.info(f"\n\n{'='*20} [Batch {batch_id}] Start Consensus LCS (V5.1 New - Strict Steps) {'='*20}")
 
-    # 1. 准备数据 & 重建轨迹
+    # --- 1. 数据准备与轨迹重建 ---
     success_traj_info = {}
     
     for traj_uid, raw_steps in g_calc_trajs.items():
         if not raw_steps: continue
         
+        # 只处理 R_core == 1.0 的成功轨迹用于共识计算
         if raw_steps[0].get('R_core') != 1.0: continue
         
-        # 强制重建
+        # 轨迹重建
         steps = _reconstruct_trajectory_from_disk(raw_steps)
-
         is_buffer = steps[0].get('is_buffer_data', False)
         
-        # Log Path
-        raw_path = steps[0].get('log_dir_path', 'Unknown_Path')
-        if raw_path != 'Unknown_Path':
-            clickable_path = f"file://{os.path.abspath(raw_path)}"
-        else:
-            clickable_path = "Path Not Available"
-
-        # --- [DEBUG] Extract Log ---
-        match_debug_logger.info(f"\n{'-'*10} Extracting: {traj_uid} {'-'*10}")
-        match_debug_logger.info(f"  Source: {'[BUFFER]' if is_buffer else '[ONLINE]'}")
-        match_debug_logger.info(f"  Path:   {clickable_path}")
-
+        # 提取有效步骤
         valid_steps = []
         act_identifiers = []
         
         for step in steps:
-            s_idx = step.get('step_index')
             s_type = step.get('action_type', '')
             s_parsed = step.get('parsed_action')
             s_success = step.get('action_success', False)
             is_healed = step.get('is_healed_data', False)
+            status = step.get('action_status', '')
             
-            # 过滤: Buffer/Healed 宽容，Online 严格
             keep = False
             if is_buffer or is_healed:
-                status = step.get('action_status', '')
                 if not (status.startswith('FAILURE') or status.startswith('ERROR') or status.startswith('FORMAT')):
                     keep = True
             else:
                 if s_success:
                     keep = True
             
-            if not keep:
-                match_debug_logger.info(f"  Step {s_idx}: [SKIPPED] Success={s_success}")
-                continue
-            
-            valid_steps.append(step)
-            
-            # 构造 ID
-            if use_fine_grained:
-                if s_type in ['finish', 'input_text']:
-                     act_identifier = f"{s_type}::{str(s_parsed).strip()}" if s_parsed else s_type
+            if keep:
+                valid_steps.append(step)
+                # 构造 ID
+                if use_fine_grained:
+                    act_str = str(s_parsed).strip() if s_parsed else ""
+                    act_identifier = f"{s_type}::{act_str}"
                 else:
-                     act_identifier = f"{s_type}::{str(s_parsed).strip()}" if s_parsed else s_type
-            else:
-                act_identifier = s_type
-            
-            act_identifiers.append(act_identifier)
-            match_debug_logger.info(f"  Step {s_idx}: [KEEP] ID='{act_identifier}' {'(REC)' if is_healed else ''}")
-            
+                    act_identifier = s_type
+                act_identifiers.append(act_identifier)
+
         if valid_steps:
             success_traj_info[traj_uid] = {
                 'steps': valid_steps, 
                 'act_ids': act_identifiers, 
-                'n_success': len(valid_steps),
+                'n_steps': len(valid_steps),
+                # TokenCost 仍记录但不用于排序
+                'n_tokens': steps[0].get('traj_total_tokens', 0),
                 'is_buffer': is_buffer,
-                'path': clickable_path,
                 'r_tau': steps[0].get('R_tau', 0.0)
             }
-            match_debug_logger.info(f"  -> Final Len: {len(valid_steps)}")
-        else:
-            match_debug_logger.info(f"  -> WARNING: No valid steps!")
 
     if not success_traj_info: 
-        match_debug_logger.info("No successful trajectories found.")
+        match_debug_logger.info("No successful trajectories found for consensus.")
         return
 
-    # 2. 锚点选择
-    def calculate_anchor_score(item):
-        traj_uid, info = item
-        steps = info['steps']
-        n_succ = info['n_success']
-        r_tau = info['r_tau']
-        is_buffer = info['is_buffer']
-        
-        bad_taps = 0
-        for s in steps:
-            if s.get('action_type') == 'tap':
-                parsed = str(s.get('parsed_action', ''))
-                if '1' in parsed or '(0,' in parsed:
-                    bad_taps += 1
-        
-        buffer_priority_bonus = -1000.0 if is_buffer else 1000.0
-        
-        score = buffer_priority_bonus + (1.0 * n_succ) + (0.5 * bad_taps) - (0.1 * r_tau)
-        info['debug_score'] = score
-        return score
-
-    sorted_trajs = sorted(success_traj_info.items(), key=calculate_anchor_score)
+    # --- 2. 锚点进化 (Anchor Evolution) ---
+    # 修改点：严格按 Step 排序，移除 Token 比较。
     
-    # --- [DEBUG] Anchor Table ---
-    match_debug_logger.info(f"\n--- Anchor Candidates ---")
-    for rank, (uid, info) in enumerate(sorted_trajs[:5]):
-        src = "BUFFER" if info['is_buffer'] else "ONLINE"
-        match_debug_logger.info(f"{rank+1}. {src} | Score: {info['debug_score']:.2f} | Len: {info['n_success']} | UID: {uid}")
-
+    sorted_trajs = sorted(
+        success_traj_info.items(), 
+        key=lambda item: item[1]['n_steps'] # <--- 仅基于步数
+    )
+    
     anchor_uid, anchor_data = sorted_trajs[0]
     anchor_seq = anchor_data['act_ids']
-
+    
     match_debug_logger.info(f"\n>>> SELECTED ANCHOR: {anchor_uid}")
-    match_debug_logger.info(f">>> Seq: {anchor_seq}")
+    match_debug_logger.info(f"    Len: {anchor_data['n_steps']} (Strict Minimal Steps)")
+    match_debug_logger.info(f"    Seq: {anchor_seq}")
 
-    # 3. 序列对齐与赋值
+    # --- 3. 计算 S_necessity (共识投票) ---
+    
+    anchor_len = len(anchor_seq)
+    anchor_votes = [0] * anchor_len
+    total_samples = len(success_traj_info)
+    
+    match_debug_logger.info(f"\n--- Voting Phase (Samples: {total_samples}) ---")
+
+    def get_lcs_match_indices(seq_a, seq_b):
+        m, n = len(seq_a), len(seq_b)
+        dp = [[0] * (n + 1) for _ in range(m + 1)]
+        for i in range(1, m + 1):
+            for j in range(1, n + 1):
+                if seq_a[i-1] == seq_b[j-1]:
+                    dp[i][j] = dp[i-1][j-1] + 1
+                else:
+                    dp[i][j] = max(dp[i-1][j], dp[i][j-1])
+        
+        matched_b = set()
+        matched_a = set()
+        mapping_b_to_a = {}
+        
+        i, j = m, n
+        while i > 0 and j > 0:
+            if seq_a[i-1] == seq_b[j-1]:
+                matched_b.add(j-1)
+                matched_a.add(i-1)
+                mapping_b_to_a[j-1] = i-1
+                i -= 1; j -= 1
+            elif dp[i-1][j] > dp[i][j-1]:
+                i -= 1
+            else:
+                j -= 1
+        return matched_b, matched_a, mapping_b_to_a
+
+    # 投票
+    for uid, info in success_traj_info.items():
+        curr_seq = info['act_ids']
+        if uid == anchor_uid:
+            for k in range(anchor_len):
+                anchor_votes[k] += 1
+        else:
+            _, matched_indices_anchor, _ = get_lcs_match_indices(anchor_seq, curr_seq)
+            for k in matched_indices_anchor:
+                anchor_votes[k] += 1
+    
+    s_necessity_vec = [(v / (total_samples + 1e-6)) for v in anchor_votes]
+    
+    match_debug_logger.info(f"Anchor Consensus Map:")
+    for k, (act, nec) in enumerate(zip(anchor_seq, s_necessity_vec)):
+        match_debug_logger.info(f"  Step {k}: [{nec:.2f}] {act}")
+
+    # --- 4. 奖励回写 (Write Back) ---
+    
     for traj_uid, info in success_traj_info.items():
         current_seq = info['act_ids']
         current_steps = info['steps']
         
-        m_steps_ratio = info['n_success'] / config.max_steps
+        m_steps_ratio = info['n_steps'] / config.max_steps
         q_step = max(0.0, 1.0 - config.alpha_step * m_steps_ratio)
         
-        matched_indices = set()
-        if traj_uid == anchor_uid:
-            matched_indices = set(range(len(current_seq)))
-        else:
-            # LCS DP
-            m, n = len(anchor_seq), len(current_seq)
-            dp = [[0] * (n + 1) for _ in range(m + 1)]
-            for i in range(1, m + 1):
-                for j in range(1, n + 1):
-                    if anchor_seq[i-1] == current_seq[j-1]:
-                        dp[i][j] = dp[i-1][j-1] + 1
-                    else:
-                        dp[i][j] = max(dp[i-1][j], dp[i][j-1])
-            # Backtrack
-            i, j = m, n
-            while i > 0 and j > 0:
-                if anchor_seq[i-1] == current_seq[j-1]:
-                    matched_indices.add(j-1)
-                    i -= 1; j -= 1
-                elif dp[i-1][j] > dp[i][j-1]: i -= 1
-                else: j -= 1
-
-        # --- [DEBUG] 打印所有匹配详情 ---
-        match_rate = len(matched_indices) / (len(current_seq) + 1e-6)
-        match_debug_logger.info(f"\n[Match Result] Traj: {traj_uid}")
-        match_debug_logger.info(f"  Source: {'BUFFER' if info['is_buffer'] else 'ONLINE'}")
-        match_debug_logger.info(f"  Match Rate: {match_rate:.2f} ({len(matched_indices)}/{len(current_seq)})")
+        matched_indices_curr, _, mapping_b_to_a = get_lcs_match_indices(anchor_seq, current_seq)
         
-        visual_match = []
-        for idx, act in enumerate(current_seq):
-            mark = "✅" if idx in matched_indices else "❌"
-            visual_match.append(f"{mark} {act}")
-        match_debug_logger.info(f"  Alignment: {visual_match}")
-
-        # 回写 (Write Back)
+        match_debug_logger.info(f"\n[Reward Assign] Traj: {traj_uid} (Q_step={q_step:.2f})")
+        
         for idx, step in enumerate(current_steps):
             if step.get('is_healed_data'): continue 
 
-            is_match = (idx in matched_indices) or step.get('is_human_marked', False)
+            is_match = (idx in matched_indices_curr)
             
-            act_type = step.get('action_type', '')
-            parsed = str(step.get('parsed_action', ''))
-            is_suspicious_tap = (act_type == 'tap' and ('1' in parsed or '(0,' in parsed))
-
+            s_nec = 0.0
+            s_util = 0.0
+            
             if is_match:
-                if is_suspicious_tap and not step.get('is_human_marked', False):
-                    i_action = 0.1
-                else:
-                    i_action = 1.0
+                anchor_idx = mapping_b_to_a[idx]
+                s_nec = s_necessity_vec[anchor_idx]
+                s_util = 1.0 
+                i_action = s_nec 
+                r_core_raw = i_action * q_step
             else:
                 i_action = -beta
+                r_core_raw = -beta
+                s_nec = 0.0
+                s_util = 0.0
 
-            r_core_raw = i_action * q_step if i_action > 0 else i_action
-            
             step['R_core_raw'] = r_core_raw
             step['I_action'] = i_action
             step['Q_step'] = q_step
-            step['S_necessity'] = 1.0 if is_match else 0.0
-            step['S_utility'] = 1.0 if is_match else 0.0
+            step['S_necessity'] = s_nec
+            step['S_utility'] = s_util
+            
+            mark = f"✅(S={s_nec:.2f})" if is_match else "❌"
+            match_debug_logger.info(f"  Step {idx}: {mark} -> R={r_core_raw:.3f} | {step.get('action_type')}")
 
     match_debug_logger.info(f"{'='*20} [Batch {batch_id}] End {'='*20}\n")
 
@@ -534,9 +528,14 @@ def _calculate_separated_advantages(steps: List[Dict[str, Any]], omega: float, c
 # 主入口
 # =============================================================================
 
-def compute_ccapo_advantages(g_calc_steps: List[Dict[str, Any]], g_online_steps: List[Dict[str, Any]], embedding_model, config):
+def compute_ccapo_advantages(g_calc_steps: List[Dict[str, Any]], 
+                             g_online_steps: List[Dict[str, Any]], 
+                             g_buffer_steps: List[Dict[str, Any]], # <--- ✅ [Fix] 接收显式传递的 Buffer
+                             embedding_model, 
+                             config):
     """
     [CCAPO V8.6] (With Reconstruction & Full Logs)
+    Signature fixed to accept 5 arguments.
     """
     ccapo_file_logger.info("=== [CCAPO V8.6] Start Calculation ===")
     
@@ -551,7 +550,10 @@ def compute_ccapo_advantages(g_calc_steps: List[Dict[str, Any]], g_online_steps:
             if 'traj_total_tokens' not in step: step['traj_total_tokens'] = 0
 
     g_calc_trajs = _group_steps_by_traj(g_calc_steps)
-    g_buffer_steps = [s for s in g_calc_steps if s.get('is_buffer_data', False)]
+    
+    # 注意：如果传入了 explicit g_buffer_steps，理论上我们不需要再从 g_calc_steps 里筛选
+    # 但为了保险起见，这里保持原逻辑用于分离计算，或者直接使用传入的参数
+    # 在 calculate_R_step_fail 中我们直接使用传入的 g_buffer_steps
     
     _calculate_R_tau(g_calc_trajs, config)
     
@@ -577,6 +579,7 @@ def compute_ccapo_advantages(g_calc_steps: List[Dict[str, Any]], g_online_steps:
             s['Z_core'] = z
             s['R_step'] = z + w_N * s.get('Z_novelty', 0.0) + s['R_format_penalty']
 
+    # 使用传入的 g_buffer_steps 列表 (如果为空列表则无副作用)
     _calculate_R_step_fail(g_calc_steps, g_buffer_steps, embedding_model, config)
     
     fail_steps = [s for s in g_calc_steps if s.get('R_core') == -1.0]

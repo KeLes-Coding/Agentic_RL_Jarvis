@@ -601,13 +601,12 @@ class DataParallelPPOActor(BasePPOActor):
         g_calc_steps_with_adv, lambda_sr = ccapo_algos.compute_ccapo_advantages(
             g_calc_steps,
             g_online_steps,
+            g_buffer_steps if G_buffer_batch else [], # 传入 buffer steps 列表以便分离计算
             embedding_model,
             ccapo_config
         )
         
         # ======================= ✅ [恢复] 奖励回写 =======================
-        # 仅写入 Online 数据，且排除 step 0
-        # steps_to_save = [s for s in g_calc_steps_with_adv if not s.get('is_buffer_data', False)]
         steps_to_save = g_calc_steps_with_adv
         self.save_reward_components_to_disk(steps_to_save)
         # ===============================================================
@@ -626,6 +625,7 @@ class DataParallelPPOActor(BasePPOActor):
             if batch_proto and 'advantages' in batch_proto.non_tensor_batch:
                 adv_np = batch_proto.non_tensor_batch.pop('advantages')
                 adv_list = [float(x) if x is not None else 0.0 for x in adv_np]
+                # 转换为 Tensor 方便后续处理
                 batch_proto.batch['advantages'] = torch.tensor(
                     adv_list, dtype=torch.float32, device=batch_proto.batch.device
                 )
@@ -637,8 +637,29 @@ class DataParallelPPOActor(BasePPOActor):
         temperature = G_online_batch.meta_info.get("temperature", 1.0)
         ppo_micro_batch_size = self.config.ppo_micro_batch_size_per_gpu or 1
         
-        online_weight = 0.8
-        buffer_weight = 0.2
+        # ======================= ✅ [V3 稳定性优化] 动态权重调整 =======================
+        # 逻辑：
+        # SR 低 -> 模型处于"学徒期" -> 增加 Buffer 权重 (复习标准答案) -> 稳定
+        # SR 高 -> 模型处于"出师期" -> 增加 Online 权重 (自我探索) -> 效率
+        # 设定一个保底值，防止完全遗忘 Buffer
+        
+        current_sr_val = max(0.0, min(1.0, lambda_sr))
+        
+        # 基础配置 (可从 config 读取，这里给默认值)
+        base_online = 0.5
+        max_online = 0.9
+        
+        # 线性插值: SR=0 -> w=0.5; SR=1 -> w=0.9
+        online_weight = base_online + (max_online - base_online) * current_sr_val
+        buffer_weight = 1.0 - online_weight
+        
+        # 如果 Buffer 为空 (冷启动阶段)，全量 Online
+        if not G_buffer_batch_final or G_buffer_batch_final.batch.batch_size[0] == 0:
+            online_weight = 1.0
+            buffer_weight = 0.0
+            
+        logger.info(f"[CCAPO Weights] SR={current_sr_val:.2f} | Online_W={online_weight:.2f} | Buffer_W={buffer_weight:.2f}")
+        # ===========================================================================
         
         metrics = {}
         debug_notes = {}
@@ -667,17 +688,29 @@ class DataParallelPPOActor(BasePPOActor):
                 batch_size = data_proto.batch.batch_size[0]
                 num_micros = (batch_size + ppo_micro_batch_size - 1) // ppo_micro_batch_size
                 
-                micro_batches = data_proto.select(
-                    list(data_proto.batch.keys()), 
-                    list(data_proto.non_tensor_batch.keys())
-                ).chunk(num_micros)
-
-                for micro_batch_proto in micro_batches:
-                    mb_dict = {
-                        **micro_batch_proto.batch.to(get_torch_device().current_device()),
-                        **micro_batch_proto.non_tensor_batch
-                    }
+                # Shuffle micro-batches for better stability (Optional but recommended)
+                indices = torch.randperm(batch_size)
+                
+                # 手动切分 Chunk
+                for i in range(num_micros):
+                    start_idx = i * ppo_micro_batch_size
+                    end_idx = min((i + 1) * ppo_micro_batch_size, batch_size)
+                    batch_indices = indices[start_idx:end_idx]
                     
+                    # 提取 Micro Batch 数据
+                    mb_dict = {}
+                    # Tensor data
+                    for k, v in data_proto.batch.items():
+                        mb_dict[k] = v[batch_indices].to(get_torch_device().current_device())
+                    # Non-tensor data (list slicing)
+                    for k, v in data_proto.non_tensor_batch.items():
+                        # Handle potential list vs tensor mismatch in non_tensor_batch
+                        try:
+                            mb_dict[k] = [v[idx] for idx in batch_indices.tolist()]
+                        except:
+                            mb_dict[k] = v # Fallback
+                    
+                    # Forward
                     entropy, log_prob = self._forward_micro_batch(
                         micro_batch=mb_dict,
                         temperature=temperature,
@@ -692,10 +725,17 @@ class DataParallelPPOActor(BasePPOActor):
 
                     if name == "online":
                         # [Online] PPO
+                        
+                        # ======================= ✅ [V3 稳定性优化] 优势截断 =======================
+                        # 防止单条极好或极差的轨迹产生过大梯度
+                        adv_batch = mb_dict["advantages"]
+                        adv_batch = torch.clamp(adv_batch, -4.0, 4.0) # 限制在 +/- 4.0 Sigma 内
+                        # =========================================================================
+
                         pg_loss, pg_clipfrac, ppo_kl, _ = compute_policy_loss(
-                            old_log_prob=mb_dict["rollout_log_probs"],
+                            old_log_prob=mb_dict["rollout_log_probs"], # 注意这里要是 tensor
                             log_prob=log_prob,
-                            advantages=mb_dict["advantages"],
+                            advantages=adv_batch,
                             response_mask=response_mask,
                             cliprange=self.config.clip_ratio,
                             cliprange_low=self.config.clip_ratio_low,
@@ -704,11 +744,13 @@ class DataParallelPPOActor(BasePPOActor):
                             loss_agg_mode=self.config.loss_agg_mode
                         )
                         policy_loss = pg_loss
-                        if epoch == 0:
+                        if epoch == 0 and i == 0:
                             append_to_dict(metrics, {
                                 "actor/pg_loss_online": pg_loss.detach().item(),
                                 "actor/ppo_kl_online": ppo_kl.detach().item(),
-                                "actor/clip_frac_online": pg_clipfrac.detach().item()
+                                "actor/clip_frac_online": pg_clipfrac.detach().item(),
+                                "actor/adv_mean": adv_batch.mean().item(), # Log Adv Mean
+                                "actor/adv_max": adv_batch.max().item()    # Log Adv Max
                             })
 
                     elif name == "buffer":
@@ -717,13 +759,14 @@ class DataParallelPPOActor(BasePPOActor):
                         valid_tokens = response_mask.sum() + 1e-6
                         bc_loss = - masked_log_prob.sum() / valid_tokens
                         policy_loss = bc_loss
-                        if epoch == 0:
+                        if epoch == 0 and i == 0:
                             append_to_dict(metrics, {"actor/bc_loss_buffer": bc_loss.detach().item()})
                     
                     if self.config.entropy_coeff != 0.0 and entropy is not None:
                         entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=self.config.loss_agg_mode)
                         policy_loss = policy_loss - entropy_loss * self.config.entropy_coeff
 
+                    # Loss Scaling
                     scaled_loss = (loss_weight * policy_loss) / total_micro_batches
                     scaled_loss.backward()
                     total_loss_acc += policy_loss.detach().item() * loss_weight
@@ -732,10 +775,11 @@ class DataParallelPPOActor(BasePPOActor):
             if epoch == 0:
                 append_to_dict(metrics, {
                     "actor/total_weighted_loss": total_loss_acc,
-                    "actor/grad_norm": grad_norm.detach().item()
+                    "actor/grad_norm": grad_norm.detach().item(),
+                    "actor/weight_online": online_weight
                 })
 
-        # --- 6. 仪表盘日志 (恢复全量统计) ---
+        # --- 6. 仪表盘日志 ---
         self._log_dashboard_metrics(metrics, online_steps_final, buffer_steps_final, lambda_sr)
 
         # --- 7. 准备 STDB 更新数据 ---
