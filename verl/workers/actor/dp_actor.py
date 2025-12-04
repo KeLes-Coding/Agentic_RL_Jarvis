@@ -463,13 +463,11 @@ class DataParallelPPOActor(BasePPOActor):
     def save_reward_components_to_disk(self, steps_list: List[Dict[str, Any]]):
         """
         将内存中计算出的奖励分数写回到磁盘。
-        (✅ Fix V4: 严格修复索引错位问题，防止 Step 0 被写入)
+        (✅ Fix V5: Added Persistence for Anchor Metadata)
         """
         if not self.config.get("save_reward_components", True):
             return
 
-        # logger.info(f"[Reward Write-Back] 开始回写 {len(steps_list)} 个步骤的奖励...")
-        
         # 1. 按 log_dir_path 分组
         steps_by_traj = collections.defaultdict(list)
         for step in steps_list:
@@ -478,7 +476,9 @@ class DataParallelPPOActor(BasePPOActor):
                 steps_by_traj[log_dir_path].append(step)
         
         # 2. 定义要保存的键
-        macro_keys = ['R_tau', 'R_core', 'A_traj']
+        # ✅ [新增] 将 'anchor_uid' 和 'is_anchor' 加入 macro_keys，以便写入 summary.json
+        macro_keys = ['R_tau', 'R_core', 'A_traj', 'anchor_uid', 'is_anchor']
+        
         reward_keys_to_save = macro_keys + [
             'R_step', 'A_step', 'advantages', 'A_final_raw',
             'R_core_raw', 'R_match_raw', 'R_novelty_bonus', 'R_format_penalty',
@@ -495,24 +495,18 @@ class DataParallelPPOActor(BasePPOActor):
             for step in steps:
                 try:
                     step_index_val = step['step_index']
-                    # 强制转换为 int
                     if hasattr(step_index_val, 'item'):
                         step_index = int(step_index_val.item())
                     else:
                         step_index = int(step_index_val)
                     
-                    # --- ✅ [关键索引修复] ---
                     is_buffer = step.get('is_buffer_data', False)
                     
                     if is_buffer:
-                        # Buffer 数据 (来自 STDB): 内存索引通常是 1-based (1..T)
                         target_file_index = step_index
                     else:
-                        # Online 数据 (来自 Rollout): 内存索引是 0-based (0..T-1)
-                        # 需要 +1 才能对应磁盘 step_1..step_T
                         target_file_index = step_index + 1
                     
-                    # ⛔️ [严格防御] 绝对不允许写入 step_0 (Reset 目录)
                     if target_file_index < 1:
                         continue
 
@@ -520,7 +514,6 @@ class DataParallelPPOActor(BasePPOActor):
                     step_detail_path = os.path.join(log_dir_path, f"step_{target_file_index}", "step_details.json")
                     
                     if os.path.exists(step_detail_path):
-                        # 准备 payload
                         reward_payload = {}
                         for key in reward_keys_to_save:
                             if key in step:
@@ -529,7 +522,6 @@ class DataParallelPPOActor(BasePPOActor):
                                 if hasattr(val, 'dtype'): val = float(val)
                                 reward_payload[key] = val
                         
-                        # 读取 -> 更新 -> 写入
                         try:
                             with open(step_detail_path, 'r', encoding='utf-8') as f:
                                 s_data = json.load(f)
@@ -543,10 +535,9 @@ class DataParallelPPOActor(BasePPOActor):
                                 json.dump(s_data, f, indent=4, ensure_ascii=False)
                             
                             updated_count += 1
-                        except Exception as io_e:
-                            pass # 文件读写冲突忽略
+                        except Exception: pass
 
-                        # --- B. 更新 summary.json (宏观数据，每条轨迹只更新一次) ---
+                        # --- B. 更新 summary.json (关键修改) ---
                         if not summary_updated:
                             summary_path = os.path.join(log_dir_path, "summary.json")
                             if os.path.exists(summary_path):
@@ -564,25 +555,49 @@ class DataParallelPPOActor(BasePPOActor):
                                             sum_data["reward_summary"] = {}
                                         sum_data["reward_summary"].update(macro_payload)
                                         
+                                        # ✅ [冗余备份] 也直接写在根层级，方便 Viewer 读取
+                                        if 'anchor_uid' in macro_payload:
+                                            sum_data['anchor_uid'] = macro_payload['anchor_uid']
+                                        if 'is_anchor' in macro_payload:
+                                            sum_data['is_anchor'] = macro_payload['is_anchor']
+                                        
                                         with open(summary_path, 'w', encoding='utf-8') as f:
                                             json.dump(sum_data, f, indent=4, ensure_ascii=False)
                                         
                                         summary_updated = True
                                     except: pass
-                    else:
-                        pass
-
-                except Exception as e:
-                    logger.warning(f"[Write-Back] Traj: {log_dir_path} Idx: {step_index} Error: {e}")
+                except Exception: pass
 
         # if updated_count > 0:
         #      logger.info(f"[Reward Write-Back] 完成。更新了 {updated_count} 个步骤文件。")
 
+    def _extract_micro_batch(self, data_proto, indices):
+        """
+        [CCAPO Helper] 从 DataProto 中提取指定索引的 Micro Batch。
+        处理 Tensor 和非 Tensor (List) 数据。
+        """
+        mb = {}
+        # 1. 处理 Tensor 数据
+        for k, v in data_proto.batch.items():
+            mb[k] = v[indices].to(get_torch_device().current_device())
+            
+        # 2. 处理非 Tensor 数据 (如 multi_modal_inputs 列表)
+        for k, v in data_proto.non_tensor_batch.items():
+            try:
+                # 列表切片
+                mb[k] = [v[idx] for idx in indices.tolist()]
+            except TypeError:
+                # 如果 v 不是列表 (可能是 None 或其他)，直接复制
+                mb[k] = v
+        return mb
+
     @GPUMemoryLogger(role="dp actor (CCAPO)", logger=logger)
     def update_policy_ccapo(self, G_online_batch: DataProto, G_buffer_batch: DataProto, embedding_model, ccapo_config: DictConfig):
         """
-        [CCAPO Refactored] 执行 CCAPO 策略更新。
-        Mixed Loss: Online(PPO) + Buffer(BC)
+        [CCAPO Refactored V8.7] 执行 CCAPO 策略更新。
+        Fixes:
+        1. Joint Gradient Update (防止锯齿震荡).
+        2. Fixed Weights (0.8 Online / 0.2 Buffer).
         """
         self.actor_module.train()
 
@@ -590,23 +605,22 @@ class DataParallelPPOActor(BasePPOActor):
         g_online_steps = to_list_of_dict(G_online_batch)
         
         g_calc_steps = g_online_steps
+        g_buffer_steps = []
         if G_buffer_batch:
             g_buffer_steps = to_list_of_dict(G_buffer_batch)
             if g_buffer_steps:
                 g_calc_steps = g_online_steps + g_buffer_steps 
-            else:
-                g_calc_steps = g_online_steps 
         
-        # --- 2. 计算优势 ---
+        # --- 2. 计算优势 (调用修正后的无 Z-Score 版本) ---
         g_calc_steps_with_adv, lambda_sr = ccapo_algos.compute_ccapo_advantages(
             g_calc_steps,
             g_online_steps,
-            g_buffer_steps if G_buffer_batch else [], # 传入 buffer steps 列表以便分离计算
+            g_buffer_steps if G_buffer_batch else [], 
             embedding_model,
             ccapo_config
         )
         
-        # ======================= ✅ [恢复] 奖励回写 =======================
+        # ======================= [恢复] 奖励回写 =======================
         steps_to_save = g_calc_steps_with_adv
         self.save_reward_components_to_disk(steps_to_save)
         # ===============================================================
@@ -624,165 +638,147 @@ class DataParallelPPOActor(BasePPOActor):
         def _fix_advantages_tensor(batch_proto):
             if batch_proto and 'advantages' in batch_proto.non_tensor_batch:
                 adv_np = batch_proto.non_tensor_batch.pop('advantages')
-                adv_list = [float(x) if x is not None else 0.0 for x in adv_np]
                 # 转换为 Tensor 方便后续处理
                 batch_proto.batch['advantages'] = torch.tensor(
-                    adv_list, dtype=torch.float32, device=batch_proto.batch.device
+                    [float(x) if x is not None else 0.0 for x in adv_np], 
+                    dtype=torch.float32, device=batch_proto.batch.device
                 )
         
         _fix_advantages_tensor(G_online_batch_final)
         _fix_advantages_tensor(G_buffer_batch_final)
 
-        # --- 4. 准备训练参数 ---
+        # --- 4. 准备训练参数与权重 ---
         temperature = G_online_batch.meta_info.get("temperature", 1.0)
         ppo_micro_batch_size = self.config.ppo_micro_batch_size_per_gpu or 1
         
-        # ======================= ✅ [V3 稳定性优化] 动态权重调整 =======================
-        # 逻辑：
-        # SR 低 -> 模型处于"学徒期" -> 增加 Buffer 权重 (复习标准答案) -> 稳定
-        # SR 高 -> 模型处于"出师期" -> 增加 Online 权重 (自我探索) -> 效率
-        # 设定一个保底值，防止完全遗忘 Buffer
+        # [策略调整] 固定权重混合
+        has_buffer = (G_buffer_batch_final is not None and G_buffer_batch_final.batch.batch_size[0] > 0)
         
-        current_sr_val = max(0.0, min(1.0, lambda_sr))
-        
-        # 基础配置 (可从 config 读取，这里给默认值)
-        base_online = 0.5
-        max_online = 0.9
-        
-        # 线性插值: SR=0 -> w=0.5; SR=1 -> w=0.9
-        online_weight = base_online + (max_online - base_online) * current_sr_val
-        buffer_weight = 1.0 - online_weight
-        
-        # 如果 Buffer 为空 (冷启动阶段)，全量 Online
-        if not G_buffer_batch_final or G_buffer_batch_final.batch.batch_size[0] == 0:
-            online_weight = 1.0
-            buffer_weight = 0.0
+        # 如果有 Buffer，使用 0.8 / 0.2；否则全量 Online
+        online_weight = 0.8 if has_buffer else 1.0
+        buffer_weight = 0.2 if has_buffer else 0.0
             
-        logger.info(f"[CCAPO Weights] SR={current_sr_val:.2f} | Online_W={online_weight:.2f} | Buffer_W={buffer_weight:.2f}")
-        # ===========================================================================
-        
+        logger.info(f"[CCAPO Weights] Fixed: Online={online_weight:.2f} | Buffer={buffer_weight:.2f}")
+
+        # --- 5. 联合训练循环 (Joint Gradient Update) ---
         metrics = {}
         debug_notes = {}
-
-        # --- 5. 训练循环 ---
+        
+        n_online = G_online_batch_final.batch.batch_size[0]
+        # 计算所需的 micro-batch 步数 (以 Online 为主节奏)
+        n_micros_online = (n_online + ppo_micro_batch_size - 1) // ppo_micro_batch_size
+        
+        if has_buffer:
+            n_buffer = G_buffer_batch_final.batch.batch_size[0]
+        
         for epoch in range(self.config.ppo_epochs):
-            self.actor_optimizer.zero_grad()
+            # 每个 Epoch 打乱索引
+            indices_online = torch.randperm(n_online)
+            indices_buffer = torch.randperm(n_buffer) if has_buffer else None
             
-            batches_to_process = []
-            if G_online_batch_final and G_online_batch_final.batch.batch_size[0] > 0:
-                batches_to_process.append((G_online_batch_final, online_weight, "online"))
-            if G_buffer_batch_final and G_buffer_batch_final.batch.batch_size[0] > 0:
-                batches_to_process.append((G_buffer_batch_final, buffer_weight, "buffer"))
-            
-            if not batches_to_process: break
-
-            total_micro_batches = sum(
-                (proto.batch.batch_size[0] + ppo_micro_batch_size - 1) // ppo_micro_batch_size
-                for proto, _, _ in batches_to_process
-            )
-            if total_micro_batches == 0: break
-
-            total_loss_acc = 0.0
-
-            for data_proto, loss_weight, name in batches_to_process:
-                batch_size = data_proto.batch.batch_size[0]
-                num_micros = (batch_size + ppo_micro_batch_size - 1) // ppo_micro_batch_size
+            for i in range(n_micros_online):
+                # ✅ 关键：Step 开始前清零梯度
+                self.actor_optimizer.zero_grad()
                 
-                # Shuffle micro-batches for better stability (Optional but recommended)
-                indices = torch.randperm(batch_size)
+                # ==========================
+                # Part A: Online (PPO) Update
+                # ==========================
+                start_idx = i * ppo_micro_batch_size
+                end_idx = min((i + 1) * ppo_micro_batch_size, n_online)
+                batch_idx = indices_online[start_idx:end_idx]
                 
-                # 手动切分 Chunk
-                for i in range(num_micros):
-                    start_idx = i * ppo_micro_batch_size
-                    end_idx = min((i + 1) * ppo_micro_batch_size, batch_size)
-                    batch_indices = indices[start_idx:end_idx]
-                    
-                    # 提取 Micro Batch 数据
-                    mb_dict = {}
-                    # Tensor data
-                    for k, v in data_proto.batch.items():
-                        mb_dict[k] = v[batch_indices].to(get_torch_device().current_device())
-                    # Non-tensor data (list slicing)
-                    for k, v in data_proto.non_tensor_batch.items():
-                        # Handle potential list vs tensor mismatch in non_tensor_batch
-                        try:
-                            mb_dict[k] = [v[idx] for idx in batch_indices.tolist()]
-                        except:
-                            mb_dict[k] = v # Fallback
-                    
-                    # Forward
-                    entropy, log_prob = self._forward_micro_batch(
-                        micro_batch=mb_dict,
-                        temperature=temperature,
-                        calculate_entropy=(self.config.entropy_coeff != 0.0)
-                    )
-                    
-                    response_length = mb_dict["responses"].size(1)
-                    if "loss_mask" in mb_dict:
-                        response_mask = mb_dict["loss_mask"][:, -response_length:]
-                    else:
-                        response_mask = mb_dict["attention_mask"][:, -response_length:]
+                mb_online = self._extract_micro_batch(G_online_batch_final, batch_idx)
+                
+                # Forward
+                entropy_on, log_prob_on = self._forward_micro_batch(
+                    mb_online, temperature, calculate_entropy=(self.config.entropy_coeff != 0.0)
+                )
+                
+                response_len_on = mb_online["responses"].size(1)
+                mask_on = mb_online["attention_mask"][:, -response_len_on:]
+                if "loss_mask" in mb_online:
+                     mask_on = mb_online["loss_mask"][:, -response_len_on:]
 
-                    if name == "online":
-                        # [Online] PPO
+                # PPO Loss
+                # 优势截断：防止极端值破坏梯度
+                adv_batch = torch.clamp(mb_online["advantages"], -4.0, 4.0)
+
+                pg_loss, pg_clipfrac, ppo_kl, _ = compute_policy_loss(
+                    old_log_prob=mb_online["old_log_probs"],
+                    log_prob=log_prob_on,
+                    advantages=adv_batch,
+                    response_mask=mask_on,
+                    cliprange=self.config.clip_ratio,
+                    cliprange_low=self.config.clip_ratio_low,
+                    cliprange_high=self.config.clip_ratio_high,
+                    clip_ratio_c=self.config.get("clip_ratio_c", 3.0),
+                    loss_agg_mode=self.config.loss_agg_mode
+                )
+                
+                policy_loss_on = pg_loss
+                if self.config.entropy_coeff != 0.0 and entropy_on is not None:
+                    entropy_loss = agg_loss(loss_mat=entropy_on, loss_mask=mask_on, loss_agg_mode=self.config.loss_agg_mode)
+                    policy_loss_on = policy_loss_on - entropy_loss * self.config.entropy_coeff
+
+                # Backward Online (累积梯度)
+                (policy_loss_on * online_weight).backward()
+                
+                # Log metrics (first step only)
+                if epoch == 0 and i == 0:
+                    append_to_dict(metrics, {
+                        "actor/pg_loss_online": pg_loss.detach().item(),
+                        "actor/ppo_kl_online": ppo_kl.detach().item(),
+                        "actor/clip_frac_online": pg_clipfrac.detach().item(),
+                        "actor/adv_mean": adv_batch.mean().item()
+                    })
+
+                # ==========================
+                # Part B: Buffer (BC) Update
+                # ==========================
+                if has_buffer:
+                    # Buffer 索引循环逻辑：如果 Buffer 比 Online 小，则循环使用
+                    start_b = (i * ppo_micro_batch_size) % n_buffer
+                    end_b = min(start_b + ppo_micro_batch_size, n_buffer)
+                    
+                    # 处理索引回绕情况，简单起见如果切片跨越边界，取剩余部分即可
+                    # 更严谨的做法是拼接，但作为 Buffer 随机采样，这样足够了
+                    if end_b <= start_b: 
+                        end_b = n_buffer
                         
-                        # ======================= ✅ [V3 稳定性优化] 优势截断 =======================
-                        # 防止单条极好或极差的轨迹产生过大梯度
-                        adv_batch = mb_dict["advantages"]
-                        adv_batch = torch.clamp(adv_batch, -4.0, 4.0) # 限制在 +/- 4.0 Sigma 内
-                        # =========================================================================
-
-                        pg_loss, pg_clipfrac, ppo_kl, _ = compute_policy_loss(
-                            old_log_prob=mb_dict["rollout_log_probs"], # 注意这里要是 tensor
-                            log_prob=log_prob,
-                            advantages=adv_batch,
-                            response_mask=response_mask,
-                            cliprange=self.config.clip_ratio,
-                            cliprange_low=self.config.clip_ratio_low,
-                            cliprange_high=self.config.clip_ratio_high,
-                            clip_ratio_c=self.config.get("clip_ratio_c", 3.0),
-                            loss_agg_mode=self.config.loss_agg_mode
-                        )
-                        policy_loss = pg_loss
-                        if epoch == 0 and i == 0:
-                            append_to_dict(metrics, {
-                                "actor/pg_loss_online": pg_loss.detach().item(),
-                                "actor/ppo_kl_online": ppo_kl.detach().item(),
-                                "actor/clip_frac_online": pg_clipfrac.detach().item(),
-                                "actor/adv_mean": adv_batch.mean().item(), # Log Adv Mean
-                                "actor/adv_max": adv_batch.max().item()    # Log Adv Max
-                            })
-
-                    elif name == "buffer":
-                        # [Buffer] BC Loss
-                        masked_log_prob = log_prob * response_mask
-                        valid_tokens = response_mask.sum() + 1e-6
-                        bc_loss = - masked_log_prob.sum() / valid_tokens
-                        policy_loss = bc_loss
-                        if epoch == 0 and i == 0:
-                            append_to_dict(metrics, {"actor/bc_loss_buffer": bc_loss.detach().item()})
+                    batch_idx_b = indices_buffer[start_b:end_b]
+                    mb_buffer = self._extract_micro_batch(G_buffer_batch_final, batch_idx_b)
                     
-                    if self.config.entropy_coeff != 0.0 and entropy is not None:
-                        entropy_loss = agg_loss(loss_mat=entropy, loss_mask=response_mask, loss_agg_mode=self.config.loss_agg_mode)
-                        policy_loss = policy_loss - entropy_loss * self.config.entropy_coeff
+                    # Forward Buffer (No Entropy needed for BC usually)
+                    _, log_prob_buf = self._forward_micro_batch(mb_buffer, temperature, calculate_entropy=False)
+                    
+                    # BC Loss
+                    response_len_buf = mb_buffer["responses"].size(1)
+                    mask_buf = mb_buffer["attention_mask"][:, -response_len_buf:]
+                    
+                    # Standard BC Loss: Minimize -log_prob(expert_action)
+                    # masked_log_prob = log_prob * mask
+                    valid_tokens = mask_buf.sum() + 1e-6
+                    bc_loss = - (log_prob_buf * mask_buf).sum() / valid_tokens
+                    
+                    # Backward Buffer (累积梯度)
+                    (bc_loss * buffer_weight).backward()
+                    
+                    if epoch == 0 and i == 0:
+                        append_to_dict(metrics, {"actor/bc_loss_buffer": bc_loss.detach().item()})
 
-                    # Loss Scaling
-                    scaled_loss = (loss_weight * policy_loss) / total_micro_batches
-                    scaled_loss.backward()
-                    total_loss_acc += policy_loss.detach().item() * loss_weight
+                # ==========================
+                # Part C: Optimizer Step
+                # ==========================
+                # ✅ 关键：在所有 Loss Backward 完成后，统一更新一次
+                grad_norm = self._optimizer_step()
+                
+                if epoch == 0 and i == 0:
+                    append_to_dict(metrics, {"actor/grad_norm": grad_norm.detach().item()})
 
-            grad_norm = self._optimizer_step()
-            if epoch == 0:
-                append_to_dict(metrics, {
-                    "actor/total_weighted_loss": total_loss_acc,
-                    "actor/grad_norm": grad_norm.detach().item(),
-                    "actor/weight_online": online_weight
-                })
-
-        # --- 6. 仪表盘日志 ---
+        # --- 6. 仪表盘日志 (保持不变) ---
         self._log_dashboard_metrics(metrics, online_steps_final, buffer_steps_final, lambda_sr)
 
-        # --- 7. 准备 STDB 更新数据 ---
+        # --- 7. 准备 STDB 更新数据 (保持不变) ---
         online_trajs_for_stdb = ccapo_algos._group_steps_by_traj(online_steps_final)
         cpu_trajs_for_stdb = {}
         for uid, steps in online_trajs_for_stdb.items():

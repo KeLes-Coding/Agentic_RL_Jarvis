@@ -278,7 +278,7 @@ algorithm:
 
     # R_format_novelty (Sec 5.3)
     w_N: 0.2                    # R_format_novelty 的权重
-    base_bonus: 0.2             # R_format_novelty 的基础奖励
+    base_bonus: 0.05             # R_format_novelty 的基础奖励
     penalty_format_error: -2.0  # JSON 格式错误的惩罚
     penalty_failure: -1.0       # 动作执行失败 (非 JSON 错误) 的惩罚
     
