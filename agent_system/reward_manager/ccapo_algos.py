@@ -204,9 +204,9 @@ def _calculate_A_traj(g_calc_steps: List[Dict[str, Any]], current_sr: float):
     """
     [Sec 4.2 Optimized V2] 计算 A_traj
     修改点：
-    1. 全错一致 (All Fail Same) -> Adv = -0.5 (软惩罚，防止因 R_step 正向导致刷分)
-    2. 全对一致 (All Success Same) -> Adv = 0.0 (完美收敛)
-    3. 正常差异 -> 微小 epsilon
+    1. 全错一致 (All Fail Same) -> Adv = -0.5
+    2. 全对一致 (All Success Same) -> Adv = 0.0
+    3. [新增] 成功样本正向保护 (Success Protection): 防止成功样本因归一化变为负值
     """
     if not g_calc_steps: return
     all_R_tau = [step.get('R_tau', 0.0) for step in g_calc_steps]
@@ -218,17 +218,14 @@ def _calculate_A_traj(g_calc_steps: List[Dict[str, Any]], current_sr: float):
     # --- 核心数学修正 ---
     
     # Case 1: 全错且一致 (All Fail Same)
-    # [用户修正] 不能设为 0.0，否则模型会为了追求 R_step 而故意失败。
-    # 设为 -0.5，给予基础负反馈，保证 Success (>0) 永远优于 Failure (-0.5)。
     if r_ptp < 1e-6 and mean_R <= 0:
         raw_advantages = [-0.5 for _ in all_R_tau]
         match_debug_logger.info(f"  [A_traj] All Fail Same (Mean={mean_R:.2f}). Adv=-0.5 (Soft Penalty)")
 
     # Case 2: 全对且一致 (All Success Same)
-    # 既然都满分且效率一样，保持静默，防止数值噪音。
     elif r_ptp < 1e-6 and mean_R > 0:
         raw_advantages = [0.1 for _ in all_R_tau]
-        match_debug_logger.info(f"  [A_traj] All Success Same. Adv=0.0")
+        match_debug_logger.info(f"  [A_traj] All Success Same. Adv=0.1")
              
     # Case 3: 存在差异 (正常情况)
     else:
@@ -236,17 +233,25 @@ def _calculate_A_traj(g_calc_steps: List[Dict[str, Any]], current_sr: float):
         safe_std = std_R + 1e-8
         raw_advantages = [(v - mean_R) / safe_std for v in all_R_tau]
 
-    # --- 保护机制 (保持不变) ---
+    # --- 保护机制 (Protection Mechanism) ---
     protection_factor = min(max(current_sr, 0.2), 1.0)
 
     final_advantages = []
     for r_val, adv_val in zip(all_R_tau, raw_advantages):
+        
+        # [关键修改] 成功样本保护
+        # 如果任务成功(R_tau > 0)，但归一化后 Advantage < 0 (因为别人分更高)，
+        # 我们不能让它变成负分，否则模型会认为这次成功是"错误"的。
         if r_val > 0.0 and adv_val < 0.0:
-            adv_val = adv_val * protection_factor
-        elif r_val < 0.0 and adv_val > 0.0:
+            # 强制给予微小的正向奖励，或者至少为 0
+            adv_val = 0.05 
+            
+        # 失败样本限制
+        elif r_val <= 0.0 and adv_val > 0.0:
             # 即使是"优秀的失败"，也要限制其优势不能超过 -0.05
             # 防止其看起来比"差劲的成功"还要好
             adv_val = -0.05 
+        
         final_advantages.append(adv_val)
 
     # Clip 范围限制，防止单样本梯度爆炸
@@ -332,27 +337,19 @@ def _calculate_R_format_penalty(g_calc_steps: List[Dict[str, Any]], config):
 # =============================================================================
 # [修改] 动作新颖性组件 (符合文稿：全局计数 + 成功筛选)
 # =============================================================================
-
 def _calculate_action_novelty(g_calc_steps: List[Dict[str, Any]], config):
     """
-    [CCAPO V9.2 Fix] 基于全局成功计数的动作新颖性 + 格式奖励饱和机制
+    [CCAPO V9.3 Simplified] 纯粹的新颖性奖励
     
-    修复逻辑:
-    针对 "tap(1) 刷屏" 现象。原因为: 新颖性趋近于0，但格式奖励恒定为+0.1，导致 Agent 
-    依然能从烂大街的动作中获利。
-    
-    Fix: 引入 saturation_threshold (饱和阈值)。
-    当一个动作的全局计数超过阈值(如50次)时，认为 Agent 已熟练掌握该格式，
-    强制移除该步的 Format Bonus，迫使 Agent 探索新动作以获取奖励。
+    退化逻辑:
+    1. 移除 saturation_threshold 和剥夺 Format Bonus 的逻辑。
+    2. Global Counts 仅用于计算 Z_novelty (探索奖励)，该奖励会自然衰减至 0。
+    3. 防止 reward hacking 的任务完全移交给 _calculate_repetition_penalty 和 Anchor 匹配机制。
     """
     use_fine_grained = getattr(config, 'use_fine_grained_action', True)
     base_bonus = getattr(config, 'base_bonus', 0.2) 
     
-    # [新增] 饱和阈值：超过这个次数，该动作不再发放“低保”(Format Bonus)
-    # 建议设为 30-100 之间，给予 Agent 足够的练习次数，但不允许无限刷
-    saturation_threshold = getattr(config, 'novelty_saturation_threshold', 50)
-
-    # 1. 路径定义与加载
+    # 路径定义与加载
     count_file = "logger/CCAPO/global_action_counts.json"
     global_counts = _load_global_counts(count_file)
     
@@ -367,37 +364,31 @@ def _calculate_action_novelty(g_calc_steps: List[Dict[str, Any]], config):
         # 生成动作指纹
         act_id = _get_deterministic_id(step, use_fine_grained)
         
-        # 获取当前全局计数 + 本 Batch 内已累积的计数
+        # 获取计数
         current_global = global_counts.get(act_id, 0)
         current_batch_inc = new_counts_update[act_id]
         total_count = current_global + current_batch_inc
         
-        # --- Part A: 计算新颖性奖励 (不变) ---
+        # --- Part A: 计算新颖性奖励 (自然衰减) ---
+        # 随着 total_count 增加，novelty_score 会趋近于 0
+        # 这本身就是一种“软饱和”，不需要人为硬截断
         calc_denom = np.sqrt(total_count + 1)
         novelty_score = base_bonus / calc_denom
         step['Z_novelty'] = novelty_score
         
-        # --- Part B [CRITICAL FIX]: 格式奖励饱和剥离 ---
-        # 如果动作已经太老旧 (total_count > threshold)，说明 Agent 只是在刷单
-        # 此时不仅没有新颖性，连之前的 Format Bonus 也要收回
-        if total_count > saturation_threshold:
-            current_fmt_penalty = step.get('R_format_penalty', 0.0)
-            # 只剥离正向的 Bonus，保留负向的 Penalty (报错依然要扣分)
-            if current_fmt_penalty > 0:
-                step['R_format_penalty'] = 0.0
-                # (可选) 标记状态，方便调试
-                # step['action_status'] = f"SATURATED::{step.get('action_status','')}"
+        # --- [Removed] Part B: 移除格式奖励饱和剥离 ---
+        # 我们不再因为动作“老旧”而剥夺它的 R_format_penalty。
+        # "正确的老动作" (SOP) 应该保留 Format Bonus。
+        # "错误的老动作" (Hacking) 将由 Repetition Penalty 制裁。
 
         # 记录增量
         new_counts_update[act_id] += 1
 
-    # 3. 更新并保存全局计数
+    # 更新并保存
     if new_counts_update:
         for k, v in new_counts_update.items():
             global_counts[k] = global_counts.get(k, 0) + v
-            
         _save_global_counts(count_file, global_counts)
-        ccapo_file_logger.info(f"[NOVELTY] Updated global counts for {len(new_counts_update)} unique actions.")
 
 def _calculate_repetition_penalty(g_calc_trajs: Dict[str, List[Dict[str, Any]]], config):
     """
@@ -454,100 +445,86 @@ def _calculate_repetition_penalty(g_calc_trajs: Dict[str, List[Dict[str, Any]]],
 
 def _calculate_R_step_success(g_calc_steps: List[Dict[str, Any]], g_calc_trajs: Dict[str, List[Dict[str, Any]]], config):
     """
-    [Sec 5.1 Revised] 基于结构化共识的 LCS 奖励
+    [CCAPO Simplified] 极简版 LCS + Q_step (Fixed for Trajectory Efficiency)
     
-    Update Logic (V5.2 - Explicit Anchor Persistence):
-    1. Anchor Selection: Max R_tau -> Min Steps -> Min Tokens.
-    2. Data Injection: Inject 'anchor_uid' and 'is_anchor' into steps for disk persistence.
+    逻辑:
+    1. 选出 Anchor (Batch内 R_tau 最高 & 长度最短)。
+    2. 计算轨迹的全局效率乘数 Q_step (由 N_success 决定，全轨迹共享)。
+    3. 如果当前步在 Anchor 的 LCS 序列中 -> R = 1.0 * Q_step
+    4. 如果当前步不在 LCS 序列中       -> R = 0.5 * Q_step (保留探索空间)
     """
-    use_fine_grained = getattr(config, 'use_fine_grained_action', True)
-    beta = getattr(config, 'redundancy_penalty', 0.2)
-
-    batch_id = datetime.datetime.now().strftime("%H:%M:%S.%f")
-    match_debug_logger.info(f"\n\n{'='*20} [Batch {batch_id}] Start Consensus LCS (V5.2 Explicit Anchor) {'='*20}")
-
-    # --- 1. 数据准备与 P_global 统计准备 ---
+    
+    # --- 1. 数据清洗与筛选 ---
     success_traj_info = {}
-    action_type_counts = collections.defaultdict(int) 
     
     for traj_uid, raw_steps in g_calc_trajs.items():
         if not raw_steps: continue
-        
-        # 只处理 R_core == 1.0 的成功轨迹
+        # 只处理成功的轨迹
         if raw_steps[0].get('R_core') != 1.0: continue
         
-        # 轨迹重建
+        # 轨迹重建 (内存/磁盘)
         steps = _reconstruct_trajectory_from_disk(raw_steps)
-        is_buffer = steps[0].get('is_buffer_data', False)
         
-        valid_steps = []
+        # 提取用于 LCS 对比的指纹序列
         act_identifiers = []
-        traj_action_types = set()
+        valid_steps = []
         
+        # [修改] 用于统计 N_success 的计数器
+        n_success_count = 0 
+
         for step in steps:
+            # 过滤掉 Buffer 中可能的无效步或 System 步
+            # 注意：按照定义，N_success 只包含 action_success=True 的步骤
+            is_valid_success = step.get('action_success', False)
+            
+            # 兼容 Buffer Data (通常默认视为 Success)
+            if step.get('is_buffer_data'):
+                is_valid_success = True
+
+            if not is_valid_success:
+                continue
+                
+            n_success_count += 1
+                
+            # 构造指纹 (Action Type + Parsed Content)
             s_type = step.get('action_type', '')
             s_parsed = step.get('parsed_action')
-            s_success = step.get('action_success', False)
-            is_healed = step.get('is_healed_data', False)
-            status = step.get('action_status', '')
+            # 简单处理，确保指纹稳定性
+            act_str = str(s_parsed).strip() if s_parsed else ""
+            act_id = f"{s_type}::{act_str}"
             
-            keep = False
-            if is_buffer or is_healed:
-                if not (status.startswith('FAILURE') or status.startswith('ERROR') or status.startswith('FORMAT')):
-                    keep = True
-            else:
-                if s_success:
-                    keep = True
-            
-            if keep:
-                valid_steps.append(step)
-                # 构造 ID
-                if use_fine_grained:
-                    act_str = str(s_parsed).strip() if s_parsed else ""
-                    act_identifier = f"{s_type}::{act_str}"
-                else:
-                    act_identifier = s_type
-                act_identifiers.append(act_identifier)
-                
-                traj_action_types.add(s_type)
+            act_identifiers.append(act_id)
+            valid_steps.append(step)
 
         if valid_steps:
-            for at in traj_action_types:
-                action_type_counts[at] += 1
-
             success_traj_info[traj_uid] = {
-                'steps': valid_steps, 
+                'steps': valid_steps, # 注意：这是过滤后的 steps，回写时需要映射回 raw_steps
+                'all_steps_raw': steps, # 保留原始引用以便回写
                 'act_ids': act_identifiers, 
                 'n_steps': len(valid_steps),
+                'n_success_count': n_success_count, # [新增] 明确记录 N_success
                 'n_tokens': steps[0].get('traj_total_tokens', 0),
-                'r_tau': steps[0].get('R_tau', 0.0), # 确保 R_tau 被记录
-                'is_buffer': is_buffer
+                'r_tau': steps[0].get('R_tau', 0.0)
             }
 
     if not success_traj_info: 
-        match_debug_logger.info("No successful trajectories found for consensus.")
         return
 
-    total_samples = len(success_traj_info)
-
-    # --- 2. 锚点进化 (Anchor Evolution - Revised per User Request) ---
-    # 规则：优先 R_tau 高 (Descending)，其次 步数少 (Ascending)，最后 Token 少 (Ascending)
+    # --- 2. 锚点选择 (Anchor Selection) ---
+    # 策略：R_tau 越大越好，Step 越少越好
     sorted_trajs = sorted(
         success_traj_info.items(), 
-        key=lambda item: (-item[1]['r_tau'], item[1]['n_steps'], item[1]['n_tokens']) 
+        key=lambda item: (-item[1]['r_tau'], item[1]['n_steps']) 
     )
-    
     anchor_uid, anchor_data = sorted_trajs[0]
     anchor_seq = anchor_data['act_ids']
     
-    match_debug_logger.info(f"\n>>> SELECTED ANCHOR: {anchor_uid}")
-    match_debug_logger.info(f"    R_tau: {anchor_data['r_tau']:.4f}, Len: {anchor_data['n_steps']}")
-    match_debug_logger.info(f"    Seq: {anchor_seq}")
+    # [可视化修复] 标记 Anchor 轨迹
+    for s in anchor_data['all_steps_raw']:
+        s['is_anchor'] = True
+        s['anchor_uid'] = str(anchor_uid) # 写入顶层便于概览
 
-    # --- 3. 计算 S_necessity (共识投票) ---
-    anchor_len = len(anchor_seq)
-    anchor_votes = [0] * anchor_len
-    
+    # --- 3. LCS 计算辅助函数 (标准 DP) ---
     def get_lcs_match_indices(seq_a, seq_b):
         m, n = len(seq_a), len(seq_b)
         dp = [[0] * (n + 1) for _ in range(m + 1)]
@@ -558,84 +535,81 @@ def _calculate_R_step_success(g_calc_steps: List[Dict[str, Any]], g_calc_trajs: 
                 else:
                     dp[i][j] = max(dp[i-1][j], dp[i][j-1])
         
-        matched_b = set()
-        mapping_b_to_a = {}
-        
+        matched_b_indices = set()
         i, j = m, n
         while i > 0 and j > 0:
             if seq_a[i-1] == seq_b[j-1]:
-                matched_b.add(j-1)
-                mapping_b_to_a[j-1] = i-1
+                matched_b_indices.add(j-1)
                 i -= 1; j -= 1
             elif dp[i-1][j] > dp[i][j-1]:
                 i -= 1
             else:
                 j -= 1
-        return matched_b, None, mapping_b_to_a
+        return matched_b_indices
 
-    # 投票阶段
-    for uid, info in success_traj_info.items():
-        curr_seq = info['act_ids']
-        if uid == anchor_uid:
-            for k in range(anchor_len):
-                anchor_votes[k] += 1
-        else:
-            _, _, mapping_b_to_a = get_lcs_match_indices(anchor_seq, curr_seq)
-            for k_b, k_a in mapping_b_to_a.items():
-                anchor_votes[k_a] += 1
-    
-    s_necessity_vec = [(v / (total_samples + 1e-6)) for v in anchor_votes]
-    
-    # --- 4. 奖励回写 (Write Back) ---
+    # --- 4. 奖励计算 (Binary LCS + Trajectory-Level Q_step) ---
     for traj_uid, info in success_traj_info.items():
         current_seq = info['act_ids']
-        current_steps = info['steps']
+        raw_steps_to_update = info['all_steps_raw']
         
-        # [Explicit Persistence] 标记锚点身份
-        is_anchor_traj = (traj_uid == anchor_uid)
+        # 计算 LCS 匹配索引 (相对于 valid_steps)
+        matched_indices_curr = get_lcs_match_indices(anchor_seq, current_seq)
         
-        m_steps_ratio = info['n_steps'] / config.max_steps
+        # [修改] 计算全局共享的 Q_step (Trajectory Efficiency Multiplier)
+        # 公式: max(0, 1 - alpha * (N_success / MaxSteps))
+        n_success = info['n_success_count']
+        m_steps_ratio = n_success / config.max_steps
         q_step = max(0.0, 1.0 - config.alpha_step * m_steps_ratio)
         
-        matched_indices_curr, _, mapping_b_to_a = get_lcs_match_indices(anchor_seq, current_seq)
+        # 遍历更新步骤
+        valid_idx_counter = 0
         
-        for idx, step in enumerate(current_steps):
-            # 注入锚点元数据 (用于 dp_actor 存盘)
-            step['anchor_uid'] = str(anchor_uid)
-            step['is_anchor'] = is_anchor_traj
+        for step in raw_steps_to_update:
+            # 初始化
+            step['R_core_raw'] = 0.0
+            # [可视化修复] 写入 Anchor 元数据，供前端 Tooltip 显示
+            step['meta_anchor_uid'] = str(anchor_uid)
             
-            if step.get('is_healed_data'): continue 
-
-            is_match = (idx in matched_indices_curr)
-            s_type = step.get('action_type', 'unknown')
+            should_eval = False
+            if step.get('action_success', False) or step.get('is_buffer_data'):
+                should_eval = True
             
-            s_nec = 0.0
-            s_util = 0.0
-            
-            if is_match:
-                # [Case 1] Match
-                anchor_idx = mapping_b_to_a[idx]
-                s_nec = s_necessity_vec[anchor_idx]
-                s_util = 1.0 
+            if should_eval:
+                is_match = (valid_idx_counter in matched_indices_curr)
                 
-                i_action = s_nec 
-                r_core_raw = i_action * q_step
+                # [修改] 不再根据 step_index 计算，直接使用计算好的全局 q_step
+                step['Q_step'] = q_step 
+                
+                if is_match:
+                    # --- [HIT] 命中锚点关键路径 ---
+                    r_core_raw = 1.0 * q_step
+                    
+                    step['R_core_raw'] = r_core_raw
+                    step['S_utility'] = 1.0 
+                    
+                    # [可视化修复] 这里的赋值决定了前端显示 "Match"
+                    step['I_action'] = 1.0 
+                    step['meta_lcs_id'] = f"MATCH_IDX_{valid_idx_counter}"
+                else:
+                    # --- [MISS] 偏离锚点 ---
+                    # 给予低保 (0.5 * Q_step)，允许探索
+                    r_core_raw = 0.5 * q_step
+                    
+                    step['R_core_raw'] = r_core_raw
+                    step['S_utility'] = 0.5 
+                    
+                    # [可视化修复] 这里的赋值决定了前端显示 "Redundant"
+                    step['I_action'] = -1.0 
+                    step['meta_lcs_id'] = "REDUNDANT"
+
+                valid_idx_counter += 1
             else:
-                # [Case 2] Mismatch
-                p_global = action_type_counts.get(s_type, 0) / (total_samples + 1e-6)
-                forgiveness_factor = 1.0 - p_global
-                penalty = -beta * forgiveness_factor
-                
-                i_action = penalty 
-                r_core_raw = penalty
-
-            step['R_core_raw'] = r_core_raw
-            step['I_action'] = i_action
-            step['Q_step'] = q_step
-            step['S_necessity'] = s_nec
-            step['S_utility'] = s_util
-
-    match_debug_logger.info(f"{'='*20} [Batch {batch_id}] End {'='*20}\n")
+                # 失败步骤 (Action Success = False)
+                # 根据你的设计，失败步骤的 R_core_raw 为 0
+                step['R_core_raw'] = 0.0
+                step['Q_step'] = q_step # 即使失败，也记录下当轮的 Q_step 供参考
+                step['I_action'] = 0.0
+                step['meta_lcs_id'] = "N/A"
 
 def _calculate_R_step_fail(g_calc_steps: List[Dict[str, Any]], g_buffer_steps: List[Dict[str, Any]], embedding_model, config):
     """
@@ -751,10 +725,11 @@ def compute_ccapo_advantages(g_calc_steps: List[Dict[str, Any]],
     Updates:
     1. Integrated `_calculate_repetition_penalty` to stop reward hacking.
     2. Updated `_calculate_A_traj` with soft penalty (-0.5) for all-fail scenarios.
+    3. [Fix] Initialize visualization metadata (meta_anchor_uid, meta_lcs_id) for ALL steps.
     """
     ccapo_file_logger.info("=== [CCAPO V9.1] Start Calculation ===")
     
-    # 1. 初始化键值 (新增 R_repetition)
+    # 1. 初始化键值 (新增 R_repetition, meta_anchor_uid, meta_lcs_id)
     keys_defaults = {
         'R_core_raw': 0.0, 'R_match_raw': 0.0, 'R_format_penalty': 0.0, 
         'S_necessity': 0.0, 'S_utility': 0.0, 'I_action': 0.0, 
@@ -763,7 +738,10 @@ def compute_ccapo_advantages(g_calc_steps: List[Dict[str, Any]],
         'anchor_uid': 'N/A', 'is_anchor': False,
         'R_step': 0.0,
         # [新增] 重复惩罚字段
-        'R_repetition': 0.0 
+        'R_repetition': 0.0,
+        # [修复] 必须初始化这些用于 Tooltip 可视化的元数据，防止 DataProto 长度不一致报错
+        'meta_anchor_uid': 'N/A',
+        'meta_lcs_id': 'N/A'
     }
 
     for step in g_calc_steps:
@@ -805,6 +783,7 @@ def compute_ccapo_advantages(g_calc_steps: List[Dict[str, Any]],
     _calculate_repetition_penalty(g_calc_trajs, config)
 
     # Step C: 计算基于 LCS 的共识奖励
+    # 注意：这里只会更新“成功”轨迹的 meta_anchor_uid，失败轨迹保持默认值 'N/A'
     _calculate_R_step_success(g_calc_steps, g_calc_trajs, config)
     
     # 4. 最终奖励聚合 (Aggregating Rewards)

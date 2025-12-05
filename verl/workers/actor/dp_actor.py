@@ -479,12 +479,18 @@ class DataParallelPPOActor(BasePPOActor):
         # ✅ [新增] 将 'anchor_uid' 和 'is_anchor' 加入 macro_keys，以便写入 summary.json
         macro_keys = ['R_tau', 'R_core', 'A_traj', 'anchor_uid', 'is_anchor']
         
+        # ✅ [关键修复] 在这里添加 meta_lcs_id, meta_anchor_uid, R_repetition
+        # 只有将它们加入这个列表，它们才会被 json.dump 写入磁盘
         reward_keys_to_save = macro_keys + [
             'R_step', 'A_step', 'advantages', 'A_final_raw',
             'R_core_raw', 'R_match_raw', 'R_novelty_bonus', 'R_format_penalty',
             'Z_novelty', 'b_stage', 
             'TokenCost', 'Q_economy',
-            'S_necessity', 'S_utility', 'I_action', 'Q_step'
+            'S_necessity', 'S_utility', 'I_action', 'Q_step',
+            # --- 新增字段 ---
+            'meta_lcs_id',      # 用于 Viewer Tooltip 显示具体匹配的 ID
+            'meta_anchor_uid',  # 用于 Viewer Tooltip 显示锚点 UID
+            'R_repetition'      # 用于调试重复惩罚
         ]
 
         updated_count = 0
@@ -521,15 +527,26 @@ class DataParallelPPOActor(BasePPOActor):
                                 if hasattr(val, 'item'): val = val.item()
                                 if hasattr(val, 'dtype'): val = float(val)
                                 reward_payload[key] = val
+                                
+                                # ✅ [V3 兼容性] 为了让 viewer 直接读取而不必深挖 reward_components，
+                                # 我们也将这些关键 key 直接放在 payload 顶层 (如果 viewer 逻辑是读取顶层的话)
+                                # 但通常我们将它们归档在 reward_payload 中，稍后 update 进 json
                         
                         try:
                             with open(step_detail_path, 'r', encoding='utf-8') as f:
                                 s_data = json.load(f)
                             
+                            # 1. 写入 reward_components (结构化存储)
                             if "reward_components" not in s_data:
                                 s_data["reward_components"] = {}
                             s_data["reward_components"].update(reward_payload)
                             s_data["reward_components"]["note"] = "Populated by dp_actor (V12 Fixed)"
+
+                            # 2. ✅ [关键] 将 viewer 需要的字段直接打平到 JSON 根目录
+                            # stdb.py 的 _load_trajectory_from_path 通常读取根目录字段
+                            for k in ['I_action', 'meta_lcs_id', 'meta_anchor_uid', 'R_repetition', 'R_tau', 'R_core']:
+                                if k in reward_payload:
+                                    s_data[k] = reward_payload[k]
 
                             with open(step_detail_path, 'w', encoding='utf-8') as f:
                                 json.dump(s_data, f, indent=4, ensure_ascii=False)
@@ -571,6 +588,9 @@ class DataParallelPPOActor(BasePPOActor):
         # if updated_count > 0:
         #      logger.info(f"[Reward Write-Back] 完成。更新了 {updated_count} 个步骤文件。")
 
+        # if updated_count > 0:
+        #      logger.info(f"[Reward Write-Back] 完成。更新了 {updated_count} 个步骤文件。")
+
     def _extract_micro_batch(self, data_proto, indices):
         """
         [CCAPO Helper] 从 DataProto 中提取指定索引的 Micro Batch。
@@ -594,10 +614,11 @@ class DataParallelPPOActor(BasePPOActor):
     @GPUMemoryLogger(role="dp actor (CCAPO)", logger=logger)
     def update_policy_ccapo(self, G_online_batch: DataProto, G_buffer_batch: DataProto, embedding_model, ccapo_config: DictConfig):
         """
-        [CCAPO Refactored V8.7] 执行 CCAPO 策略更新。
-        Fixes:
-        1. Joint Gradient Update (防止锯齿震荡).
-        2. Fixed Weights (0.8 Online / 0.2 Buffer).
+        [CCAPO Refactored V9.3] 只使用 Online 数据进行梯度更新 (Remove BC Update)
+        
+        Updates:
+        1. 保持从 Buffer 计算奖励 (为了获取 Anchor)，但在训练循环中剔除 Buffer 数据。
+        2. 强制 has_buffer = False，online_weight = 1.0。
         """
         self.actor_module.train()
 
@@ -609,9 +630,11 @@ class DataParallelPPOActor(BasePPOActor):
         if G_buffer_batch:
             g_buffer_steps = to_list_of_dict(G_buffer_batch)
             if g_buffer_steps:
+                # 合并用于计算奖励 (Anchor 需要全局视角)
                 g_calc_steps = g_online_steps + g_buffer_steps 
         
-        # --- 2. 计算优势 (调用修正后的无 Z-Score 版本) ---
+        # --- 2. 计算优势 (Advantage Calculation) ---
+        # 这一步依然需要 Buffer 数据来提供高质量的 Anchor
         g_calc_steps_with_adv, lambda_sr = ccapo_algos.compute_ccapo_advantages(
             g_calc_steps,
             g_online_steps,
@@ -625,106 +648,119 @@ class DataParallelPPOActor(BasePPOActor):
         self.save_reward_components_to_disk(steps_to_save)
         # ===============================================================
 
-        # --- 3. 重新封装为 DataProto ---
+        # --- 3. 重新封装为 DataProto (仅 Online) ---
+        
+        # 筛选出 Online 数据用于训练
         online_steps_final = [s for s in g_calc_steps_with_adv if not s.get('is_buffer_data', False)]
         G_online_batch_final = DataProto.from_single_dict(collate_fn(online_steps_final))
         
-        buffer_steps_final = [s for s in g_calc_steps_with_adv if s.get('is_buffer_data', False)]
-        G_buffer_batch_final = None
-        if buffer_steps_final:
-            G_buffer_batch_final = DataProto.from_single_dict(collate_fn(buffer_steps_final))
+        # [修改点] 强制置空 Buffer Batch，防止进入训练循环
+        # 我们不再使用 Buffer 数据进行 BC Loss 更新，避免旧数据对 Policy 造成 Distribution Shift
+        G_buffer_batch_final = None 
 
         # 辅助：修复 advantages 类型
         def _fix_advantages_tensor(batch_proto):
             if batch_proto and 'advantages' in batch_proto.non_tensor_batch:
                 adv_np = batch_proto.non_tensor_batch.pop('advantages')
-                # 转换为 Tensor 方便后续处理
                 batch_proto.batch['advantages'] = torch.tensor(
                     [float(x) if x is not None else 0.0 for x in adv_np], 
                     dtype=torch.float32, device=batch_proto.batch.device
                 )
         
         _fix_advantages_tensor(G_online_batch_final)
-        _fix_advantages_tensor(G_buffer_batch_final)
+        # _fix_advantages_tensor(G_buffer_batch_final) # No need anymore
 
         # --- 4. 准备训练参数与权重 ---
         temperature = G_online_batch.meta_info.get("temperature", 1.0)
+        
+        ppo_mini_batch_size = self.config.ppo_mini_batch_size
         ppo_micro_batch_size = self.config.ppo_micro_batch_size_per_gpu or 1
         
-        # [策略调整] 固定权重混合
-        has_buffer = (G_buffer_batch_final is not None and G_buffer_batch_final.batch.batch_size[0] > 0)
+        # [修改点] 强制设置为无 Buffer 模式
+        has_buffer = False 
         
-        # 如果有 Buffer，使用 0.8 / 0.2；否则全量 Online
-        online_weight = 0.8 if has_buffer else 1.0
-        buffer_weight = 0.2 if has_buffer else 0.0
+        online_weight = 1.0
+        buffer_weight = 0.0
             
-        logger.info(f"[CCAPO Weights] Fixed: Online={online_weight:.2f} | Buffer={buffer_weight:.2f}")
+        logger.info(f"[CCAPO Training] BC Update Removed. Using Only Online Data. (Online=1.0)")
 
-        # --- 5. 联合训练循环 (Joint Gradient Update) ---
+        # --- 5. 联合训练循环 (Joint Gradient Update with Accumulation) ---
         metrics = {}
         debug_notes = {}
         
         n_online = G_online_batch_final.batch.batch_size[0]
-        # 计算所需的 micro-batch 步数 (以 Online 为主节奏)
-        n_micros_online = (n_online + ppo_micro_batch_size - 1) // ppo_micro_batch_size
+        # n_buffer = 0 # No buffer
         
-        if has_buffer:
-            n_buffer = G_buffer_batch_final.batch.batch_size[0]
-        
+        # 计算需要多少个 Mini-Batch 才能跑完一轮 Epoch
+        n_minis = (n_online + ppo_mini_batch_size - 1) // ppo_mini_batch_size
+
         for epoch in range(self.config.ppo_epochs):
             # 每个 Epoch 打乱索引
             indices_online = torch.randperm(n_online)
-            indices_buffer = torch.randperm(n_buffer) if has_buffer else None
             
-            for i in range(n_micros_online):
-                # ✅ 关键：Step 开始前清零梯度
+            # --- [外层循环] Mini-Batch 循环 (梯度更新的单位) ---
+            for i_mini in range(n_minis):
+                
+                # 1. 确定当前 Mini-Batch 的数据索引范围
+                start_idx_mini = i_mini * ppo_mini_batch_size
+                end_idx_mini = min((i_mini + 1) * ppo_mini_batch_size, n_online)
+                current_mini_indices = indices_online[start_idx_mini:end_idx_mini]
+                
+                # 计算当前 Mini-Batch 包含多少样本，以及需要拆分成多少个 Micro-Batch
+                n_samples_in_mini = len(current_mini_indices)
+                n_micros_in_this_mini = (n_samples_in_mini + ppo_micro_batch_size - 1) // ppo_micro_batch_size
+                
+                # 2. [关键] 在 Mini-Batch 开始前清零梯度
                 self.actor_optimizer.zero_grad()
                 
-                # ==========================
-                # Part A: Online (PPO) Update
-                # ==========================
-                start_idx = i * ppo_micro_batch_size
-                end_idx = min((i + 1) * ppo_micro_batch_size, n_online)
-                batch_idx = indices_online[start_idx:end_idx]
-                
-                mb_online = self._extract_micro_batch(G_online_batch_final, batch_idx)
-                
-                # Forward
-                entropy_on, log_prob_on = self._forward_micro_batch(
-                    mb_online, temperature, calculate_entropy=(self.config.entropy_coeff != 0.0)
-                )
-                
-                response_len_on = mb_online["responses"].size(1)
-                mask_on = mb_online["attention_mask"][:, -response_len_on:]
-                if "loss_mask" in mb_online:
-                     mask_on = mb_online["loss_mask"][:, -response_len_on:]
+                # --- [内层循环] Micro-Batch 循环 (显存限制的单位) ---
+                for i_micro in range(n_micros_in_this_mini):
+                    
+                    # ==========================
+                    # Part A: Online (PPO) Forward/Backward
+                    # ==========================
+                    start_micro = i_micro * ppo_micro_batch_size
+                    end_micro = min((i_micro + 1) * ppo_micro_batch_size, n_samples_in_mini)
+                    
+                    batch_idx = current_mini_indices[start_micro:end_micro]
+                    
+                    mb_online = self._extract_micro_batch(G_online_batch_final, batch_idx)
+                    
+                    # Forward
+                    entropy_on, log_prob_on = self._forward_micro_batch(
+                        mb_online, temperature, calculate_entropy=(self.config.entropy_coeff != 0.0)
+                    )
+                    
+                    response_len_on = mb_online["responses"].size(1)
+                    mask_on = mb_online["attention_mask"][:, -response_len_on:]
+                    if "loss_mask" in mb_online:
+                          mask_on = mb_online["loss_mask"][:, -response_len_on:]
 
-                # PPO Loss
-                # 优势截断：防止极端值破坏梯度
-                adv_batch = torch.clamp(mb_online["advantages"], -4.0, 4.0)
+                    # PPO Loss
+                    adv_batch = torch.clamp(mb_online["advantages"], -4.0, 4.0)
 
-                pg_loss, pg_clipfrac, ppo_kl, _ = compute_policy_loss(
-                    old_log_prob=mb_online["old_log_probs"],
-                    log_prob=log_prob_on,
-                    advantages=adv_batch,
-                    response_mask=mask_on,
-                    cliprange=self.config.clip_ratio,
-                    cliprange_low=self.config.clip_ratio_low,
-                    cliprange_high=self.config.clip_ratio_high,
-                    clip_ratio_c=self.config.get("clip_ratio_c", 3.0),
-                    loss_agg_mode=self.config.loss_agg_mode
-                )
-                
-                policy_loss_on = pg_loss
-                if self.config.entropy_coeff != 0.0 and entropy_on is not None:
-                    entropy_loss = agg_loss(loss_mat=entropy_on, loss_mask=mask_on, loss_agg_mode=self.config.loss_agg_mode)
-                    policy_loss_on = policy_loss_on - entropy_loss * self.config.entropy_coeff
+                    pg_loss, pg_clipfrac, ppo_kl, _ = compute_policy_loss(
+                        old_log_prob=mb_online["old_log_probs"],
+                        log_prob=log_prob_on,
+                        advantages=adv_batch,
+                        response_mask=mask_on,
+                        cliprange=self.config.clip_ratio,
+                        cliprange_low=self.config.clip_ratio_low,
+                        cliprange_high=self.config.clip_ratio_high,
+                        clip_ratio_c=self.config.get("clip_ratio_c", 3.0),
+                        loss_agg_mode=self.config.loss_agg_mode
+                    )
+                    
+                    policy_loss_on = pg_loss
+                    if self.config.entropy_coeff != 0.0 and entropy_on is not None:
+                        entropy_loss = agg_loss(loss_mat=entropy_on, loss_mask=mask_on, loss_agg_mode=self.config.loss_agg_mode)
+                        policy_loss_on = policy_loss_on - entropy_loss * self.config.entropy_coeff
 
-                # Backward Online (累积梯度)
-                (policy_loss_on * online_weight).backward()
-                
-                # Log metrics (first step only)
-                if epoch == 0 and i == 0:
+                    # [关键] Loss Normalization (归一化)
+                    # 只剩 Online 部分，weight = 1.0
+                    loss_online_scaled = policy_loss_on / n_micros_in_this_mini
+                    loss_online_scaled.backward()
+                    
                     append_to_dict(metrics, {
                         "actor/pg_loss_online": pg_loss.detach().item(),
                         "actor/ppo_kl_online": ppo_kl.detach().item(),
@@ -732,51 +768,19 @@ class DataParallelPPOActor(BasePPOActor):
                         "actor/adv_mean": adv_batch.mean().item()
                     })
 
-                # ==========================
-                # Part B: Buffer (BC) Update
-                # ==========================
-                if has_buffer:
-                    # Buffer 索引循环逻辑：如果 Buffer 比 Online 小，则循环使用
-                    start_b = (i * ppo_micro_batch_size) % n_buffer
-                    end_b = min(start_b + ppo_micro_batch_size, n_buffer)
-                    
-                    # 处理索引回绕情况，简单起见如果切片跨越边界，取剩余部分即可
-                    # 更严谨的做法是拼接，但作为 Buffer 随机采样，这样足够了
-                    if end_b <= start_b: 
-                        end_b = n_buffer
-                        
-                    batch_idx_b = indices_buffer[start_b:end_b]
-                    mb_buffer = self._extract_micro_batch(G_buffer_batch_final, batch_idx_b)
-                    
-                    # Forward Buffer (No Entropy needed for BC usually)
-                    _, log_prob_buf = self._forward_micro_batch(mb_buffer, temperature, calculate_entropy=False)
-                    
-                    # BC Loss
-                    response_len_buf = mb_buffer["responses"].size(1)
-                    mask_buf = mb_buffer["attention_mask"][:, -response_len_buf:]
-                    
-                    # Standard BC Loss: Minimize -log_prob(expert_action)
-                    # masked_log_prob = log_prob * mask
-                    valid_tokens = mask_buf.sum() + 1e-6
-                    bc_loss = - (log_prob_buf * mask_buf).sum() / valid_tokens
-                    
-                    # Backward Buffer (累积梯度)
-                    (bc_loss * buffer_weight).backward()
-                    
-                    if epoch == 0 and i == 0:
-                        append_to_dict(metrics, {"actor/bc_loss_buffer": bc_loss.detach().item()})
+                    # ==========================
+                    # Part B: Buffer (BC) REMOVED
+                    # ==========================
+                    # BC Update logic deleted as requested.
 
-                # ==========================
-                # Part C: Optimizer Step
-                # ==========================
-                # ✅ 关键：在所有 Loss Backward 完成后，统一更新一次
+                # --- [外层循环末尾] 执行参数更新 ---
                 grad_norm = self._optimizer_step()
-                
-                if epoch == 0 and i == 0:
-                    append_to_dict(metrics, {"actor/grad_norm": grad_norm.detach().item()})
+                append_to_dict(metrics, {"actor/grad_norm": grad_norm.detach().item()})
 
-        # --- 6. 仪表盘日志 (保持不变) ---
-        self._log_dashboard_metrics(metrics, online_steps_final, buffer_steps_final, lambda_sr)
+        # --- 6. 仪表盘日志 ---
+        # buffer_steps_final 只是用来做统计，不参与训练
+        buffer_steps_for_stats = [s for s in g_calc_steps_with_adv if s.get('is_buffer_data', False)]
+        self._log_dashboard_metrics(metrics, online_steps_final, buffer_steps_for_stats, lambda_sr)
 
         # --- 7. 准备 STDB 更新数据 (保持不变) ---
         online_trajs_for_stdb = ccapo_algos._group_steps_by_traj(online_steps_final)
@@ -791,7 +795,9 @@ class DataParallelPPOActor(BasePPOActor):
         return metrics, cpu_trajs_for_stdb, debug_notes
 
     def _log_dashboard_metrics(self, metrics, online_steps, buffer_steps, lambda_sr):
-        """辅助函数：记录丰富的仪表盘指标 (恢复原版统计)"""
+        """
+        [Modified] 增强版仪表盘，新增 ccapo_diag 诊断组，用于监测训练异常。
+        """
         try:
             # 1. 基础 SR
             metrics['actor/lambda_sr_raw'] = lambda_sr
@@ -805,6 +811,13 @@ class DataParallelPPOActor(BasePPOActor):
             raw_core_values = []
             raw_match_values = []
             
+            # --- [新增] 诊断计数器 ---
+            diag_total_steps = 0
+            diag_lcs_match_count = 0      # 命中 Anchor 的步数
+            diag_rep_penalty_count = 0    # 触发重复惩罚的步数
+            diag_format_bonus_count = 0   # 拿到格式奖励的步数
+            diag_novelty_sum = 0.0        # 新颖性奖励总和
+            
             count_total = 0
             count_success = 0
             count_format_error = 0
@@ -813,6 +826,8 @@ class DataParallelPPOActor(BasePPOActor):
             # 3. 遍历 Online
             for step in online_steps:
                 count_total += 1
+                diag_total_steps += 1
+                
                 if step.get('action_success', False): count_success += 1
                 
                 status = step.get('action_status', '')
@@ -823,6 +838,23 @@ class DataParallelPPOActor(BasePPOActor):
                 online_step_advantages.append(step.get('A_step', 0.0))
                 online_step_token_costs.append(step.get('TokenCost', 0.0))
                 
+                # --- [新增] 诊断数据采集 ---
+                # 监测 LCS 命中率 (Agent 是否在跟随 Anchor?)
+                if step.get('S_utility', 0.0) > 0.0:
+                    diag_lcs_match_count += 1
+                
+                # 监测 刷屏/复读行为 (Agent 是否在恶意 Loop?)
+                if step.get('R_repetition', 0.0) < 0.0:
+                    diag_rep_penalty_count += 1
+                    
+                # 监测 格式依从性 (Agent 是否还记得基本格式?)
+                # 只要 R_format_penalty > 0 说明拿到了 Bonus
+                if step.get('R_format_penalty', 0.0) > 0.0:
+                    diag_format_bonus_count += 1
+                
+                # 监测 新颖性衰减程度
+                diag_novelty_sum += step.get('Z_novelty', 0.0)
+
                 if 'traj_uid' in step:
                     uid = step['traj_uid']
                     online_traj_rewards[uid] = step.get('R_tau', 0.0)
@@ -840,7 +872,7 @@ class DataParallelPPOActor(BasePPOActor):
                 metrics[f"{prefix}_mean"] = np.mean(arr)
                 metrics[f"{prefix}_min"] = np.min(arr)
                 metrics[f"{prefix}_max"] = np.max(arr)
-                metrics[f"{prefix}_hist"] = arr # ✅ 直方图恢复
+                # metrics[f"{prefix}_hist"] = arr # 减少日志体积，暂不记录直方图
 
             _log_stats("ccapo_step/online_reward_R_step", online_step_rewards)
             _log_stats("ccapo_step/online_advantage_A_step", online_step_advantages)
@@ -855,12 +887,37 @@ class DataParallelPPOActor(BasePPOActor):
             metrics['ccapo_proportions/online_format_error_rate'] = count_format_error / (count_total + eps)
             metrics['ccapo_proportions/online_exec_failure_rate'] = count_exec_failure / (count_total + eps)
 
+            # --- [新增] 诊断仪表盘 (CCAPO Diagnostics) ---
+            # 这是一个单独的组，用于监测异常
+            if diag_total_steps > 0:
+                # 1. LCS Match Rate: 越高越好。
+                # 如果 SR 低且这个低 -> Agent 彻底迷路了，不知道 Anchor 是啥。
+                metrics['ccapo_diag/lcs_match_ratio'] = diag_lcs_match_count / diag_total_steps
+                
+                # 2. Hack Rate: 越低越好。
+                # 如果这个高 -> Agent 正在尝试 tap(1) 刷屏，Repetition Penalty 正在生效。
+                metrics['ccapo_diag/repetition_hack_ratio'] = diag_rep_penalty_count / diag_total_steps
+                
+                # 3. Format Bonus Rate: 应该稳定在很高(接近1.0)。
+                # 如果 SR 低且这个低 -> Agent 连格式都忘了，模型崩了 (Collapse)。
+                metrics['ccapo_diag/format_compliance_ratio'] = diag_format_bonus_count / diag_total_steps
+                
+                # 4. Novelty Strength: 应该逐渐趋近于 0。
+                # 如果后期还很高，说明 Agent 还在乱试动作，没有收敛。
+                metrics['ccapo_diag/avg_novelty_strength'] = diag_novelty_sum / diag_total_steps
+
             # 6. Success vs Fail Traj
             succ_tau, fail_tau = [], []
+            succ_lens = [] # 记录成功轨迹的长度分布
             for uid, r in online_traj_rewards.items():
-                if r > 0: succ_tau.append(r)
-                else: fail_tau.append(r)
+                if r > 0: 
+                    succ_tau.append(r)
+                    succ_lens.append(online_traj_total_steps[uid])
+                else: 
+                    fail_tau.append(r)
+            
             _log_stats("ccapo_success/traj_R_tau", succ_tau)
+            _log_stats("ccapo_success/traj_length", succ_lens) # [新增] 监测成功轨迹长度变化
             _log_stats("ccapo_fail/traj_R_tau", fail_tau)
 
             # 7. Buffer 统计
