@@ -283,7 +283,7 @@ algorithm:
     penalty_failure: -1.0       # 动作执行失败 (非 JSON 错误) 的惩罚
     
     # A_final (Sec 1)
-    omega: 1.0                  # 微观优势 A_step 的权重
+    omega: 0.7                 # 微观优势 A_step 的权重
     
     # STDB (Sec 2)
     stdb_top_k: 8

@@ -30,7 +30,7 @@ echo "设置完成。"
 # 这将确保每个训练批次只包含一个任务
 train_data_size=1
 val_data_size=4
-group_size=4
+group_size=8
 
 # We only use data preparation to indicate the modality and the data size.
 # python3 -m examples.data_preprocess.prepare \

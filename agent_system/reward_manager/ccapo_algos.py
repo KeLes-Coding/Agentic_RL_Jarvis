@@ -202,11 +202,11 @@ def _calculate_R_tau(g_calc_trajs: Dict[str, List[Dict[str, Any]]], config):
 
 def _calculate_A_traj(g_calc_steps: List[Dict[str, Any]], current_sr: float):
     """
-    [Sec 4.2 Optimized V2] 计算 A_traj
+    [Sec 4.2 Optimized V4] 计算 A_traj (修复 SR=1 时的崩盘震荡)
     修改点：
-    1. 全错一致 (All Fail Same) -> Adv = -0.5
-    2. 全对一致 (All Success Same) -> Adv = 0.0
-    3. [新增] 成功样本正向保护 (Success Protection): 防止成功样本因归一化变为负值
+    1. 保留 safe_std_threshold 防止 0.0004 分差导致的噪声放大。
+    2. [关键新增] 成功样本底线保护 (Success Floor): 即使是 batch 里效率最差的成功轨迹，
+       其 Advantage 也不允许低于 -0.2。防止模型把它当成失败样本去"矫枉过正"。
     """
     if not g_calc_steps: return
     all_R_tau = [step.get('R_tau', 0.0) for step in g_calc_steps]
@@ -229,28 +229,31 @@ def _calculate_A_traj(g_calc_steps: List[Dict[str, Any]], current_sr: float):
              
     # Case 3: 存在差异 (正常情况)
     else:
-        # epsilon = 1e-8，敏锐捕捉效率差
-        safe_std = std_R + 1e-8
+        # [保留 V3] 最小标准差阈值，防止微小分差爆炸
+        min_std_threshold = 0.02
+        safe_std = max(std_R, min_std_threshold)
+        
         raw_advantages = [(v - mean_R) / safe_std for v in all_R_tau]
-
-    # --- 保护机制 (Protection Mechanism) ---
-    protection_factor = min(max(current_sr, 0.2), 1.0)
 
     final_advantages = []
     for r_val, adv_val in zip(all_R_tau, raw_advantages):
         
-        # [关键修改] 成功样本保护
-        # 如果任务成功(R_tau > 0)，但归一化后 Advantage < 0 (因为别人分更高)，
-        # 我们不能让它变成负分，否则模型会认为这次成功是"错误"的。
-        if r_val > 0.0 and adv_val < 0.0:
-            # 强制给予微小的正向奖励，或者至少为 0
-            adv_val = 0.05 
-            
-        # 失败样本限制
-        elif r_val <= 0.0 and adv_val > 0.0:
-            # 即使是"优秀的失败"，也要限制其优势不能超过 -0.05
-            # 防止其看起来比"差劲的成功"还要好
-            adv_val = -0.05 
+        # [关键修改] 成功样本底线保护 (Success Floor)
+        # 针对你观察到的 "6 vs 25" 导致的 SR 崩盘问题。
+        # 如果任务成功(R > 0)，哪怕效率极低(R_tau 很低)，归一化后 Adv 变成了 -2.0，
+        # 我们也要把它拉回 -0.2。
+        # 理由：它完成了任务。Adv -2.0 会让模型以为这是个极其严重的错误(甚至比失败还严重)，
+        # 从而导致模型遗忘"如何完成任务"，导致下一轮 SR 暴跌。
+        if r_val > 0.0:
+            if adv_val < -0.2:
+                adv_val = -0.2
+        
+        # [保留] 失败样本限制 (Failure Ceiling)
+        # 如果任务失败，即使它在失败者里排第一，Advantage 也不应该变成正数鼓励它。
+        # 限制其上限为 -0.05。
+        elif r_val <= 0.0:
+            if adv_val > -0.05:
+                adv_val = -0.05
         
         final_advantages.append(adv_val)
 
@@ -335,60 +338,43 @@ def _calculate_R_format_penalty(g_calc_steps: List[Dict[str, Any]], config):
         step['R_format_penalty'] = bonus + penalty
 
 # =============================================================================
-# [修改] 动作新颖性组件 (符合文稿：全局计数 + 成功筛选)
+# [修改] 动作新颖性组件
 # =============================================================================
 def _calculate_action_novelty(g_calc_steps: List[Dict[str, Any]], config):
     """
-    [CCAPO V9.3 Simplified] 纯粹的新颖性奖励
-    
-    退化逻辑:
-    1. 移除 saturation_threshold 和剥夺 Format Bonus 的逻辑。
-    2. Global Counts 仅用于计算 Z_novelty (探索奖励)，该奖励会自然衰减至 0。
-    3. 防止 reward hacking 的任务完全移交给 _calculate_repetition_penalty 和 Anchor 匹配机制。
+    [CCAPO V10 - Simplified] 局部 Batch 级新颖性奖励
+    不再读写磁盘，仅计算当前 Batch 内的动作频率。
+    公式: Bonus = base / sqrt(Batch_Count(a))
     """
     use_fine_grained = getattr(config, 'use_fine_grained_action', True)
     base_bonus = getattr(config, 'base_bonus', 0.2) 
     
-    # 路径定义与加载
-    count_file = "logger/CCAPO/global_action_counts.json"
-    global_counts = _load_global_counts(count_file)
+    # 1. 统计当前 Batch 内所有动作的出现次数
+    batch_counts = collections.defaultdict(int)
     
-    new_counts_update = collections.defaultdict(int)
-    
+    # 第一遍遍历：统计
     for step in g_calc_steps:
-        # [Filter] 必须是执行成功的动作
-        if not step.get('action_success', False):
-            step['Z_novelty'] = 0.0 
+        # 只统计成功的动作，失败动作不配拥有新颖性
+        if not step.get('action_success', False): 
             continue
-
-        # 生成动作指纹
+            
         act_id = _get_deterministic_id(step, use_fine_grained)
+        batch_counts[act_id] += 1
         
-        # 获取计数
-        current_global = global_counts.get(act_id, 0)
-        current_batch_inc = new_counts_update[act_id]
-        total_count = current_global + current_batch_inc
+    # 2. 第二遍遍历：分配奖励
+    for step in g_calc_steps:
+        if not step.get('action_success', False):
+            step['Z_novelty'] = 0.0
+            continue
+            
+        act_id = _get_deterministic_id(step, use_fine_grained)
+        count = batch_counts.get(act_id, 1)
         
-        # --- Part A: 计算新颖性奖励 (自然衰减) ---
-        # 随着 total_count 增加，novelty_score 会趋近于 0
-        # 这本身就是一种“软饱和”，不需要人为硬截断
-        calc_denom = np.sqrt(total_count + 1)
-        novelty_score = base_bonus / calc_denom
+        # 局部衰减公式：出现次数越多，奖励越低
+        # sqrt 使得衰减比较温和，不会因为出现 2 次就变成 0
+        novelty_score = base_bonus / np.sqrt(count)
+        
         step['Z_novelty'] = novelty_score
-        
-        # --- [Removed] Part B: 移除格式奖励饱和剥离 ---
-        # 我们不再因为动作“老旧”而剥夺它的 R_format_penalty。
-        # "正确的老动作" (SOP) 应该保留 Format Bonus。
-        # "错误的老动作" (Hacking) 将由 Repetition Penalty 制裁。
-
-        # 记录增量
-        new_counts_update[act_id] += 1
-
-    # 更新并保存
-    if new_counts_update:
-        for k, v in new_counts_update.items():
-            global_counts[k] = global_counts.get(k, 0) + v
-        _save_global_counts(count_file, global_counts)
 
 def _calculate_repetition_penalty(g_calc_trajs: Dict[str, List[Dict[str, Any]]], config):
     """
@@ -435,8 +421,8 @@ def _calculate_repetition_penalty(g_calc_trajs: Dict[str, List[Dict[str, Any]]],
                 # 【关键】剥夺 Format Bonus
                 # 既然触发了恶意复读，就不配拿格式分
                 if step.get('R_format_penalty', 0.0) > 0:
-                     step['R_format_penalty'] = 0.0
-                     
+                      step['R_format_penalty'] = 0.0
+                      
                 step['action_status'] = f"REP({consecutive_count})::{step.get('action_status','')}"
             else:
                 step['R_repetition'] = 0.0
@@ -451,7 +437,10 @@ def _calculate_R_step_success(g_calc_steps: List[Dict[str, Any]], g_calc_trajs: 
     1. 选出 Anchor (Batch内 R_tau 最高 & 长度最短)。
     2. 计算轨迹的全局效率乘数 Q_step (由 N_success 决定，全轨迹共享)。
     3. 如果当前步在 Anchor 的 LCS 序列中 -> R = 1.0 * Q_step
-    4. 如果当前步不在 LCS 序列中       -> R = 0.5 * Q_step (保留探索空间)
+    4. [Updated] 如果当前步不在 LCS 序列中:
+       不再给予固定的 0.5 惩罚，而是基于相对长度 (L_anchor / L_current) 给予动态分。
+       R = 0.95 * min(1.0, L_anchor/L_current) * Q_step
+       这允许"平替"路径获得高分，消除僵化，同时通过 0.95 保持 Anchor 的收敛引力。
     """
     
     # --- 1. 数据清洗与筛选 ---
@@ -519,6 +508,10 @@ def _calculate_R_step_success(g_calc_steps: List[Dict[str, Any]], g_calc_trajs: 
     anchor_uid, anchor_data = sorted_trajs[0]
     anchor_seq = anchor_data['act_ids']
     
+    # [新增] 获取 Anchor 的关键长度，用于后续计算比率
+    # 防止除以0，虽然 Anchor 必然 > 0
+    anchor_len = max(1.0, float(anchor_data['n_success_count'])) 
+    
     # [可视化修复] 标记 Anchor 轨迹
     for s in anchor_data['all_steps_raw']:
         s['is_anchor'] = True
@@ -561,6 +554,20 @@ def _calculate_R_step_success(g_calc_steps: List[Dict[str, Any]], g_calc_trajs: 
         m_steps_ratio = n_success / config.max_steps
         q_step = max(0.0, 1.0 - config.alpha_step * m_steps_ratio)
         
+        # === [新增] 计算动态惩罚比率 (Dynamic Mismatch Ratio) ===
+        # 逻辑: (L_anchor / L_current)
+        # 如果当前轨迹比 Anchor 长，ratio < 1.0，得分自然下降
+        # 如果当前轨迹比 Anchor 短，ratio > 1.0，但在 Anchor 更新前，我们将其截断为 1.0
+        # 配合 0.95 的系数，构成"软性约束"
+        current_len = max(1.0, float(n_success))
+        len_ratio = anchor_len / current_len
+        # 上限截断为 1.0，防止在 Anchor 未切换时给出 > 1.0 的 Step 奖励导致值爆炸
+        len_ratio = min(1.0, len_ratio) 
+        
+        # 设定非 Match 步骤的折扣系数 (0.95)
+        # 这个 gap 保证了同等长度下，Anchor 依然优于非 Anchor (1.0 vs 0.95)
+        mismatch_coeff = 0.95 * len_ratio
+
         # 遍历更新步骤
         valid_idx_counter = 0
         
@@ -582,6 +589,7 @@ def _calculate_R_step_success(g_calc_steps: List[Dict[str, Any]], g_calc_trajs: 
                 
                 if is_match:
                     # --- [HIT] 命中锚点关键路径 ---
+                    # 奖励 = 1.0 (满) * Q_step
                     r_core_raw = 1.0 * q_step
                     
                     step['R_core_raw'] = r_core_raw
@@ -591,16 +599,23 @@ def _calculate_R_step_success(g_calc_steps: List[Dict[str, Any]], g_calc_trajs: 
                     step['I_action'] = 1.0 
                     step['meta_lcs_id'] = f"MATCH_IDX_{valid_idx_counter}"
                 else:
-                    # --- [MISS] 偏离锚点 ---
-                    # 给予低保 (0.5 * Q_step)，允许探索
-                    r_core_raw = 0.5 * q_step
+                    # --- [MISS] 偏离锚点 (但依然成功) ---
+                    # 旧逻辑: 0.5 * q_step (固定惩罚)
+                    # 新逻辑: 0.95 * (L_anchor/L_curr) * q_step (动态效用)
+                    # 保底: max(0.5, ...) 防止极长轨迹导致负面影响太大，虽不常见
+                    
+                    dynamic_reward = mismatch_coeff * q_step
+                    r_core_raw = max(0.5 * q_step, dynamic_reward)
                     
                     step['R_core_raw'] = r_core_raw
-                    step['S_utility'] = 0.5 
+                    
+                    # 记录实际得分比率，方便调试
+                    step['S_utility'] = mismatch_coeff 
                     
                     # [可视化修复] 这里的赋值决定了前端显示 "Redundant"
-                    step['I_action'] = -1.0 
-                    step['meta_lcs_id'] = "REDUNDANT"
+                    # 这里改为 0.0 (中性)，表示它不是错误，只是"非标准"
+                    step['I_action'] = 0.0 
+                    step['meta_lcs_id'] = f"ALT_PATH_{mismatch_coeff:.2f}"
 
                 valid_idx_counter += 1
             else:
@@ -713,6 +728,60 @@ def _calculate_separated_advantages(steps: List[Dict[str, Any]], omega: float, c
         s['advantages'] = (s['A_final_raw'] - mean_adv) / safe_std_final
 
 # =============================================================================
+# [新增] 5. Dr. GRPO 长度加权组件 (解决数量偏差)
+# =============================================================================
+
+def _apply_length_weighting(steps_list: List[Dict[str, Any]]):
+    """
+    [Dr. GRPO Logic] 
+    Apply importance weight based on trajectory length to neutralize quantity bias.
+    Weight = Mean_Batch_Length / Traj_Length
+    
+    Effect:
+    - Long trajectories (Length > Mean) -> Weight < 1.0 (Down-weighted)
+    - Short trajectories (Length < Mean) -> Weight > 1.0 (Up-weighted)
+    """
+    if not steps_list: return
+
+    # 1. 统计所有轨迹的长度
+    traj_lengths = {}
+    trajs = _group_steps_by_traj(steps_list)
+    
+    lengths_val = []
+    for uid, steps in trajs.items():
+        l = len(steps)
+        traj_lengths[uid] = l
+        lengths_val.append(l)
+    
+    if not lengths_val: return
+
+    # 2. 计算 Batch 平均长度
+    mean_len = np.mean(lengths_val)
+    
+    # 3. 应用权重到每个 Step
+    for step in steps_list:
+        uid_val = step['traj_uid']
+        if isinstance(uid_val, (np.ndarray, torch.Tensor)):
+             uid_val = uid_val.item()
+             
+        l_i = traj_lengths.get(uid_val, mean_len)
+        
+        # 计算相对权重: 长轨迹降权，短轨迹加权
+        # 防止除以0 (虽不太可能)
+        weight = mean_len / max(1.0, float(l_i))
+        
+        # 写入 metadata (用于调试)
+        step['W_length'] = weight
+        
+        # 【关键操作】直接修正 Advantage
+        # 这样 PPO 更新时： Adv * grad = (Raw_Adv * Weight) * grad
+        # 等效于在 Loss 上加权，消除了长轨迹的数量优势
+        if 'advantages' in step:
+            step['advantages'] *= weight
+            
+    match_debug_logger.info(f"  [Dr. GRPO] Applied length weighting. Mean Length={mean_len:.2f}")
+
+# =============================================================================
 # 主入口
 # =============================================================================
 def compute_ccapo_advantages(g_calc_steps: List[Dict[str, Any]], 
@@ -721,13 +790,12 @@ def compute_ccapo_advantages(g_calc_steps: List[Dict[str, Any]],
                              embedding_model, 
                              config):
     """
-    [CCAPO V9.1] Integration with Global Novelty, Dense Format Rewards & Anti-Hacking
+    [CCAPO V9.4] Integration with Dr. GRPO (Trajectory-Length Normalization)
     Updates:
-    1. Integrated `_calculate_repetition_penalty` to stop reward hacking.
-    2. Updated `_calculate_A_traj` with soft penalty (-0.5) for all-fail scenarios.
-    3. [Fix] Initialize visualization metadata (meta_anchor_uid, meta_lcs_id) for ALL steps.
+    1. Integrated `_apply_length_weighting` to fix Quantity Bias.
+    2. Maintained `_calculate_repetition_penalty` and all legacy logic.
     """
-    ccapo_file_logger.info("=== [CCAPO V9.1] Start Calculation ===")
+    ccapo_file_logger.info("=== [CCAPO V9.4] Start Calculation ===")
     
     # 1. 初始化键值 (新增 R_repetition, meta_anchor_uid, meta_lcs_id)
     keys_defaults = {
@@ -739,6 +807,8 @@ def compute_ccapo_advantages(g_calc_steps: List[Dict[str, Any]],
         'R_step': 0.0,
         # [新增] 重复惩罚字段
         'R_repetition': 0.0,
+        # [新增] Dr. GRPO 权重字段
+        'W_length': 1.0,
         # [修复] 必须初始化这些用于 Tooltip 可视化的元数据，防止 DataProto 长度不一致报错
         'meta_anchor_uid': 'N/A',
         'meta_lcs_id': 'N/A'
@@ -829,5 +899,9 @@ def compute_ccapo_advantages(g_calc_steps: List[Dict[str, Any]],
     _calculate_separated_advantages(online_subset, config.omega, sr)
     _calculate_separated_advantages(buffer_subset, config.omega, sr)
     
-    ccapo_file_logger.info("=== [CCAPO V9.1] Done ===")
+    # === [新增] Step 6: Dr. GRPO 长度加权 (Quantity Bias Fix) ===
+    # 仅对 Online 数据进行长度归一化加权，确保长轨迹不会因为 Token 多而主导梯度
+    _apply_length_weighting(online_subset)
+    
+    ccapo_file_logger.info("=== [CCAPO V9.4] Done ===")
     return g_calc_steps, sr
