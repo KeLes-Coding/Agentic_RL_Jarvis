@@ -731,55 +731,107 @@ def _calculate_separated_advantages(steps: List[Dict[str, Any]], omega: float, c
 # [新增] 5. Dr. GRPO 长度加权组件 (解决数量偏差)
 # =============================================================================
 
-def _apply_length_weighting(steps_list: List[Dict[str, Any]]):
+def _apply_dr_grpo_v3(steps_list: List[Dict[str, Any]]):
     """
-    [Dr. GRPO Logic] 
-    Apply importance weight based on trajectory length to neutralize quantity bias.
-    Weight = Mean_Batch_Length / Traj_Length
+    [Dr. GRPO V3 - Success-Conditional Tanh-Gating]
     
-    Effect:
-    - Long trajectories (Length > Mean) -> Weight < 1.0 (Down-weighted)
-    - Short trajectories (Length < Mean) -> Weight > 1.0 (Up-weighted)
+    Innovation:
+    1. Failure Invariance: Failed trajectories always get W=1.0. 
+       (Prevents weakening the penalty for long failures).
+    2. Success-Only Statistics: Length stats are calculated ONLY from successful trajectories.
+    3. Parameter-Free: Uses tanh to naturally bound weights to (0, 2).
+    
+    Logic:
+       if is_fail: W = 1.0
+       if is_success: W = 1.0 + tanh( (Mean_Succ - L_i) / Std_Succ )
     """
     if not steps_list: return
 
-    # 1. 统计所有轨迹的长度
-    traj_lengths = {}
+    # 1. Group by Trajectory
     trajs = _group_steps_by_traj(steps_list)
     
-    lengths_val = []
-    for uid, steps in trajs.items():
-        l = len(steps)
-        traj_lengths[uid] = l
-        lengths_val.append(l)
-    
-    if not lengths_val: return
+    # 2. Extract Success Trajectory Lengths
+    succ_lengths = []
+    traj_info_map = {} # uid -> {'length': int, 'is_success': bool}
 
-    # 2. 计算 Batch 平均长度
-    mean_len = np.mean(lengths_val)
+    for uid, steps in trajs.items():
+        if not steps: continue
+        
+        # Check success from the first step (which holds trajectory-level info)
+        # Assuming R_core == 1.0 means success
+        r_core = steps[0].get('R_core', 0.0)
+        is_success = (r_core == 1.0)
+        length = len(steps)
+        
+        traj_info_map[uid] = {'length': length, 'is_success': is_success}
+        
+        if is_success:
+            succ_lengths.append(length)
+
+    # 3. Calculate Statistics (Only if we have successes)
+    mean_succ = 0.0
+    std_succ = 1.0 # default to avoid div by zero
+    has_success = len(succ_lengths) > 0
     
-    # 3. 应用权重到每个 Step
+    if has_success:
+        arr = np.array(succ_lengths, dtype=float)
+        mean_succ = np.mean(arr)
+        std_succ = np.std(arr) + 1e-6 # epsilon
+
+    # 4. Apply Weights
     for step in steps_list:
         uid_val = step['traj_uid']
         if isinstance(uid_val, (np.ndarray, torch.Tensor)):
              uid_val = uid_val.item()
-             
-        l_i = traj_lengths.get(uid_val, mean_len)
         
-        # 计算相对权重: 长轨迹降权，短轨迹加权
-        # 防止除以0 (虽不太可能)
-        weight = mean_len / max(1.0, float(l_i))
+        info = traj_info_map.get(uid_val)
+        if not info: continue
         
-        # 写入 metadata (用于调试)
+        # Default weight
+        weight = 1.0
+        z_score = 0.0
+        
+        # --- Core Logic ---
+        if not info['is_success']:
+            # Case A: Failure Invariance
+            # 失败者保持原样，确保吃到满额的 Negative Advantage
+            weight = 1.0
+        elif not has_success:
+             # Should not happen if is_success is true, but for safety
+             weight = 1.0
+        else:
+            # Case B: Success-Conditional Tanh-Gating
+            # 只在成功者内部卷效率
+            l_i = info['length']
+            
+            # Z-Score: (群体平均 - 我的长度) / 标准差
+            # 短于平均 -> Z > 0 -> W > 1
+            # 长于平均 -> Z < 0 -> W < 1
+            z_score = (mean_succ - float(l_i)) / std_succ
+            
+            # Tanh Mapping: Range (0, 2)
+            # Center at 1.0
+            weight = 1.0 + np.tanh(z_score)
+            
+            # [Safety] 防止权重过小导致样本失效
+            # 虽然 25步的成功(vs 5步平均)确实很烂，但好歹是成功，给个保底 0.2
+            weight = max(0.2, weight)
+
+        # Write Metadata
         step['W_length'] = weight
+        step['meta_z_score'] = z_score
         
-        # 【关键操作】直接修正 Advantage
-        # 这样 PPO 更新时： Adv * grad = (Raw_Adv * Weight) * grad
-        # 等效于在 Loss 上加权，消除了长轨迹的数量优势
+        # Apply to Advantages
         if 'advantages' in step:
+            # Apply Dr. GRPO weight
             step['advantages'] *= weight
             
-    match_debug_logger.info(f"  [Dr. GRPO] Applied length weighting. Mean Length={mean_len:.2f}")
+            # [Final Safety Clip] 
+            # 无论如何，防止最终梯度爆炸，这是 PPO 的最后一道防线
+            step['advantages'] = np.clip(step['advantages'], -4.0, 4.0).item()
+            
+    match_debug_logger.info(f"  [Dr. GRPO V3] Success Count: {len(succ_lengths)}. "
+                           f"Mean Succ Len: {mean_succ:.2f}. Applied Weights.")
 
 # =============================================================================
 # 主入口
@@ -901,7 +953,7 @@ def compute_ccapo_advantages(g_calc_steps: List[Dict[str, Any]],
     
     # === [新增] Step 6: Dr. GRPO 长度加权 (Quantity Bias Fix) ===
     # 仅对 Online 数据进行长度归一化加权，确保长轨迹不会因为 Token 多而主导梯度
-    _apply_length_weighting(online_subset)
+    _apply_dr_grpo_v3(online_subset)
     
     ccapo_file_logger.info("=== [CCAPO V9.4] Done ===")
     return g_calc_steps, sr
