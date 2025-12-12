@@ -312,6 +312,7 @@ class SuccessTrajectoryDatabase:
         这会从 summary.json 和 /step_N/step_details.json 中重新组合轨迹。
         (✅ [CCAPO V4] 升级日志：检查所有关键字段)
         (🌟 [V5 Update] 支持读取 user_annotations.json 人工标记)
+        (🔥 [V6 Fix] 修复 Identity Collision: 强制命名空间隔离，防止 Buffer 与 Online UID 冲突)
         """
         
         # ======================= ✅ 日志升级：内部辅助函数 ✅ =======================
@@ -319,7 +320,7 @@ class SuccessTrajectoryDatabase:
             """检查数据是否存在并记录到 STDB 文件日志。"""
             if data is None:
                 self.file_logger.warning(f"[{context}] 缺失数据: '{key}' 未在 step_details.json 中找到 (值为 None)。")
-                return data # 返回 None 以便下游处理
+                return data 
             elif isinstance(data, list) and not data:
                 self.file_logger.warning(f"[{context}] 数据为空: '{key}' 是一个空列表[]。")
                 return data 
@@ -344,8 +345,14 @@ class SuccessTrajectoryDatabase:
         traj_total_steps = summary_data.get('step_count', 0)
         traj_total_tokens = summary_data.get('token_usage', {}).get('total_tokens', 0)
 
-        traj_uid = os.path.basename(log_dir_path)
-        self.file_logger.info(f"[STDB._load] 开始加载 Traj_UID: {traj_uid} (共 {traj_total_steps} 个步骤)")
+        # [🔥 关键修复: UID Namespacing] 
+        # 原始的文件夹名可能只是简单的 "0", "1" 或 "2023..."，容易与当前 Online UID 冲突。
+        # 我们强制加上 STDB 前缀和路径哈希，确保它在内存中是绝对唯一的。
+        raw_uid = os.path.basename(log_dir_path)
+        # 使用路径的哈希或特定前缀来保证唯一性
+        traj_uid = f"STDB::{raw_uid}" 
+        
+        self.file_logger.info(f"[STDB._load] 开始加载 Traj: {raw_uid} -> 映射为 Unique UID: {traj_uid} (共 {traj_total_steps} 步)")
 
         # --- 🌟 [New] 加载人工标记 ---
         marked_steps_indices = set()
@@ -354,7 +361,6 @@ class SuccessTrajectoryDatabase:
             try:
                 with open(anno_path, 'r', encoding='utf-8') as f:
                     anno_data = json.load(f)
-                    # viewer 保存的是 critical_steps: [0, 3, 5] 这种格式
                     marked_steps_indices = set(anno_data.get("critical_steps", []))
                 if marked_steps_indices:
                     self.file_logger.info(f"[STDB._load] 发现人工标记步骤: {marked_steps_indices}")
@@ -366,7 +372,7 @@ class SuccessTrajectoryDatabase:
         
         # 2.1 预计算 N_success(tau)
         traj_n_success_steps = 0
-        for i in range(1, traj_total_steps + 1): # 假设 step_count 是从0开始的
+        for i in range(1, traj_total_steps + 1): 
             step_detail_path = os.path.join(log_dir_path, f"step_{i}", "step_details.json")
             if os.path.exists(step_detail_path):
                 try:
@@ -380,7 +386,7 @@ class SuccessTrajectoryDatabase:
         self.file_logger.debug(f"[STDB._load] Traj {traj_uid}: 预计算 n_success = {traj_n_success_steps}")
             
         # 2.2 加载每一步
-        for i in range(1, traj_total_steps + 1): # 假设 step_count 是从0开始的
+        for i in range(1, traj_total_steps + 1): 
             step_detail_path = os.path.join(log_dir_path, f"step_{i}", "step_details.json")
             if not os.path.exists(step_detail_path):
                 self.file_logger.warning(f"[STDB._load] Traj {traj_uid}: 找不到 step_{i}/step_details.json，跳过此步骤。")
@@ -389,23 +395,27 @@ class SuccessTrajectoryDatabase:
             with open(step_detail_path, 'r', encoding='utf-8') as f:
                 step_data = json.load(f)
             
-            log_ctx = f"STDB._load(traj_uid={traj_uid}, step_{i})"
+            log_ctx = f"STDB._load({traj_uid}, step_{i})"
 
             # ======================= ✅ 日志升级：检查所有字段 ✅ =======================
-            # 步骤级(Micro)数据
             step_index = _log_data_presence('step_number', step_data.get('step_number', i), log_ctx)
             thought = _log_data_presence('thought', step_data.get('thought'), log_ctx)
             parsed_action = _log_data_presence('parsed_action', step_data.get('parsed_action'), log_ctx)
             action_type = _log_data_presence('action_type', step_data.get('action_type'), log_ctx)
-            action_success = _log_data_presence('action_success', step_data.get('action_success'), log_ctx) # bool
+            action_success = _log_data_presence('action_success', step_data.get('action_success'), log_ctx)
             step_token_usage = _log_data_presence('token_usage', step_data.get('token_usage'), log_ctx)
             confidence_metrics = _log_data_presence('confidence_metrics', step_data.get('confidence_metrics'), log_ctx)
             action_status = _log_data_presence('action_status', step_data.get('action_status'), log_ctx)
             
+            # [🔥 新增] 尝试恢复 R_tau 和 R_core
+            # 如果之前训练循环回写了这些值到磁盘，我们必须加载它们，否则排序会乱。
+            r_tau_val = step_data.get('R_tau')
+            r_core_val = step_data.get('R_core')
+            
             # 核心 RL 数据
             log_probs_list = _log_data_presence('rollout_log_probs', step_data.get('rollout_log_probs'), log_ctx)
             
-            # G_Buffer Bug 修复数据
+            # G_Buffer Tensors
             self.file_logger.debug(f"[{log_ctx}] 正在重新水合 G_Buffer Tensors...")
             input_ids_data = _log_data_presence('input_ids', step_data.get('input_ids'), log_ctx)
             attention_mask_data = _log_data_presence('attention_mask', step_data.get('attention_mask'), log_ctx)
@@ -414,7 +424,6 @@ class SuccessTrajectoryDatabase:
             # ======================= 日志升级结束 ✅ =======================
 
             # --- 转换数据 ---
-            
             if isinstance(log_probs_list, list):
                 rollout_log_probs = torch.tensor(log_probs_list)
             else:
@@ -443,13 +452,18 @@ class SuccessTrajectoryDatabase:
                                     if confidence_metrics is not None else 0.0),
                 'action_status': action_status if action_status is not None else '',
                 
+                # [🔥 新增] 显式传递 R_tau / R_core
+                # 如果磁盘里有，就用磁盘的；如果没有，默认为 0.0 (后续流程可能会重算)
+                'R_tau': r_tau_val if r_tau_val is not None else 0.0,
+                'R_core': r_core_val if r_core_val is not None else 0.0,
+
                 # 🌟 人工标记 flag
                 'is_human_marked': (step_index in marked_steps_indices),
 
                 # 核心 RL 数据
                 'rollout_log_probs': rollout_log_probs, 
                 
-                # G_Buffer Bug
+                # G_Buffer Tensors
                 'input_ids': input_ids,
                 'attention_mask': attention_mask,
                 'position_ids': position_ids,
@@ -458,6 +472,7 @@ class SuccessTrajectoryDatabase:
                 # 标识符
                 'log_dir_path': log_dir_path,
                 'is_buffer_data': True, 
+                # [🔥 使用命名空间隔离后的 UID]
                 'traj_uid': traj_uid,
             }
             loaded_steps.append(rehydrated_step)

@@ -186,7 +186,7 @@ def _calculate_R_tau(g_calc_trajs: Dict[str, List[Dict[str, Any]]], config):
             R_core = 1.0
         
         R_tau = R_core 
-        m_token_ratio = total_tokens / config.max_tokens
+        m_token_ratio = total_tokens / (config.max_tokens + 5)
         token_cost = m_token_ratio 
         
         if R_core == 1.0:
@@ -200,68 +200,164 @@ def _calculate_R_tau(g_calc_trajs: Dict[str, List[Dict[str, Any]]], config):
             step['R_core'] = R_core
             step['TokenCost'] = token_cost
 
+def _reconstruct_trajectory_from_disk(steps: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    [Reconstructor V3.1] 带日志增强
+    """
+    if not steps: return steps
+    
+    # 获取 UID 用于日志
+    uid = steps[0].get('traj_uid', 'UNKNOWN')
+    log_dir = steps[0].get('log_dir_path')
+    
+    if not log_dir or not os.path.exists(log_dir):
+        match_debug_logger.warning(f"  [RECONSTRUCT] Skip {uid}: path invalid {log_dir}")
+        return steps
+
+    input_step_map = {s.get('step_index'): s for s in steps}
+    reconstructed_steps = []
+    
+    max_probe_limit = 100 
+    start_idx = 0
+    
+    for i in range(start_idx, max_probe_limit):
+        step_file = os.path.join(log_dir, f"step_{i}", "step_details.json")
+        
+        if not os.path.exists(step_file):
+            if i == 0: continue 
+            break 
+            
+        if i in input_step_map:
+            reconstructed_steps.append(input_step_map[i])
+        else:
+            # 内存没有，从磁盘加载
+            try:
+                with open(step_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                
+                # [日志] 确认磁盘数据身份
+                disk_path = data.get('log_dir_path', 'N/A')
+                if disk_path != 'N/A' and os.path.basename(disk_path) != os.path.basename(log_dir):
+                     match_debug_logger.error(f"  [RECONSTRUCT] !!! IDENTITY MISMATCH !!!")
+                     match_debug_logger.error(f"     Memory Expects: {log_dir}")
+                     match_debug_logger.error(f"     Disk Contains:  {disk_path}")
+
+                healed_step = {
+                    'step_index': i,
+                    'action_type': data.get('action_type', 'unknown'),
+                    'parsed_action': data.get('parsed_action', ''),
+                    'action_success': data.get('action_success', False),
+                    'action_status': data.get('action_status', ''),
+                    'is_human_marked': False,
+                    'is_healed_data': True,
+                    'log_dir_path': log_dir,
+                    'R_core': steps[0].get('R_core'), 
+                    'R_tau': steps[0].get('R_tau'),
+                    'traj_uid': steps[0].get('traj_uid'),
+                    'is_buffer_data': steps[0].get('is_buffer_data', False)
+                }
+                reconstructed_steps.append(healed_step)
+                
+            except Exception as e:
+                match_debug_logger.warning(f"  [RECONSTRUCT] Failed to load Step {i}: {e}")
+
+    if not reconstructed_steps:
+        return steps
+        
+    return reconstructed_steps
+
 def _calculate_A_traj(g_calc_steps: List[Dict[str, Any]], current_sr: float):
     """
-    [Sec 4.2 Optimized V4] 计算 A_traj (修复 SR=1 时的崩盘震荡)
-    修改点：
-    1. 保留 safe_std_threshold 防止 0.0004 分差导致的噪声放大。
-    2. [关键新增] 成功样本底线保护 (Success Floor): 即使是 batch 里效率最差的成功轨迹，
-       其 Advantage 也不允许低于 -0.2。防止模型把它当成失败样本去"矫枉过正"。
+    [Sec 4.2 Fixed] 修复版 A_traj 计算
+    1. 修正统计方式：按 Trajectory 聚合，消除 Step Count Bias。
+    2. 修正激励逻辑：成功样本底线提升至 0.0 (或更高)，严禁给予负分(-0.2)导致遗忘。
     """
+    # 打印所有 uid 和对应的 R_tau，检查是否有重复 UID 对应不同 R_tau 的情况
+    debug_uid_check = collections.defaultdict(set)
+    for step in g_calc_steps:
+        uid = step['traj_uid']
+        if isinstance(uid, torch.Tensor): uid = uid.item()
+        debug_uid_check[uid].add(step.get('R_tau', 0.0))
+
+    for uid, r_set in debug_uid_check.items():
+        if len(r_set) > 1:
+            match_debug_logger.error(f"!!! CRITICAL WARNING: UID Collision Detected !!! UID {uid} maps to multiple R_tau values: {r_set}")
+
     if not g_calc_steps: return
-    all_R_tau = [step.get('R_tau', 0.0) for step in g_calc_steps]
-    
-    mean_R = np.mean(all_R_tau)
-    std_R = np.std(all_R_tau)
-    r_ptp = np.ptp(all_R_tau)
-    
-    # --- 核心数学修正 ---
-    
-    # Case 1: 全错且一致 (All Fail Same)
-    if r_ptp < 1e-6 and mean_R <= 0:
-        raw_advantages = [-0.5 for _ in all_R_tau]
-        match_debug_logger.info(f"  [A_traj] All Fail Same (Mean={mean_R:.2f}). Adv=-0.5 (Soft Penalty)")
 
-    # Case 2: 全对且一致 (All Success Same)
-    elif r_ptp < 1e-6 and mean_R > 0:
-        raw_advantages = [0.1 for _ in all_R_tau]
-        match_debug_logger.info(f"  [A_traj] All Success Same. Adv=0.1")
-             
-    # Case 3: 存在差异 (正常情况)
+    # --- 1. 数据重组：按轨迹聚合 (Key Fix 1) ---
+    # 必须把 step 列表压缩成轨迹列表，否则长轨迹会主导均值
+    traj_map = {} # uid -> R_tau
+    for step in g_calc_steps:
+        # 兼容 Tensor 或普通类型
+        uid = step['traj_uid']
+        if isinstance(uid, (np.ndarray, torch.Tensor)):
+            uid = uid.item()
+        
+        # 只记录一次 R_tau (假设同轨迹内 R_tau 相同)
+        if uid not in traj_map:
+            traj_map[uid] = step.get('R_tau', 0.0)
+    
+    unique_r_taus = list(traj_map.values())
+    if not unique_r_taus: return
+
+    # 基于轨迹的统计量
+    mean_R = np.mean(unique_r_taus)
+    std_R = np.std(unique_r_taus)
+    r_ptp = np.ptp(unique_r_taus)
+
+    # --- 2. 动态底线 (Key Fix 2) ---
+    # 只要是成功样本，绝不给负 Advantage。
+    # 早期 (SR低) 给强激励 (+0.2)，后期给中性激励 (0.0)。
+    # 只有当你明确想要模型“放弃”某种成功路径时，才给负分，但这非常危险。
+    if current_sr < 0.25:
+        success_floor = 0.2
+    elif current_sr < 0.5:
+        success_floor = 0.0
     else:
-        # [保留 V3] 最小标准差阈值，防止微小分差爆炸
-        min_std_threshold = 0.02
-        safe_std = max(std_R, min_std_threshold)
-        
-        raw_advantages = [(v - mean_R) / safe_std for v in all_R_tau]
+        success_floor = -0.2
 
+    # 计算 Advantage
+    traj_adv_map = {}
+    
+    # 异常处理：全同分
+    if r_ptp < 1e-6:
+        fill_val = 0.2 if mean_R > 0 else -0.5
+        for uid in traj_map:
+            traj_adv_map[uid] = fill_val
+    else:
+        min_std = 0.02
+        safe_std = max(std_R, min_std)
+        
+        for uid, r_val in traj_map.items():
+            # 标准 Z-Score
+            adv = (r_val - mean_R) / safe_std
+            
+            # --- [逻辑修正核心] ---
+            if r_val > 0.0:
+                # 成功样本：如果算出来是负数（比如 -1.0），强行拉回 Floor (0.0 或 0.2)
+                # 这样 Traj 20 即使比 Traj 17 差，也依然是“正向”的。
+                if adv < success_floor:
+                    adv = success_floor
+            elif r_val <= 0.0:
+                # 失败样本：封顶 -0.05
+                if adv > -0.05:
+                    adv = -0.05
+            
+            traj_adv_map[uid] = adv
+
+    # --- 3. 回写 ---
     final_advantages = []
-    for r_val, adv_val in zip(all_R_tau, raw_advantages):
+    for step in g_calc_steps:
+        uid = step['traj_uid']
+        if isinstance(uid, (np.ndarray, torch.Tensor)):
+            uid = uid.item()
         
-        # [关键修改] 成功样本底线保护 (Success Floor)
-        # 针对你观察到的 "6 vs 25" 导致的 SR 崩盘问题。
-        # 如果任务成功(R > 0)，哪怕效率极低(R_tau 很低)，归一化后 Adv 变成了 -2.0，
-        # 我们也要把它拉回 -0.2。
-        # 理由：它完成了任务。Adv -2.0 会让模型以为这是个极其严重的错误(甚至比失败还严重)，
-        # 从而导致模型遗忘"如何完成任务"，导致下一轮 SR 暴跌。
-        if r_val > 0.0:
-            if adv_val < -0.2:
-                adv_val = -0.2
-        
-        # [保留] 失败样本限制 (Failure Ceiling)
-        # 如果任务失败，即使它在失败者里排第一，Advantage 也不应该变成正数鼓励它。
-        # 限制其上限为 -0.05。
-        elif r_val <= 0.0:
-            if adv_val > -0.05:
-                adv_val = -0.05
-        
-        final_advantages.append(adv_val)
-
-    # Clip 范围限制，防止单样本梯度爆炸
-    final_advantages = np.clip(final_advantages, -3.0, 3.0).tolist()
-
-    for step, adv in zip(g_calc_steps, final_advantages):
+        adv = traj_adv_map.get(uid, 0.0)
+        # Clip
+        adv = float(np.clip(adv, -3.0, 3.0))
         step['A_traj'] = adv
+
 
 # =============================================================================
 # [新增/修改] 辅助函数：全局计数持久化
@@ -431,42 +527,37 @@ def _calculate_repetition_penalty(g_calc_trajs: Dict[str, List[Dict[str, Any]]],
 
 def _calculate_R_step_success(g_calc_steps: List[Dict[str, Any]], g_calc_trajs: Dict[str, List[Dict[str, Any]]], config):
     """
-    [CCAPO Simplified] 极简版 LCS + Q_step (Fixed for Trajectory Efficiency)
-    
-    逻辑:
-    1. 选出 Anchor (Batch内 R_tau 最高 & 长度最短)。
-    2. 计算轨迹的全局效率乘数 Q_step (由 N_success 决定，全轨迹共享)。
-    3. 如果当前步在 Anchor 的 LCS 序列中 -> R = 1.0 * Q_step
-    4. [Updated] 如果当前步不在 LCS 序列中:
-       不再给予固定的 0.5 惩罚，而是基于相对长度 (L_anchor / L_current) 给予动态分。
-       R = 0.95 * min(1.0, L_anchor/L_current) * Q_step
-       这允许"平替"路径获得高分，消除僵化，同时通过 0.95 保持 Anchor 的收敛引力。
+    [CCAPO Simplified] 极简版 LCS + Q_step
+    增加详细日志：为什么选它做 Anchor？
     """
-    
+    match_debug_logger.info(f"\n=== [Anchor Selection & LCS Start] ===")
+
     # --- 1. 数据清洗与筛选 ---
     success_traj_info = {}
     
+    # 计数器：发现了多少成功轨迹
+    found_success_count = 0
+    
     for traj_uid, raw_steps in g_calc_trajs.items():
         if not raw_steps: continue
-        # 只处理成功的轨迹
-        if raw_steps[0].get('R_core') != 1.0: continue
         
-        # 轨迹重建 (内存/磁盘)
+        # 检查是否成功
+        r_core = raw_steps[0].get('R_core')
+        if r_core != 1.0: 
+            continue
+            
+        found_success_count += 1
+
+        # 轨迹重建
         steps = _reconstruct_trajectory_from_disk(raw_steps)
         
-        # 提取用于 LCS 对比的指纹序列
+        # 提取指纹
         act_identifiers = []
         valid_steps = []
-        
-        # [修改] 用于统计 N_success 的计数器
         n_success_count = 0 
 
         for step in steps:
-            # 过滤掉 Buffer 中可能的无效步或 System 步
-            # 注意：按照定义，N_success 只包含 action_success=True 的步骤
             is_valid_success = step.get('action_success', False)
-            
-            # 兼容 Buffer Data (通常默认视为 Success)
             if step.get('is_buffer_data'):
                 is_valid_success = True
 
@@ -474,11 +565,8 @@ def _calculate_R_step_success(g_calc_steps: List[Dict[str, Any]], g_calc_trajs: 
                 continue
                 
             n_success_count += 1
-                
-            # 构造指纹 (Action Type + Parsed Content)
             s_type = step.get('action_type', '')
             s_parsed = step.get('parsed_action')
-            # 简单处理，确保指纹稳定性
             act_str = str(s_parsed).strip() if s_parsed else ""
             act_id = f"{s_type}::{act_str}"
             
@@ -486,38 +574,63 @@ def _calculate_R_step_success(g_calc_steps: List[Dict[str, Any]], g_calc_trajs: 
             valid_steps.append(step)
 
         if valid_steps:
+            r_tau_val = steps[0].get('R_tau', 0.0)
             success_traj_info[traj_uid] = {
-                'steps': valid_steps, # 注意：这是过滤后的 steps，回写时需要映射回 raw_steps
-                'all_steps_raw': steps, # 保留原始引用以便回写
+                'steps': valid_steps, 
+                'all_steps_raw': steps, 
                 'act_ids': act_identifiers, 
                 'n_steps': len(valid_steps),
-                'n_success_count': n_success_count, # [新增] 明确记录 N_success
+                'n_success_count': n_success_count,
                 'n_tokens': steps[0].get('traj_total_tokens', 0),
-                'r_tau': steps[0].get('R_tau', 0.0)
+                'r_tau': r_tau_val
             }
 
+    match_debug_logger.info(f"  -> Total Success Trajs Found in Batch: {found_success_count}")
+    
     if not success_traj_info: 
+        match_debug_logger.info(f"  -> No valid success trajectories for Anchor (Valid Count=0). Skip.")
         return
 
     # --- 2. 锚点选择 (Anchor Selection) ---
-    # 策略：R_tau 越大越好，Step 越少越好
+    # 打印候选名单
+    match_debug_logger.info(f"  [Election] Candidates:")
+    
+    candidate_list = []
+    for uid, info in success_traj_info.items():
+        candidate_list.append({
+            'uid': uid,
+            'R_tau': info['r_tau'],
+            'Steps': info['n_steps']
+        })
+    
+    # 按照排序逻辑打印
+    # 排序逻辑: R_tau 降序, Steps 升序
+    sorted_candidates = sorted(
+        candidate_list,
+        key=lambda x: (-x['R_tau'], x['Steps'])
+    )
+    
+    for rank, cand in enumerate(sorted_candidates):
+        match_debug_logger.info(f"    Rank {rank+1}: UID={cand['uid']}, R_tau={cand['R_tau']:.4f}, Steps={cand['Steps']}")
+
+    # 实际排序
     sorted_trajs = sorted(
         success_traj_info.items(), 
         key=lambda item: (-item[1]['r_tau'], item[1]['n_steps']) 
     )
+    
     anchor_uid, anchor_data = sorted_trajs[0]
     anchor_seq = anchor_data['act_ids']
-    
-    # [新增] 获取 Anchor 的关键长度，用于后续计算比率
-    # 防止除以0，虽然 Anchor 必然 > 0
     anchor_len = max(1.0, float(anchor_data['n_success_count'])) 
     
-    # [可视化修复] 标记 Anchor 轨迹
+    match_debug_logger.info(f"  [Decision] Selected Anchor: UID {anchor_uid} (Len={anchor_len:.1f})")
+
+    # 标记 Anchor
     for s in anchor_data['all_steps_raw']:
         s['is_anchor'] = True
-        s['anchor_uid'] = str(anchor_uid) # 写入顶层便于概览
+        s['anchor_uid'] = str(anchor_uid)
 
-    # --- 3. LCS 计算辅助函数 (标准 DP) ---
+    # --- 3. LCS 计算与奖励分配 ---
     def get_lcs_match_indices(seq_a, seq_b):
         m, n = len(seq_a), len(seq_b)
         dp = [[0] * (n + 1) for _ in range(m + 1)]
@@ -527,7 +640,6 @@ def _calculate_R_step_success(g_calc_steps: List[Dict[str, Any]], g_calc_trajs: 
                     dp[i][j] = dp[i-1][j-1] + 1
                 else:
                     dp[i][j] = max(dp[i-1][j], dp[i][j-1])
-        
         matched_b_indices = set()
         i, j = m, n
         while i > 0 and j > 0:
@@ -540,41 +652,26 @@ def _calculate_R_step_success(g_calc_steps: List[Dict[str, Any]], g_calc_trajs: 
                 j -= 1
         return matched_b_indices
 
-    # --- 4. 奖励计算 (Binary LCS + Trajectory-Level Q_step) ---
     for traj_uid, info in success_traj_info.items():
         current_seq = info['act_ids']
         raw_steps_to_update = info['all_steps_raw']
         
-        # 计算 LCS 匹配索引 (相对于 valid_steps)
         matched_indices_curr = get_lcs_match_indices(anchor_seq, current_seq)
         
-        # [修改] 计算全局共享的 Q_step (Trajectory Efficiency Multiplier)
-        # 公式: max(0, 1 - alpha * (N_success / MaxSteps))
         n_success = info['n_success_count']
         m_steps_ratio = n_success / config.max_steps
         q_step = max(0.0, 1.0 - config.alpha_step * m_steps_ratio)
         
-        # === [新增] 计算动态惩罚比率 (Dynamic Mismatch Ratio) ===
-        # 逻辑: (L_anchor / L_current)
-        # 如果当前轨迹比 Anchor 长，ratio < 1.0，得分自然下降
-        # 如果当前轨迹比 Anchor 短，ratio > 1.0，但在 Anchor 更新前，我们将其截断为 1.0
-        # 配合 0.95 的系数，构成"软性约束"
         current_len = max(1.0, float(n_success))
         len_ratio = anchor_len / current_len
-        # 上限截断为 1.0，防止在 Anchor 未切换时给出 > 1.0 的 Step 奖励导致值爆炸
         len_ratio = min(1.0, len_ratio) 
-        
-        # 设定非 Match 步骤的折扣系数 (0.95)
-        # 这个 gap 保证了同等长度下，Anchor 依然优于非 Anchor (1.0 vs 0.95)
         mismatch_coeff = 0.95 * len_ratio
 
-        # 遍历更新步骤
         valid_idx_counter = 0
+        match_count = 0
         
         for step in raw_steps_to_update:
-            # 初始化
             step['R_core_raw'] = 0.0
-            # [可视化修复] 写入 Anchor 元数据，供前端 Tooltip 显示
             step['meta_anchor_uid'] = str(anchor_uid)
             
             should_eval = False
@@ -583,48 +680,34 @@ def _calculate_R_step_success(g_calc_steps: List[Dict[str, Any]], g_calc_trajs: 
             
             if should_eval:
                 is_match = (valid_idx_counter in matched_indices_curr)
-                
-                # [修改] 不再根据 step_index 计算，直接使用计算好的全局 q_step
                 step['Q_step'] = q_step 
                 
                 if is_match:
-                    # --- [HIT] 命中锚点关键路径 ---
-                    # 奖励 = 1.0 (满) * Q_step
+                    match_count += 1
                     r_core_raw = 1.0 * q_step
-                    
                     step['R_core_raw'] = r_core_raw
                     step['S_utility'] = 1.0 
-                    
-                    # [可视化修复] 这里的赋值决定了前端显示 "Match"
                     step['I_action'] = 1.0 
                     step['meta_lcs_id'] = f"MATCH_IDX_{valid_idx_counter}"
                 else:
-                    # --- [MISS] 偏离锚点 (但依然成功) ---
-                    # 旧逻辑: 0.5 * q_step (固定惩罚)
-                    # 新逻辑: 0.95 * (L_anchor/L_curr) * q_step (动态效用)
-                    # 保底: max(0.5, ...) 防止极长轨迹导致负面影响太大，虽不常见
-                    
                     dynamic_reward = mismatch_coeff * q_step
                     r_core_raw = max(0.5 * q_step, dynamic_reward)
-                    
                     step['R_core_raw'] = r_core_raw
-                    
-                    # 记录实际得分比率，方便调试
                     step['S_utility'] = mismatch_coeff 
-                    
-                    # [可视化修复] 这里的赋值决定了前端显示 "Redundant"
-                    # 这里改为 0.0 (中性)，表示它不是错误，只是"非标准"
                     step['I_action'] = 0.0 
                     step['meta_lcs_id'] = f"ALT_PATH_{mismatch_coeff:.2f}"
 
                 valid_idx_counter += 1
             else:
-                # 失败步骤 (Action Success = False)
-                # 根据你的设计，失败步骤的 R_core_raw 为 0
                 step['R_core_raw'] = 0.0
-                step['Q_step'] = q_step # 即使失败，也记录下当轮的 Q_step 供参考
+                step['Q_step'] = q_step
                 step['I_action'] = 0.0
                 step['meta_lcs_id'] = "N/A"
+        
+        if str(traj_uid) != str(anchor_uid):
+             match_debug_logger.info(f"    Compared Traj {traj_uid} to Anchor. Matched Steps: {match_count}/{len(current_seq)}")
+
+    match_debug_logger.info(f"=== [Anchor Selection End] ===\n")
 
 def _calculate_R_step_fail(g_calc_steps: List[Dict[str, Any]], g_buffer_steps: List[Dict[str, Any]], embedding_model, config):
     """

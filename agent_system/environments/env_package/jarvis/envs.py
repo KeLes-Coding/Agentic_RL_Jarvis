@@ -20,6 +20,8 @@ from .jarvis_v2.jarvis.modules.observer import Observer
 from .jarvis_v2.jarvis.modules.actuator import Actuator
 from .jarvis_v2.agent_manager import discover_devices
 
+from .injector_bridge import AndroidInjector
+
 def _evaluate_with_llm(
     summary: str, 
     ground_truth: str, 
@@ -157,6 +159,10 @@ class JarvisMultiDeviceEnv:
 
         adb_path = self.jarvis_config.get("adb", {}).get("executable_path", "adb")
         self.adb_path = adb_path 
+
+        # [新增] 初始化注入器
+        self.env_injector = AndroidInjector(adb_path)
+
         self.observers: Dict[str, Observer] = {s: Observer(adb_path, s) for s in self.device_serials}
         self.actuators: Dict[str, Actuator] = {s: Actuator(adb_path, s) for s in self.device_serials}
 
@@ -292,25 +298,92 @@ class JarvisMultiDeviceEnv:
 
 
     # <<< 新增：用于并行 reset 的辅助方法 >>>
+    # def _reset_device(self, serial: str, task: Dict) -> Tuple[np.ndarray, str, Dict]:
+    #     """
+    #     (辅助函数) 在单独的线程中重置单个设备。
+    #     返回 (obs_image, obs_text, info)
+    #     """
+    #     try:
+    #         # ======================= ✅ 在 reset 开始时调用清理方法 ✅ =======================
+    #         self._clear_background_apps(serial)
+    #         # ===============================================================================
+
+    #         self.episode_steps[serial] = 0
+
+    #         self.tasks[serial] = task if task else {}
+
+    #         self.actuators[serial].home() # 清理后返回主屏幕
+            
+    #         # 短暂等待确保界面稳定
+    #         try:
+    #             self.actuators[serial].wait(1.0) # 等待1秒
+    #         except Exception as e:
+    #             print(f"--- [设备: {serial}] 在reset的等待期间发生错误: {e} ---")
+
+    #         obs_data = self.observers[serial].get_current_observation(
+    #             max_elements=self.max_elements_per_obs,
+    #             max_str_len=self.max_str_len_per_obs
+    #         )
+
+    #         screenshots_bytes = obs_data.get("screenshot_bytes")
+    #         if not isinstance(screenshots_bytes, list):
+    #             screenshots_bytes = [screenshots_bytes] if screenshots_bytes else []
+
+    #         final_image_array = None
+    #         compressed_bytes = None
+    #         if screenshots_bytes:
+    #             first_shot_bytes = screenshots_bytes[0]
+    #             compressed_bytes = self._compress_single_image(first_shot_bytes)
+    #             if compressed_bytes:
+    #                 try:
+    #                     img = Image.open(io.BytesIO(compressed_bytes)).convert("RGB")
+    #                     final_image_array = np.array(img, dtype=np.uint8)
+    #                 except Exception as e:
+    #                     print(f"警告: 图像解码失败 - {e}")
+
+    #         if final_image_array is None:
+    #             final_image_array = np.zeros((256, 256, 3), dtype=np.uint8)
+
+    #         image_placeholders = "<image>\n"
+    #         obs_text = obs_data.get("simplified_elements_str", "")
+    #         final_obs_text = f"{image_placeholders}{obs_text}"
+
+    #         info_dict = {
+    #             "device_serial": serial,
+    #             "raw_obs_data": obs_data,
+    #             "compressed_screenshot_bytes": compressed_bytes
+    #         }
+    #         return final_image_array, final_obs_text, info_dict
+        
+    #     except Exception as e:
+    #         print(f"--- [设备: {serial}] 线程 'reset' 失败: {e} ---")
+    #         # 返回一个表示失败的空状态，确保批处理(batch)的形状一致
+    #         return (
+    #             np.zeros((256, 256, 3), dtype=np.uint8), 
+    #             "<image>\nERROR: Reset failed.", 
+    #             {"device_serial": serial, "raw_obs_data": {}, "compressed_screenshot_bytes": None, "error": str(e)}
+    #         )
     def _reset_device(self, serial: str, task: Dict) -> Tuple[np.ndarray, str, Dict]:
         """
         (辅助函数) 在单独的线程中重置单个设备。
         返回 (obs_image, obs_text, info)
         """
         try:
-            # ======================= ✅ 在 reset 开始时调用清理方法 ✅ =======================
-            self._clear_background_apps(serial)
+            # ======================= ✅ 调用注入器进行环境重置 ✅ =======================
+            # 这里的 reset_environment 可能会抛出异常，但会被外层 try 捕获
+            if hasattr(self, 'env_injector'):
+                self.env_injector.reset_environment(serial)
+            else:
+                print(f"--- [设备: {serial}] 警告: env_injector 未初始化 ---")
             # ===============================================================================
 
             self.episode_steps[serial] = 0
-
             self.tasks[serial] = task if task else {}
 
             self.actuators[serial].home() # 清理后返回主屏幕
             
-            # 短暂等待确保界面稳定
             try:
-                self.actuators[serial].wait(1.0) # 等待1秒
+                self.actuators[serial].wait(1.0) 
             except Exception as e:
                 print(f"--- [设备: {serial}] 在reset的等待期间发生错误: {e} ---")
 
@@ -347,11 +420,13 @@ class JarvisMultiDeviceEnv:
                 "raw_obs_data": obs_data,
                 "compressed_screenshot_bytes": compressed_bytes
             }
+            
+            # [关键] 必须在这里返回元组，且必须在 try 块的最后
             return final_image_array, final_obs_text, info_dict
         
         except Exception as e:
             print(f"--- [设备: {serial}] 线程 'reset' 失败: {e} ---")
-            # 返回一个表示失败的空状态，确保批处理(batch)的形状一致
+            # [关键] 发生异常时，也必须返回格式一致的元组，不能返回 None
             return (
                 np.zeros((256, 256, 3), dtype=np.uint8), 
                 "<image>\nERROR: Reset failed.", 

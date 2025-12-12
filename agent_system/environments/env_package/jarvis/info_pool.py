@@ -80,18 +80,23 @@ class InfoPoolManager:
         step_dir = os.path.join(self.log_dir, f"step_{self.step_count}")
         os.makedirs(step_dir, exist_ok=True)
         
-        # --- ✅ [日志] 记录收到的 step_data 关键信息 ---
+        # --- ✅ [日志升级] 详细记录 I/O 路径与身份标识 ---
         try:
-            self.file_logger.info(f"[record_step] Step {self.step_count} 收到数据。")
+            # 获取路径的最后一段作为简易 UID 用于显示
+            short_uid = os.path.basename(self.log_dir)
+            self.file_logger.info(f"[record_step] Step {self.step_count} | UID: {short_uid}")
             
             # 检查关键 RL 标识符
             prompt_index = step_data.get('prompt_index', 'MISSING')
             prompt_vector_exists = 'prompt_vector' in step_data and step_data['prompt_vector'] is not None
-            self.file_logger.info(f"[record_step]   -> prompt_index: {prompt_index}")
-            self.file_logger.info(f"[record_step]   -> prompt_vector 存在: {prompt_vector_exists}")
             
-            # 记录所有传入的键
-            self.file_logger.debug(f"[record_step]   -> 所有键: {list(step_data.keys())}")
+            self.file_logger.info(f"    -> prompt_index: {prompt_index}")
+            self.file_logger.info(f"    -> prompt_vector present: {prompt_vector_exists}")
+            
+            # [冲突预警] 如果 step_count 很大，可能是 append 到了旧文件？
+            if self.step_count == 0 and os.path.exists(os.path.join(step_dir, "step_details.json")):
+                 self.file_logger.warning(f"!!! CRITICAL WARNING: Step 0 file already exists in {step_dir}! Potential Overwrite/Collision!")
+
         except Exception as e:
             self.file_logger.error(f"[record_step] 日志记录失败: {e}")
         # --- 日志结束 ---
@@ -106,7 +111,7 @@ class InfoPoolManager:
             self.step_confidences.append(step_data["confidence_metrics"].get("average_confidence", 0.0))
         # =========================================================================
 
-        # 准备要记录的步骤数据
+        # 准备要记录的步骤数据 (Macro Trace)
         current_step_record = {
             "step": self.step_count,
             "thought": step_data["thought"],
@@ -114,18 +119,16 @@ class InfoPoolManager:
             "action_success": step_data["action_success"]
         }
         
-        # 添加到内存轨迹列表中
         self.trajectory_data.append(current_step_record)
 
-        # --- 修改：在每一步都将完整的轨迹数据覆写到文件中 ---
+        # 同步写入 Trace
         try:
             with open(self.trace_path, "w", encoding="utf-8") as f:
                 json.dump(self.trajectory_data, f, indent=4, ensure_ascii=False)
         except Exception as e:
             self.file_logger.error(f"[record_step] 写入 execution_trace.json 失败: {e}")
-            print(f"Error synchronously writing to {self.trace_path} at step {self.step_count}: {e}")
-        
-        # --- 保存每一步的详细文件 (这部分逻辑保持不变) ---
+
+        # --- 保存每一步的详细文件 ---
         try:
             # 1. layout.xml
             xml_content = step_data["raw_obs_data"].get("xml", "")
@@ -159,82 +162,57 @@ class InfoPoolManager:
                 "task": step_data["task"],
                 "thought": step_data["thought"],
                 "parsed_action": step_data["parsed_action"],
-                # ======================= ✅ 升级：保存原始 LLM 响应 ✅ =======================
                 "raw_llm_response": step_data.get("raw_llm_response", "N/A"),
-                # ===========================================================================
-                "action_type": step_data.get("action_type", "unknown"), # <--- ✅ [CCAPO] 新增
+                "action_type": step_data.get("action_type", "unknown"),
                 "action_success": step_data["action_success"],
-                # --- ✅ [CCAPO V3] 关键修正：保存 action_status ---
                 "action_status": step_data.get("action_status", ""),
+                
+                # [关键] 显式写入 log_dir_path，作为数据的身份证明
+                "log_dir_path": self.log_dir,
+                # [关键] 写入简易 UID，便于人工检查
+                "traj_uid_hint": short_uid
             }
-            # --- 将 Token 和置信度信息加入 details 字典 ---
+
             if "token_usage" in step_data:
                 details["token_usage"] = step_data["token_usage"]
             if "confidence_metrics" in step_data:
                 details["confidence_metrics"] = step_data["confidence_metrics"]
             
-            # --- ✅ [CCAPO] 将 log_probs (作为列表) 加入 details 字典 ---
+            # --- Tensor Serialization ---
             if "rollout_log_probs" in step_data:
                 try:
-                    # 将 torch.Tensor 转换为 list 
                     details["rollout_log_probs"] = step_data["rollout_log_probs"].cpu().tolist()
-                except Exception as e:
-                    self.file_logger.warning(f"[record_step] 无法序列化 rollout_log_probs: {e}")
-                    print(f"Warning: could not serialize rollout_log_probs. {e}")
+                except Exception:
                     details["rollout_log_probs"] = "Error: Not serializable"
             
-            # ======================= ✅ [ 修复 G_Buffer Bug ] =======================
-            # 保存 PPO 更新所需的张量 (作为列表)
-            # (我们假设 envs.py 将这些张量从 set_last_step_tensors 传递到了 step_data)
             for key in ["input_ids", "attention_mask", "position_ids", "responses"]:
                 if key in step_data:
                     try:
                         details[key] = step_data[key].cpu().tolist()
-                    except Exception as e:
-                        self.file_logger.warning(f"[record_step] 无法序列化 {key}: {e}")
-                        print(f"Warning: could not serialize {key}. {e}")
+                    except Exception:
                         details[key] = "Error: Not serializable"
             
-            # --- ✅ [ 修复 G_Buffer VLM Bug ] ---
-            # 保存 VLM inputs (假设它们是 JSON 兼容的, e.g., dict of paths)
-            # 假设 step_data['multi_modal_inputs'] 是单个步骤的 dict, e.g., {'image': 'path/to/img.jpg'}
             if "multi_modal_inputs" in step_data:
-                try:
-                    details["multi_modal_inputs"] = step_data["multi_modal_inputs"]
-                except Exception as e:
-                    self.file_logger.warning(f"[record_step] 无法序列化 multi_modal_inputs: {e}")
-                    print(f"Warning: could not serialize multi_modal_inputs. {e}")
-                    details["multi_modal_inputs"] = "Error: Not serializable"
-            # =====================================================================
-            
-            # --- ✅ [ 修复 prompt_index Bug ] ---
-            # 显式保存 prompt_index 和 prompt_vector
+                 details["multi_modal_inputs"] = step_data["multi_modal_inputs"]
+
             if "prompt_index" in step_data:
                 details["prompt_index"] = step_data["prompt_index"]
             if "prompt_vector" in step_data:
                 try:
                     details["prompt_vector"] = step_data["prompt_vector"].cpu().tolist()
-                except Exception as e:
-                    self.file_logger.warning(f"[record_step] 无法序列化 prompt_vector: {e}")
+                except Exception:
                     details["prompt_vector"] = "Error: Not serializable"
-            # =====================================================================
 
-            # --- ✅ [V8 升级] 添加 log_dir_path 并为奖励组件创建占位符 ---
-            # 记录 log_dir_path 以便调试
-            details["log_dir_path"] = self.log_dir
-            
-            # 为 dp_actor.py 稍后写回的奖励组件创建一个专用占位符
+            # 奖励占位符
             details["reward_components"] = {
                 "note": "Reward components will be populated here after calculation by dp_actor."
             }
-            # --- 结束 [V8 升级] ---
 
             with open(os.path.join(step_dir, "step_details.json"), "w", encoding="utf-8") as f:
                 json.dump(details, f, indent=4, ensure_ascii=False)
 
         except Exception as e:
             self.file_logger.error(f"[record_step] 保存步骤 {self.step_count} artifacts 失败: {e}")
-            print(f"Error saving step artifacts for step {self.step_count}: {e}")
 
     
     # ======================= ✅ 2. 修改 finalize_run 方法签名和逻辑 ✅ =======================
