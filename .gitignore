@@ -144,3 +144,5 @@ logger/
 errors/
 
 temp*
+
+check_setup_updates.py
