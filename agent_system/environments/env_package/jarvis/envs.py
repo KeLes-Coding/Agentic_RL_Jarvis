@@ -160,17 +160,15 @@ class JarvisMultiDeviceEnv:
         adb_path = self.jarvis_config.get("adb", {}).get("executable_path", "adb")
         self.adb_path = adb_path 
 
-        # [新增] 初始化注入器
         self.env_injector = AndroidInjector(adb_path)
 
         self.observers: Dict[str, Observer] = {s: Observer(adb_path, s) for s in self.device_serials}
         self.actuators: Dict[str, Actuator] = {s: Actuator(adb_path, s) for s in self.device_serials}
 
-        # <<< 新增：初始化线程池 >>>
-        # 为每个设备（环境）创建一个工作线程
+        # [关键] 初始化线程池和Future列表
         self.executor = ThreadPoolExecutor(max_workers=self.num_envs, thread_name_prefix="jarvis_env_worker")
+        self.reset_futures: List[Future] = []
         print(f"ThreadPoolExecutor (线程池) 已启动，设置 max_workers={self.num_envs} 以实现并行I/O。")
-
 
         self.max_steps_per_episode = max_steps_per_episode
         self.episode_steps: Dict[str, int] = {s: 0 for s in self.device_serials}
@@ -363,25 +361,26 @@ class JarvisMultiDeviceEnv:
     #             "<image>\nERROR: Reset failed.", 
     #             {"device_serial": serial, "raw_obs_data": {}, "compressed_screenshot_bytes": None, "error": str(e)}
     #         )
-    def _reset_device(self, serial: str, task: Dict) -> Tuple[np.ndarray, str, Dict]:
+    def _reset_device(self, serial: str, task: Dict = None) -> Tuple[np.ndarray, str, Dict]:
         """
         (辅助函数) 在单独的线程中重置单个设备。
-        返回 (obs_image, obs_text, info)
+        如果 task 为 None，则只执行物理环境重置（注入/清理），不更新 self.tasks 状态。
         """
+        mode = "BACKGROUND" if task is None else "FOREGROUND"
         try:
-            # ======================= ✅ 调用注入器进行环境重置 ✅ =======================
-            # 这里的 reset_environment 可能会抛出异常，但会被外层 try 捕获
+            # 1. 物理重置 (耗时操作)
             if hasattr(self, 'env_injector'):
                 self.env_injector.reset_environment(serial)
             else:
                 print(f"--- [设备: {serial}] 警告: env_injector 未初始化 ---")
-            # ===============================================================================
 
-            self.episode_steps[serial] = 0
-            self.tasks[serial] = task if task else {}
+            # 2. 状态更新 (仅在前台重置时进行)
+            if task is not None:
+                self.episode_steps[serial] = 0
+                self.tasks[serial] = task if task else {}
 
-            self.actuators[serial].home() # 清理后返回主屏幕
-            
+            # 3. 回到桌面并获取观察
+            self.actuators[serial].home() 
             try:
                 self.actuators[serial].wait(1.0) 
             except Exception as e:
@@ -421,52 +420,85 @@ class JarvisMultiDeviceEnv:
                 "compressed_screenshot_bytes": compressed_bytes
             }
             
-            # [关键] 必须在这里返回元组，且必须在 try 块的最后
             return final_image_array, final_obs_text, info_dict
         
         except Exception as e:
-            print(f"--- [设备: {serial}] 线程 'reset' 失败: {e} ---")
-            # [关键] 发生异常时，也必须返回格式一致的元组，不能返回 None
+            print(f"--- [设备: {serial}] 线程 'reset' ({mode}) 失败: {e} ---")
             return (
                 np.zeros((256, 256, 3), dtype=np.uint8), 
                 "<image>\nERROR: Reset failed.", 
                 {"device_serial": serial, "raw_obs_data": {}, "compressed_screenshot_bytes": None, "error": str(e)}
             )
 
+    def start_background_reset(self):
+        """
+        [关键] 在当前 Rollout 结束后调用。
+        在后台启动所有设备的重置流程 (不含具体 Task，只做环境恢复)。
+        """
+        if self.reset_futures:
+            print("--- 警告: 后台重置已在运行中，跳过重复触发 ---")
+            return
 
-    # <<< 修改：`reset` 方法现在使用线程池 >>>
+        print(f"--- [Async] 🚀 正在后台启动 {self.num_envs} 台设备的环境重置 (Resetting while Training)... ---")
+        self.reset_futures = []
+        for serial in self.device_serials:
+            # task=None 表示只做物理重置
+            self.reset_futures.append(self.executor.submit(self._reset_device, serial, None))
+
     def reset(self, tasks: List[Dict] = None) -> Tuple[Dict[str, List], List[Dict]]:
         obs_images = []
         obs_texts = []
         infos = []
 
-        # 为每个设备准备任务
         device_tasks = []
         if tasks:
-            # 确保 task 列表至少和设备列表一样长，如果不够，则用空字典填充
             device_tasks = [tasks[i] if i < len(tasks) else {} for i in range(self.num_envs)]
         else:
             device_tasks = [{} for _ in range(self.num_envs)]
 
-        # <<< 修改：使用线程池并行执行 reset >>>
-        futures: List[Future] = []
-        for i, serial in enumerate(self.device_serials):
-            task = device_tasks[i]
-            futures.append(self.executor.submit(self._reset_device, serial, task))
+        # --- 策略 A: 优先使用后台重置结果 ---
+        if self.reset_futures:
+            print(f"--- [Reset] ♻️  检测到 {len(self.reset_futures)} 个后台重置任务，正在等待完成并获取结果... ---")
+            for i, future in enumerate(self.reset_futures):
+                try:
+                    # 获取结果 (如果后台还没跑完，这里会阻塞，但已经节省了前面的时间)
+                    img, text, info = future.result() 
+                    
+                    # [关键] 补全任务状态 (因为后台重置时没有任务信息)
+                    serial = self.device_serials[i]
+                    self.tasks[serial] = device_tasks[i]
+                    self.episode_steps[serial] = 0
+                    
+                    obs_images.append(img)
+                    obs_texts.append(text)
+                    infos.append(info)
+                except Exception as e:
+                    print(f"--- [Reset] 获取后台结果失败: {e}")
+                    obs_images.append(np.zeros((256, 256, 3), dtype=np.uint8))
+                    obs_texts.append("<image>\nERROR")
+                    infos.append({"device_serial": "unknown", "error": str(e)})
+            
+            self.reset_futures = []
 
-        # 按顺序收集结果
-        for future in futures:
-            try:
-                img, text, info = future.result() # 等待线程完成
-                obs_images.append(img)
-                obs_texts.append(text)
-                infos.append(info)
-            except Exception as e:
-                # 处理 _reset_device 中未捕获的异常
-                print(f"--- 严重错误: 'reset' 线程 'future.result()' 失败: {e} ---")
-                obs_images.append(np.zeros((256, 256, 3), dtype=np.uint8))
-                obs_texts.append("<image>\nERROR: Future result failed.")
-                infos.append({"device_serial": "unknown", "error": str(e)})
+        # --- 策略 B: 如果没有后台任务，执行标准同步重置 ---
+        else:
+            # print("--- [Reset] 无后台任务，执行标准同步重置... ---")
+            futures: List[Future] = []
+            for i, serial in enumerate(self.device_serials):
+                task = device_tasks[i]
+                futures.append(self.executor.submit(self._reset_device, serial, task))
+
+            for future in futures:
+                try:
+                    img, text, info = future.result()
+                    obs_images.append(img)
+                    obs_texts.append(text)
+                    infos.append(info)
+                except Exception as e:
+                    print(f"--- 严重错误: 'reset' 线程 'future.result()' 失败: {e} ---")
+                    obs_images.append(np.zeros((256, 256, 3), dtype=np.uint8))
+                    obs_texts.append("<image>\nERROR: Future result failed.")
+                    infos.append({"device_serial": "unknown", "error": str(e)})
 
         return {"image": obs_images, "text": obs_texts}, infos
 

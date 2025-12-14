@@ -602,6 +602,19 @@ class JarvisEnvironmentManager(EnvironmentManagerBase):
             print(f"  [环境 {i}] 的日志目录: {full_path}")
         print("-------------------------------------------------")
 
+    # [新增] 显式暴露后台重置接口，供 rollout_loop 调用
+    def start_background_reset(self):
+        """
+        触发底层环境的后台重置。
+        这允许在主进程进行训练 (Training) 时，后台线程并行执行耗时的 ADB 重置操作。
+        """
+        # self.envs 是 JarvisMultiDeviceEnv 的实例
+        if hasattr(self.envs, "start_background_reset"):
+            print("--- [EnvManager] ⚡️ 触发底层 JarvisMultiDeviceEnv 的后台重置 (Async Reset) ---")
+            self.envs.start_background_reset()
+        else:
+            print(f"--- [EnvManager] 警告: 底层环境 {type(self.envs)} 没有 start_background_reset 方法 ---")
+
     # ======================= ✅ 1. 修改 reset 方法以接收 tasks 参数 ✅ =======================
     def reset(self, tasks: List[Dict] = None):
         """

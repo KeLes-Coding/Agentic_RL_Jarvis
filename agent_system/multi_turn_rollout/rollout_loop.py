@@ -473,6 +473,59 @@ class TrajectoryCollector:
         )
         self.file_logger.info(f"--- [gather_rollout_data] 聚合完成。总步骤: {len(effective_batch)} ---")
         return gen_batch_output
+    
+    def _trigger_async_reset_recursive(self, obj, depth=0):
+        """
+        递归查找 obj 对象及其子属性，直到找到并触发 start_background_reset。
+        支持穿透常见的 Wrapper 结构 (env, module, envs, _envs, etc.)。
+        """
+        indent = "  " * depth
+        method_name = "start_background_reset"
+        obj_type = type(obj).__name__
+        
+        # 1. 直接检查当前对象
+        if hasattr(obj, method_name):
+            try:
+                getattr(obj, method_name)()
+                self.file_logger.info(f"{indent}✅ [Async] 成功在 {obj_type} 上触发 {method_name}")
+                return True
+            except Exception as e:
+                self.file_logger.error(f"{indent}❌ [Async] 在 {obj_type} 上触发失败: {e}")
+                return False
+
+        # 防止递归过深
+        if depth > 5:
+            return False
+
+        triggered_any = False
+
+        # 2. 检查列表/容器 (VectorEnv / EnvManager 常见结构)
+        # 检查 .envs, ._envs, .env_list
+        target_lists = []
+        if hasattr(obj, "envs") and isinstance(obj.envs, list): target_lists.append(obj.envs)
+        if hasattr(obj, "_envs") and isinstance(obj._envs, list): target_lists.append(obj._envs)
+        if hasattr(obj, "env_list") and isinstance(obj.env_list, list): target_lists.append(obj.env_list)
+
+        for env_list in target_lists:
+            count = 0
+            for sub_env in env_list:
+                if self._trigger_async_reset_recursive(sub_env, depth + 1):
+                    count += 1
+                    triggered_any = True
+            if count > 0:
+                self.file_logger.info(f"{indent}✨ [Async] 在 {obj_type} 的列表中触发了 {count} 个子环境")
+
+        # 3. 检查常见的单体包装属性 (.env, .module, ._env)
+        target_attrs = ["env", "module", "_env"]
+        for attr in target_attrs:
+            if hasattr(obj, attr):
+                child = getattr(obj, attr)
+                # 防止循环引用或无效对象
+                if child is not None and child is not obj: 
+                    if self._trigger_async_reset_recursive(child, depth + 1):
+                        triggered_any = True
+
+        return triggered_any
 
     def vanilla_multi_turn_loop(
             self,
@@ -558,12 +611,11 @@ class TrajectoryCollector:
                 if prompt_vector_tensor is None:
                     self.file_logger.error("!!! [vanilla_multi_turn_loop] 'prompt_vector' is missing from gen_batch.batch! STDB will fail. !!!")
                 
-                # ======================= ✅ [关键修复] 健壮的任务提取与解码逻辑 =======================
                 for i in range(len(gen_batch)):
                     item = raw_prompts[i]
                     task_content = ""
                     
-                    # 情况A: Item 是 Chat List (列表或对象数组)
+                    # 情况A: Item 是 Chat List
                     if isinstance(item, list) and len(item) > 0 and isinstance(item[0], dict) and 'content' in item[0]:
                         task_content = item[0]['content']
                     # 情况B: Item 是 Numpy 封装的 List
@@ -575,18 +627,16 @@ class TrajectoryCollector:
                     else:
                         task_content = item
 
-                    # 🚨 [核心修复]: 强制解码 bytes -> str
+                    # 强制解码 bytes -> str
                     if isinstance(task_content, (bytes, np.bytes_)):
                         try:
                             task_content = task_content.decode('utf-8')
                         except Exception as e:
                             self.file_logger.error(f"解码任务内容失败: {e}")
-                            task_content = str(task_content) # 降级处理
+                            task_content = str(task_content) 
                     
-                    # 确保是字符串
                     task_content = str(task_content)
 
-                    # 构建任务数据
                     task_data = {
                         "task": task_content,
                         "ground_truth_answer": ground_truth_answers[i],
@@ -597,7 +647,6 @@ class TrajectoryCollector:
                          task_data["prompt_vector"] = prompt_vector_tensor[i]
                     
                     tasks_for_this_batch.append(task_data)
-                # =================================================================================
 
                 print("--- [rollout_loop.py] 已成功准备任务、答案、prompt_index 和 prompt_vector 用于环境重置。 ---")
                 self.file_logger.info(f"已准备 {len(tasks_for_this_batch)} 个任务 (含 STDB 索引) 用于环境重置。")
@@ -643,7 +692,6 @@ class TrajectoryCollector:
         episode_lengths = np.zeros(batch_size, dtype=np.int32)
         episode_rewards = np.zeros(batch_size, dtype=np.float32)
 
-        # 记录 reset 这一步（作为 step 0）
         if hasattr(envs, 'info_pool_managers') and hasattr(envs, 'tasks'):
             for i in range(len(infos)):
                 if i in envs.info_pool_managers:
@@ -657,7 +705,6 @@ class TrajectoryCollector:
                         "llm_prompt": "N/A",
                         "raw_llm_response": "N/A"
                     }
-                    
                     if i < len(tasks_for_this_batch):
                         step_data["prompt_index"] = tasks_for_this_batch[i].get("prompt_index")
                         step_data["prompt_vector"] = tasks_for_this_batch[i].get("prompt_vector")
@@ -673,7 +720,6 @@ class TrajectoryCollector:
             print("\n" + "="*50)
             print(f"--- 监控: 即将输入到 LLM 的完整 Prompt (Batch Item 0) (Step {_step+1}) ---")
             full_prompt_for_llm = self.tokenizer.decode(batch.batch['input_ids'][0], skip_special_tokens=False)
-            # print(full_prompt_for_llm)
             print("="*50 + "\n")
 
             batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
@@ -706,14 +752,11 @@ class TrajectoryCollector:
                 print(f"  [环境 {i}]: {response}")
             print("*"*50 + "\n")
 
-            # ======================= ✅ [CCAPO] 计算并暂存 Token、置信度、对数概率 =======================
             try:
-                # 1. 计算 Token
                 input_token_counts = torch.sum(batch_input.batch["attention_mask"], dim=1)
                 full_token_counts = torch.sum(batch.batch["attention_mask"], dim=1)
                 output_token_counts = full_token_counts - input_token_counts
 
-                # 2. 计算置信度
                 log_probs = batch.batch['rollout_log_probs']
                 response_mask = batch.batch["attention_mask"][:, -log_probs.shape[1]:]
                 
@@ -724,7 +767,6 @@ class TrajectoryCollector:
                 average_log_probs = sum_of_log_probs / num_of_tokens
                 average_confidence = torch.exp(average_log_probs)
 
-                # 3. 准备传递给 env_manager 的数据
                 token_usage_list = []
                 confidence_metrics_list = []
                 log_probs_list = [] 
@@ -749,7 +791,6 @@ class TrajectoryCollector:
                         "responses": batch.batch["responses"][i],
                     })
                 
-                # 4. 暂存数据
                 if hasattr(envs, "set_last_step_token_usage"):
                     envs.set_last_step_token_usage(token_usage_list)
                 if hasattr(envs, "set_last_step_confidence"):
@@ -759,14 +800,10 @@ class TrajectoryCollector:
                 if hasattr(envs, "set_last_step_tensors"):
                     envs.set_last_step_tensors(tensors_for_env_list)
                 
-                # 暂存 STDB 索引信息
                 if hasattr(envs, "set_last_step_stdb_info"):
                     stdb_info_list = []
                     current_prompt_index_list = batch.non_tensor_batch.get('prompt_index', [None] * batch_size)
                     current_prompt_vector_tensor = batch.batch.get('prompt_vector', None)
-                    
-                    if current_prompt_vector_tensor is None:
-                         self.file_logger.error(f"!!! [vanilla_multi_turn_loop] Step {_step+1}: 'prompt_vector' not found in current step's batch! STDB will fail. !!!")
                     
                     for i in range(batch_size):
                         stdb_info_list.append({
@@ -779,7 +816,6 @@ class TrajectoryCollector:
                 import traceback
                 print(f"!!!!!! [Rollout Step: {_step+1}] 计算 Token 和置信度时出错: {e} !!!!!!")
                 self.file_logger.error(f"[vanilla_multi_turn_loop] Step {_step+1}: 计算 Token 和置信度时出错: {e}\n{traceback.format_exc()}")
-            # ==============================================================================
 
             next_obs, rewards, dones, infos = envs.step(text_actions)
 
@@ -805,7 +841,6 @@ class TrajectoryCollector:
                     total_batch_list[i].append(batch_list[i])
                     total_infos[i].append(infos[i])
 
-                    # ======================= ✅ [CCAPO V3] 检查并终结 =======================
                     if dones[i] and hasattr(envs, 'info_pool_managers') and i in envs.info_pool_managers:
                         task_completed = infos[i].get("won", False)
                         status = "SUCCESS" if task_completed else "FAILURE"
@@ -822,7 +857,6 @@ class TrajectoryCollector:
                         )
                         total_infos[i][-1]['final_summary'] = final_summary
                         envs.info_pool_managers.pop(i, None)
-                    # ===================================================================================
 
             is_done = np.logical_or(is_done, dones)
             obs = next_obs
@@ -833,7 +867,6 @@ class TrajectoryCollector:
         if not is_done.all():
             self.file_logger.info(f"[vanilla_multi_turn_loop] 达到 Max Steps ({self.config.env.max_steps})。")
 
-        # ======================= ✅ 2. 修复超时的终结逻辑 =======================
         for i in range(batch_size):
             if not is_done[i] and hasattr(envs, 'info_pool_managers') and i in envs.info_pool_managers:
                 self.file_logger.warning(f"[vanilla_multi_turn_loop] 环境 {i} (uid={traj_uid[i]}) 超时。强制终结。")
@@ -852,7 +885,6 @@ class TrajectoryCollector:
                         total_infos[i][-1]['final_summary'] = final_summary
                     
                     envs.info_pool_managers.pop(i, None)
-        # ========================================================================
 
         success: Dict[str, np.ndarray] = envs.success_evaluator(
             total_infos=total_infos,
@@ -860,6 +892,20 @@ class TrajectoryCollector:
             episode_rewards=episode_rewards,
             episode_lengths=episode_lengths,
         )
+
+        # ======================= ✅ [优化] 触发后台异步重置 ✅ =======================
+        # 现在 JarvisEnvironmentManager 已经实现了 start_background_reset，直接调用即可
+        self.file_logger.info("--- [vanilla_multi_turn_loop] Rollout 结束，触发后台 Async Reset ---")
+        
+        if hasattr(envs, "start_background_reset"):
+            try:
+                envs.start_background_reset()
+            except Exception as e:
+                self.file_logger.error(f"[vanilla_multi_turn_loop] 触发后台重置时发生异常: {e}")
+        else:
+            self.file_logger.warning("!!! [vanilla_multi_turn_loop] envs 对象没有 start_background_reset 方法，后台重置未启动 !!!")
+        # ============================================================================
+
         self.file_logger.info(f"--- [vanilla_multi_turn_loop] 结束 ---")
         return total_batch_list, total_infos, episode_rewards, episode_lengths, success, traj_uid
     
@@ -998,5 +1044,24 @@ class TrajectoryCollector:
             traj_uid=total_traj_uid,
         )
         
+        # ======================= ✅ [最终优化] 触发后台异步重置 ✅ =======================
+        # 放在这里是因为它是最高层级，确保在返回数据给 Trainer 进行训练之前触发。
+        # 此时 Rollout 已经完全结束，Trainer 即将开始工作（Training 期间占用 GPU）。
+        # 我们利用这段 GPU 训练时间，在后台 CPU 上执行 ADB 重置。
+        # 注意：envs 是 JarvisEnvironmentManager 实例
+        if is_train: # 仅在训练模式下预重置
+            self.file_logger.info("--- [multi_turn_loop] Rollout 阶段结束，准备触发后台 Async Reset ---")
+            
+            # 直接调用 JarvisEnvironmentManager 上的方法（上面步骤1中新增的）
+            if hasattr(envs, "start_background_reset"):
+                try:
+                    envs.start_background_reset()
+                    self.file_logger.info("--- [multi_turn_loop] ✅ 成功触发后台重置 ---")
+                except Exception as e:
+                    self.file_logger.error(f"--- [multi_turn_loop] ❌ 触发后台重置失败: {e}")
+            else:
+                self.file_logger.warning(f"--- [multi_turn_loop] ⚠️ envs 对象 ({type(envs)}) 没有 start_background_reset 方法，跳过优化 ---")
+        # ============================================================================
+
         self.file_logger.info(f"--- [multi_turn_loop] 结束 ---")
         return gen_batch_output
