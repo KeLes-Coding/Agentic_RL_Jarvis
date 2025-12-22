@@ -136,6 +136,11 @@ class AndroidInjector:
         return logger
 
     def _fix_permissions_robust(self, device_id, logger):
+        """
+        [优化版] 批量修复权限。
+        先一次性获取所有包的UID，然后生成一个包含所有修复命令的Shell脚本，
+        一次性推送到设备执行，极大地减少ADB通信次数。
+        """
         apps_to_fix = [
             ("com.simplemobiletools.calendar.pro", "databases"),
             ("org.tasks", "databases"),
@@ -143,25 +148,80 @@ class AndroidInjector:
             ("net.gsantner.markor", "files") 
         ]
         
+        logger.info(f"开始批量修复应用权限 ({len(apps_to_fix)} 个应用)...")
+
+        # 1. 一次性获取所有包的 UID 信息
+        # 输出格式通常为: package:com.example.app uid:10123
+        try:
+            res = subprocess.run(
+                [self.adb_path, "-s", device_id, "shell", "pm list packages -U"], 
+                capture_output=True, text=True, check=True
+            )
+            packages_output = res.stdout
+        except Exception as e:
+            logger.error(f"获取包 UID 列表失败: {e}")
+            return
+
+        # 解析 UID 映射: { "pkg_name": "uid" }
+        pkg_uid_map = {}
+        for line in packages_output.splitlines():
+            if "package:" in line and "uid:" in line:
+                parts = line.split()
+                p_name = parts[0].split(":")[1]
+                u_id = parts[1].split(":")[1]
+                pkg_uid_map[p_name] = u_id
+
+        # 2. 构建批量修复脚本
+        script_cmds = ["#!/system/bin/sh"]
+        script_cmds.append("echo 'Starting permission fix...'")
+        
+        cmds_count = 0
         for pkg, rel_path in apps_to_fix:
-            try:
-                res = subprocess.run([self.adb_path, "-s", device_id, "shell", f"pm list packages -U {pkg}"], 
-                                     capture_output=True, text=True)
-                match = re.search(r"uid:(\d+)", res.stdout)
-                if match:
-                    uid = match.group(1)
-                    base_path = f"/data/data/{pkg}"
-                    target_path = f"{base_path}/{rel_path}"
-                    cmds = [
-                        f"chown -R {uid}:{uid} {base_path}",
-                        f"chmod 770 {base_path}",
-                        f"chmod -R 770 {target_path}",
-                        f"restorecon -R {base_path}"
-                    ]
-                    for cmd in cmds:
-                        subprocess.run([self.adb_path, "-s", device_id, "shell", cmd], capture_output=True)
-            except Exception as e:
-                logger.error(f"修复 {pkg} 权限时出错: {e}")
+            if pkg not in pkg_uid_map:
+                logger.warning(f"跳过权限修复: 未找到包 {pkg}")
+                continue
+            
+            uid = pkg_uid_map[pkg]
+            base_path = f"/data/data/{pkg}"
+            target_path = f"{base_path}/{rel_path}"
+            
+            # 将该应用的所有命令加入脚本
+            script_cmds.append(f"chown -R {uid}:{uid} {base_path}")
+            script_cmds.append(f"chmod 770 {base_path}")
+            #有些目录可能还不存在，加个判断或忽略错误
+            script_cmds.append(f"if [ -d \"{target_path}\" ]; then chmod -R 770 {target_path}; fi")
+            script_cmds.append(f"restorecon -R {base_path}")
+            cmds_count += 1
+
+        if cmds_count == 0:
+            logger.info("没有需要修复权限的应用。")
+            return
+
+        script_cmds.append("echo 'Permission fix finished.'")
+
+        # 3. 写入本地临时文件并执行
+        local_script = f"temp_perm_fix_{device_id}.sh"
+        remote_script = f"/data/local/tmp/perm_fix_{device_id}.sh"
+
+        try:
+            with open(local_script, "w", encoding="utf-8", newline='\n') as f:
+                f.write("\n".join(script_cmds))
+            
+            # 推送脚本
+            subprocess.run([self.adb_path, "-s", device_id, "push", local_script, remote_script], check=True, capture_output=True)
+            
+            # 执行脚本
+            subprocess.run([self.adb_path, "-s", device_id, "shell", "sh", remote_script], check=True, capture_output=True)
+            logger.info("批量权限修复执行完毕。")
+            
+            # 清理脚本
+            subprocess.run([self.adb_path, "-s", device_id, "shell", "rm", remote_script], capture_output=True)
+
+        except Exception as e:
+            logger.error(f"执行批量权限修复脚本时出错: {e}")
+        finally:
+            if os.path.exists(local_script):
+                os.remove(local_script)
 
     def reset_environment(self, device_id: str):
         logger = self._setup_dummy_logger(device_id)

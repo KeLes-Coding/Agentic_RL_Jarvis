@@ -55,7 +55,9 @@ StdbVectorMap = Dict[int, torch.Tensor]
 
 
 class SuccessTrajectoryDatabase:
-    def __init__(self, save_path: str, top_k: int = 8):
+    def __init__(self, save_path: str, top_k: int = 8, 
+                 allow_similarity_fallback: bool = False,  # <--- 新增：默认关闭
+                 similarity_threshold: float = 0.95):      # <--- 新增：高阈值
         """
         初始化成功轨迹数据库 (STDB)。
 
@@ -263,28 +265,11 @@ class SuccessTrajectoryDatabase:
                 for R_tau, log_dir_path in self.db[prompt_index]:
                     buffer_log_paths.add(log_dir_path)
             
-            # --- 2. 相似度回退 (如果直接匹配失败) ---
-            elif self.known_vectors is not None and prompt_vector is not None:
-                logger.debug(f"[STDB] Prompt {prompt_index} 未找到, 执行相似度搜索...")
-                self.file_logger.info(f"Prompt {prompt_index}: 未命中。执行相似度回退...")
-                # 将查询向量移到 CPU 并确保类型正确
-                query_vec = prompt_vector.cpu().float().unsqueeze(0)
-                
-                # 计算余弦相似度
-                similarities = util.cos_sim(query_vec, self.known_vectors)[0]
-                
-                # 找到最佳匹配
-                best_match_tensor_idx = torch.argmax(similarities).item()
-                best_match_prompt_index = self.known_indices[best_match_tensor_idx]
-                
-                logger.debug(f"     -> 最佳匹配: Prompt {best_match_prompt_index} (相似度: {similarities[best_match_tensor_idx]:.4f})")
-                self.file_logger.info(f"  -> Prompt {prompt_index} 匹配到 {best_match_prompt_index} (相似度: {similarities[best_match_tensor_idx]:.4f})。")
-                
-                # 使用最佳匹配的轨迹
-                for R_tau, log_dir_path in self.db[best_match_prompt_index]:
-                    buffer_log_paths.add(log_dir_path)
+            # --- [已删除] 2. 相似度回退 ---
+            # 原来的 elif ... 及其下的代码块全部删除
+            # 如果没有直接命中，就什么都不做，buffer_log_paths 会保持为空或只包含其他命中Prompt的轨迹
             else:
-                self.file_logger.warning(f"Prompt {prompt_index}: 未命中，且无法执行相似度搜索 (known_vectors: {self.known_vectors is not None}, prompt_vector: {prompt_vector is not None})")
+                self.file_logger.debug(f"Prompt {prompt_index}: 未在 STDB 中找到，且已禁用相似度回退。")
         
         if not buffer_log_paths:
             self.file_logger.warning(f"未找到任何锚点轨迹。")

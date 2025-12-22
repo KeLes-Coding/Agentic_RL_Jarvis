@@ -15,6 +15,7 @@
 
 import torch
 import numpy as np
+import threading
 from verl import DataProto
 from verl.utils.dataset.rl_dataset import collate_fn
 from verl.utils.model import compute_position_id_with_mask
@@ -1044,24 +1045,36 @@ class TrajectoryCollector:
             traj_uid=total_traj_uid,
         )
         
-        # ======================= ✅ [最终优化] 触发后台异步重置 ✅ =======================
-        # 放在这里是因为它是最高层级，确保在返回数据给 Trainer 进行训练之前触发。
-        # 此时 Rollout 已经完全结束，Trainer 即将开始工作（Training 期间占用 GPU）。
-        # 我们利用这段 GPU 训练时间，在后台 CPU 上执行 ADB 重置。
-        # 注意：envs 是 JarvisEnvironmentManager 实例
-        if is_train: # 仅在训练模式下预重置
-            self.file_logger.info("--- [multi_turn_loop] Rollout 阶段结束，准备触发后台 Async Reset ---")
+        # ======================= ✅ [最终优化] 触发后台异步重置 (真正异步) ✅ =======================
+        # 优化说明：
+        # start_background_reset 内部包含阻塞的 SSH 等待逻辑。
+        # 为了不阻塞 Trainer (GPU训练)，我们开启一个守护线程来执行重置逻辑。
+        # 这样 rollout_loop 可以立即返回数据，实现 [Training] 和 [Env Reset] 的并行。
+        
+        if is_train: 
+            self.file_logger.info("--- [multi_turn_loop] Rollout 阶段结束，正在启动后台重置线程... ---")
             
-            # 直接调用 JarvisEnvironmentManager 上的方法（上面步骤1中新增的）
             if hasattr(envs, "start_background_reset"):
                 try:
-                    envs.start_background_reset()
-                    self.file_logger.info("--- [multi_turn_loop] ✅ 成功触发后台重置 ---")
+                    # 定义后台执行的 wrapper 函数
+                    def _background_reset_task():
+                        try:
+                            envs.start_background_reset()
+                            rollout_file_logger.info("--- [Async-Thread] 后台重置流程触发完成 ---")
+                        except Exception as e:
+                            rollout_file_logger.error(f"--- [Async-Thread] ❌ 后台重置线程发生异常: {e}")
+
+                    # 创建并启动线程
+                    reset_thread = threading.Thread(target=_background_reset_task, name="EnvBackgroundReset")
+                    reset_thread.daemon = True # 设置为守护线程，防止主进程退出时挂起
+                    reset_thread.start()
+                    
+                    self.file_logger.info("--- [multi_turn_loop] ✅ 后台重置线程已启动 (Fire-and-Forget) ---")
                 except Exception as e:
-                    self.file_logger.error(f"--- [multi_turn_loop] ❌ 触发后台重置失败: {e}")
+                    self.file_logger.error(f"--- [multi_turn_loop] ❌ 启动后台线程失败: {e}")
             else:
                 self.file_logger.warning(f"--- [multi_turn_loop] ⚠️ envs 对象 ({type(envs)}) 没有 start_background_reset 方法，跳过优化 ---")
-        # ============================================================================
+        # ==========================================================================================
 
         self.file_logger.info(f"--- [multi_turn_loop] 结束 ---")
         return gen_batch_output

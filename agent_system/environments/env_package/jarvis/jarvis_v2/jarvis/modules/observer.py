@@ -74,38 +74,50 @@ class Observer:
         return 1080, 1920  # 返回一个通用的默认值以防万一
 
     def get_screenshot_bytes(self) -> bytes | None:
-        """获取设备当前屏幕的截图，并以字节形式返回。"""
-        remote_path = "/data/local/tmp/screenshot.png"
-        local_path = f"{self.local_temp_path}_screen.png"
+        """
+        [优化版] 使用 exec-out 直接获取截图流，避免文件IO和多次ADB交互。
+        """
+        # exec-out 是直接输出二进制流，比 shell screencap -p 更快且无需转义
+        cmd = [self.adb_path, "-s", self.device_serial, "exec-out", "screencap -p"]
+        # self.logger.debug(f"执行快速截图: {' '.join(cmd)}") 
         try:
-            if not self._execute_adb_command(["shell", "screencap", "-p", remote_path]):
-                return None
-            if not self._execute_adb_command(["pull", remote_path, local_path]):
-                return None
-            with open(local_path, "rb") as f:
-                return f.read()
-        finally:
-            self._execute_adb_command(["shell", "rm", remote_path])
-            if os.path.exists(local_path):
-                os.remove(local_path)
+            result = subprocess.run(
+                cmd,
+                check=True,
+                timeout=10,
+                capture_output=True
+            )
+            return result.stdout
+        except subprocess.TimeoutExpired:
+            self.logger.error("获取截图超时")
+            return None
+        except Exception as e:
+            self.logger.error(f"获取截图失败: {e}")
+            return None
 
     def get_layout_xml(self) -> str | None:
-        """获取设备当前UI布局的XML文件内容。"""
-        remote_path = "/data/local/tmp/uidump.xml"
-        local_path = f"{self.local_temp_path}_uidump.xml"
+        """
+        [优化版] 链式执行 dump 和 cat，一次交互完成获取。
+        """
+        remote_path = f"/data/local/tmp/uidump_{self.device_serial}.xml"
+        # 组合命令: dump 到文件 (如果是旧版安卓可能不支持直接输出stdout) && cat 输出 && rm 删除
+        # uiautomator dump 有时会因为界面动态变化而失败，添加 || true 防止整个命令报错
+        full_cmd = f"uiautomator dump {remote_path} > /dev/null && cat {remote_path} && rm {remote_path}"
+        
         try:
-            if not self._execute_adb_command(
-                ["shell", "uiautomator", "dump", remote_path]
-            ):
-                return None
-            if not self._execute_adb_command(["pull", remote_path, local_path]):
-                return None
-            with open(local_path, "r", encoding="utf-8") as f:
-                return f.read()
-        finally:
-            self._execute_adb_command(["shell", "rm", remote_path])
-            if os.path.exists(local_path):
-                os.remove(local_path)
+            # 注意：这里不能用 exec-out，因为我们要执行 shell 组合命令
+            result = subprocess.run(
+                [self.adb_path, "-s", self.device_serial, "shell", full_cmd],
+                check=True,
+                timeout=20,
+                capture_output=True,
+                text=True,
+                encoding="utf-8"
+            )
+            return result.stdout
+        except Exception as e:
+            self.logger.error(f"获取布局XML失败: {e}")
+            return None
 
     def _parse_bounds(self, bounds_str: str) -> Tuple[int, int, int, int]:
         """从字符串（如"[0,100][200,300]"）中解析出边界坐标。"""

@@ -77,7 +77,8 @@ class DataParallelPPOActor(BasePPOActor):
         """
         response_length = micro_batch["responses"].size(-1)
         multi_modal_inputs = {}
-        if "multi_modal_inputs" in micro_batch and micro_batch["multi_modal_inputs"]:
+        # if "multi_modal_inputs" in micro_batch and micro_batch["multi_modal_inputs"]:
+        if "multi_modal_inputs" in micro_batch and len(micro_batch["multi_modal_inputs"]) > 0:
             # micro_batch["multi_modal_inputs"] is a list of dicts, e.g., [ {'image': 'path1'}, {'image': 'path2'} ]
             # or [ {'image': tensor1}, {'image': tensor2} ]
             
@@ -738,6 +739,10 @@ class DataParallelPPOActor(BasePPOActor):
 
                     # PPO Loss
                     adv_batch = torch.clamp(mb_online["advantages"], -4.0, 4.0)
+
+                    # ✅ [FIX] Broadcast Fix: Ensure adv_batch is (B, 1) to match (B, SeqLen)
+                    if adv_batch.dim() == 1:
+                        adv_batch = adv_batch.unsqueeze(-1)
 
                     pg_loss, pg_clipfrac, ppo_kl, _ = compute_policy_loss(
                         old_log_prob=mb_online["old_log_probs"],

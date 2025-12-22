@@ -816,105 +816,104 @@ def _calculate_separated_advantages(steps: List[Dict[str, Any]], omega: float, c
 
 def _apply_dr_grpo_v3(steps_list: List[Dict[str, Any]]):
     """
-    [Dr. GRPO V3 - Success-Conditional Tanh-Gating]
-    
-    Innovation:
-    1. Failure Invariance: Failed trajectories always get W=1.0. 
-       (Prevents weakening the penalty for long failures).
-    2. Success-Only Statistics: Length stats are calculated ONLY from successful trajectories.
-    3. Parameter-Free: Uses tanh to naturally bound weights to (0, 2).
-    
-    Logic:
-       if is_fail: W = 1.0
-       if is_success: W = 1.0 + tanh( (Mean_Succ - L_i) / Std_Succ )
+    [Dr. GRPO V3.2 - Prompt-Specific Grouping]
+    根据 'prompt_index' 对 Prompt 进行严格分组。
+    同一 Prompt 下的所有轨迹（无论成功失败）参与该组的长度统计。
     """
     if not steps_list: return
 
-    # 1. Group by Trajectory
+    # --- 1. 按 Prompt (Task) 分组 ---
+    # 结构: prompt_idx -> [ {uid: str, steps: list, is_success: bool, length: int} ]
+    prompt_groups = collections.defaultdict(list)
+    
+    # 先按轨迹聚合，方便提取每条轨迹的属性
     trajs = _group_steps_by_traj(steps_list)
     
-    # 2. Extract Success Trajectory Lengths
-    succ_lengths = []
-    traj_info_map = {} # uid -> {'length': int, 'is_success': bool}
-
     for uid, steps in trajs.items():
         if not steps: continue
         
-        # Check success from the first step (which holds trajectory-level info)
-        # Assuming R_core == 1.0 means success
+        # [关键] 直接获取 upstream 传递下来的 prompt_index
+        # ray_trainer.py 中已将其从 non_tensor_batch pop 出来
+        p_idx = steps[0].get('prompt_index')
+        
+        # 容错处理：如果 tensor 类型则取值，如果不存在则归为 'unknown'
+        if hasattr(p_idx, 'item'):
+            p_idx = int(p_idx.item())
+        elif p_idx is None:
+            # 这是一个极端情况，理论上不应发生，除非数据流中有丢失
+            p_idx = 'unknown'
+        
         r_core = steps[0].get('R_core', 0.0)
         is_success = (r_core == 1.0)
         length = len(steps)
         
-        traj_info_map[uid] = {'length': length, 'is_success': is_success}
-        
-        if is_success:
-            succ_lengths.append(length)
+        prompt_groups[p_idx].append({
+            'uid': uid,
+            'is_success': is_success,
+            'length': length
+        })
 
-    # 3. Calculate Statistics (Only if we have successes)
-    mean_succ = 0.0
-    std_succ = 1.0 # default to avoid div by zero
-    has_success = len(succ_lengths) > 0
+    # --- 2. 对每个 Group 计算统计量并分配权重 ---
+    uid_weight_map = {} # uid -> weight
     
-    if has_success:
-        arr = np.array(succ_lengths, dtype=float)
-        mean_succ = np.mean(arr)
-        std_succ = np.std(arr) + 1e-6 # epsilon
+    for p_idx, group_items in prompt_groups.items():
+        # 2.1 提取该组内 *成功* 样本的长度
+        succ_lengths = [item['length'] for item in group_items if item['is_success']]
+        
+        # 2.2 计算统计量 (Mean, Std)
+        # 只有当该 Prompt 至少有 2 条成功轨迹时，比较才有意义
+        # 如果只有 1 条成功，或者全是失败，无法计算相对优势
+        can_calculate_stats = len(succ_lengths) > 1
+        
+        if can_calculate_stats:
+            arr = np.array(succ_lengths, dtype=float)
+            mean_succ = np.mean(arr)
+            std_succ = np.std(arr) + 1e-6
+        else:
+            # 无法比较时，不进行缩放
+            mean_succ = 0.0
+            std_succ = 1.0
+            
+        # 2.3 计算每个轨迹的权重
+        for item in group_items:
+            uid = item['uid']
+            is_succ = item['is_success']
+            length = item['length']
+            
+            weight = 1.0 # 默认为 1.0 (不改变)
+            
+            if is_succ and can_calculate_stats:
+                # Dr. GRPO 核心公式
+                # 只有成功样本参与“内卷”
+                z_score = (mean_succ - float(length)) / std_succ
+                
+                # Tanh Gating: 映射到 (0, 2) 区间，中心为 1.0
+                # 短于平均 -> z > 0 -> tanh > 0 -> weight > 1.0 (奖励放大)
+                # 长于平均 -> z < 0 -> tanh < 0 -> weight < 1.0 (奖励抑制)
+                weight = 1.0 + np.tanh(z_score)
+                
+                # 安全下限：防止权重过小导致样本失效（虽然是成功的）
+                weight = max(0.2, weight)
+            
+            uid_weight_map[uid] = weight
+            
+            # [可选] 日志记录：看看哪些 Prompt 触发了加权
+            if is_succ and can_calculate_stats and abs(weight - 1.0) > 0.1:
+                match_debug_logger.info(f"  [Dr.GRPO] Prompt {p_idx} | Len {length} (Avg {mean_succ:.1f}) -> W {weight:.2f}")
 
-    # 4. Apply Weights
+    # --- 3. 将权重写回步骤列表 ---
     for step in steps_list:
         uid_val = step['traj_uid']
         if isinstance(uid_val, (np.ndarray, torch.Tensor)):
              uid_val = uid_val.item()
         
-        info = traj_info_map.get(uid_val)
-        if not info: continue
+        weight = uid_weight_map.get(uid_val, 1.0)
         
-        # Default weight
-        weight = 1.0
-        z_score = 0.0
-        
-        # --- Core Logic ---
-        if not info['is_success']:
-            # Case A: Failure Invariance
-            # 失败者保持原样，确保吃到满额的 Negative Advantage
-            weight = 1.0
-        elif not has_success:
-             # Should not happen if is_success is true, but for safety
-             weight = 1.0
-        else:
-            # Case B: Success-Conditional Tanh-Gating
-            # 只在成功者内部卷效率
-            l_i = info['length']
-            
-            # Z-Score: (群体平均 - 我的长度) / 标准差
-            # 短于平均 -> Z > 0 -> W > 1
-            # 长于平均 -> Z < 0 -> W < 1
-            z_score = (mean_succ - float(l_i)) / std_succ
-            
-            # Tanh Mapping: Range (0, 2)
-            # Center at 1.0
-            weight = 1.0 + np.tanh(z_score)
-            
-            # [Safety] 防止权重过小导致样本失效
-            # 虽然 25步的成功(vs 5步平均)确实很烂，但好歹是成功，给个保底 0.2
-            weight = max(0.2, weight)
-
-        # Write Metadata
         step['W_length'] = weight
-        step['meta_z_score'] = z_score
-        
-        # Apply to Advantages
         if 'advantages' in step:
-            # Apply Dr. GRPO weight
             step['advantages'] *= weight
-            
-            # [Final Safety Clip] 
-            # 无论如何，防止最终梯度爆炸，这是 PPO 的最后一道防线
+            # PPO 最终防爆裁剪
             step['advantages'] = np.clip(step['advantages'], -4.0, 4.0).item()
-            
-    match_debug_logger.info(f"  [Dr. GRPO V3] Success Count: {len(succ_lengths)}. "
-                           f"Mean Succ Len: {mean_succ:.2f}. Applied Weights.")
 
 # =============================================================================
 # 主入口

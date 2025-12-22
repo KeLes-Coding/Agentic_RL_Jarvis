@@ -3,8 +3,8 @@ ENGINE=${1:-vllm}
 # export VLLM_ATTENTION_BACKEND=XFORMERS
 export SWANLAB_API_KEY="oB8w36PCJxKeqwif2ijWz"
 
-export CUDA_VISIBLE_DEVICES="1,2"
-GPUS_TO_LOCK="1 2"
+export CUDA_VISIBLE_DEVICES="0,1,2,3"
+GPUS_TO_LOCK="0 1 2 3"
 
 # 脚本退出时恢复GPU模式的函数
 function cleanup {
@@ -28,9 +28,9 @@ echo "设置完成。"
 
 # 关键改动：将 train_data_size 设置为 1
 # 这将确保每个训练批次只包含一个任务
-train_data_size=1
-val_data_size=4
-group_size=4
+train_data_size=4
+val_data_size=16
+group_size=8
 
 # We only use data preparation to indicate the modality and the data size.
 # python3 -m examples.data_preprocess.prepare \
@@ -39,10 +39,13 @@ group_size=4
 #     --val_data_size $val_data_size
 
 echo "开始执行训练任务..."
-python3 -m verl.trainer.main_ppo \
+
+export PYTHONPATH=$PYTHONPATH:$(pwd)
+
+PYTHONPATH=. python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=ccapo \
-    data.train_files=/home/zzh/Workspace/verl-agent/data/atomic_tasks_list_wiki_same_test_train.parquet \
-    data.val_files=/home/zzh/Workspace/verl-agent/data/atomic_tasks_list_wiki_val.parquet \
+    data.train_files=data/data_list_251216_local_balanced_train.parquet \
+    data.val_files=data/atomic_tasks_list_wiki_val.parquet \
     data.train_batch_size=$train_data_size \
     data.val_batch_size=$val_data_size \
     data.max_prompt_length=8192 \
@@ -51,21 +54,21 @@ python3 -m verl.trainer.main_ppo \
     data.truncation='left' \
     data.return_raw_chat=True \
     data.return_full_prompt=True \
-    actor_rollout_ref.model.path=/home/zzh/Workspace/modelscope/models/Qwen/Qwen2___5-VL-3B-Instruct \
+    actor_rollout_ref.model.path=/root/autodl-tmp/models/Qwen/Qwen2___5-VL-3B-Instruct \
     actor_rollout_ref.actor.optim.lr=2e-5 \
     actor_rollout_ref.model.use_remove_padding=True \
-    actor_rollout_ref.actor.ppo_mini_batch_size=8 \
-    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1 \
+    actor_rollout_ref.actor.ppo_mini_batch_size=16 \
+    actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=2 \
     actor_rollout_ref.actor.use_kl_loss=True \
     actor_rollout_ref.actor.kl_loss_coef=0.01 \
     actor_rollout_ref.actor.kl_loss_type=low_var_kl \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \
     actor_rollout_ref.actor.fsdp_config.param_offload=False \
     actor_rollout_ref.actor.fsdp_config.optimizer_offload=False \
-    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1 \
-    actor_rollout_ref.rollout.tensor_model_parallel_size=2 \
+    actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=16 \
+    actor_rollout_ref.rollout.tensor_model_parallel_size=1 \
     actor_rollout_ref.rollout.name=$ENGINE \
-    actor_rollout_ref.rollout.gpu_memory_utilization=0.8 \
+    actor_rollout_ref.rollout.gpu_memory_utilization=0.7 \
     actor_rollout_ref.rollout.enable_chunked_prefill=True \
     actor_rollout_ref.rollout.enforce_eager=False \
     actor_rollout_ref.rollout.free_cache_engine=False \
@@ -83,13 +86,13 @@ python3 -m verl.trainer.main_ppo \
     env.jarvis.jarvis_config_path=agent_system/environments/env_package/jarvis/jarvis_v2/config.yaml \
     trainer.critic_warmup=0 \
     trainer.logger='[console,swanlab]' \
-    trainer.project_name='verl_agent_jarvis_CCAPO' \
+    trainer.project_name='verl_agent_jarvis_CCAPO_48GB' \
     trainer.experiment_name='CCAPO_qwen2.5_vl_2.5b' \
-    trainer.n_gpus_per_node=2 \
+    trainer.n_gpus_per_node=4 \
     trainer.nnodes=1 \
     trainer.save_freq=5 \
     trainer.test_freq=100 \
-    trainer.total_epochs=20 \
+    trainer.total_epochs=5 \
     trainer.val_before_train=False \
     actor_rollout_ref.model.lora_rank=32 \
     actor_rollout_ref.model.lora_alpha=64 \

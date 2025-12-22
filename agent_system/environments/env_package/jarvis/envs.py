@@ -74,13 +74,21 @@ def _evaluate_with_llm(
 
         # --- ✅ 升级：构建新的多模态 Prompt ---
         prompt_text = f"""
-请扮演一个严格的评估助手。你需要根据 "参考答案" 和 "最终屏幕截图/布局" 来评估 "任务摘要"。
+请扮演一个严格的UI自动化任务评估专家。你需要根据 [参考答案] 和 [最终屏幕截图/布局] 来严格审核 [任务摘要]。
 
-评估标准 (必须同时满足):
-1.  **正确性**: "任务摘要" 必须与 "参考答案" 相符。
-2.  **一致性**: "任务摘要" 必须可以从 最终屏幕截图或者是界面布局 中得到印证。例如，如果摘要是 "价格是$50"，那么屏幕或者是界面布局上必须显示$50。如果摘要是 "操作已完成"，屏幕或者是界面布局必须显示成功的状态。
+你的核心目标是拦截那些“虽然完成了任务但没有包含具体结果”的无效摘要。
 
-请评估以下内容：
+### 评估标准 (必须同时严格满足，否则为 False):
+
+1. **信息具体性与包含度 (Crucial)**:
+   - [任务摘要] 必须 **显式包含** [参考答案] 中的核心关键信息（如：具体金额、日期、特定的名称、生成的ID号等）。
+   - **拒绝模糊表述**：如果摘要仅包含“我已经完成了购买”、“任务成功”、“信息已确认”等宽泛的描述，而未提及参考答案中的具体数值或内容，必须判定为 **False**。
+
+2. **视觉一致性 (Grounding)**:
+   - [任务摘要] 中声称的事实（如“价格是$50”）必须能在 [最终屏幕截图/布局] 中找到直接证据。
+   - 如果摘要中的信息与截图显示不符，或者截图中根本不存在该信息，判定为 **False**。
+
+### 输入数据
 
 [参考答案]
 {ground_truth}
@@ -89,12 +97,14 @@ def _evaluate_with_llm(
 {summary}
 
 [最终屏幕截图/布局]
-(请参考附加的截图和下面的文本布局)
+(参考附加截图及以下布局文本)
 {final_layout}
 
 ---
-评估结果：
-"任务摘要" 是否同时满足 **正确性** 和 **一致性**？
+### 评估结果要求
+请基于以上标准进行二元判断。
+"任务摘要" 是否同时满足 **信息具体性** 和 **视觉一致性**？
+
 请仅回答 "True" 或 "False"。
 """
         # --- ✅ 升级：构建多模态 messages 列表 ---
@@ -164,6 +174,9 @@ class JarvisMultiDeviceEnv:
 
         self.observers: Dict[str, Observer] = {s: Observer(adb_path, s) for s in self.device_serials}
         self.actuators: Dict[str, Actuator] = {s: Actuator(adb_path, s) for s in self.device_serials}
+
+        # [新增] 观察缓存，用于避免 step 中重复获取
+        self.obs_cache: Dict[str, Dict] = {}
 
         # [关键] 初始化线程池和Future列表
         self.executor = ThreadPoolExecutor(max_workers=self.num_envs, thread_name_prefix="jarvis_env_worker")
@@ -294,73 +307,130 @@ class JarvisMultiDeviceEnv:
         print(f"--- [设备: {serial}] 应用数据清理完成。清理数量: {cleared_count}, 跳过 (核心/安全) 数量: {skipped_count} ---")
     # ===========================================================================
 
+    # [方法 1: 修正] 辅助方法，用于匹配 SSH 配置 (包含对 main 节点的修复)
+    def _get_ssh_config_for_device(self, serial: str) -> Dict:
+        """
+        根据设备 serial (例如 localhost:15555) 查找对应的 SSH 配置。
+        修正：兼容 config.yaml 中存在 'main' 嵌套层级的情况。
+        """
+        try:
+            port = int(serial.split(":")[-1])
+        except ValueError:
+            return None
 
-    # <<< 新增：用于并行 reset 的辅助方法 >>>
-    # def _reset_device(self, serial: str, task: Dict) -> Tuple[np.ndarray, str, Dict]:
-    #     """
-    #     (辅助函数) 在单独的线程中重置单个设备。
-    #     返回 (obs_image, obs_text, info)
-    #     """
-    #     try:
-    #         # ======================= ✅ 在 reset 开始时调用清理方法 ✅ =======================
-    #         self._clear_background_apps(serial)
-    #         # ===============================================================================
+        # [修正点] 获取 device_providers 配置节点
+        providers = self.jarvis_config.get("device_providers", {})
+        if not providers and "main" in self.jarvis_config:
+            providers = self.jarvis_config["main"].get("device_providers", {})
 
-    #         self.episode_steps[serial] = 0
-
-    #         self.tasks[serial] = task if task else {}
-
-    #         self.actuators[serial].home() # 清理后返回主屏幕
-            
-    #         # 短暂等待确保界面稳定
-    #         try:
-    #             self.actuators[serial].wait(1.0) # 等待1秒
-    #         except Exception as e:
-    #             print(f"--- [设备: {serial}] 在reset的等待期间发生错误: {e} ---")
-
-    #         obs_data = self.observers[serial].get_current_observation(
-    #             max_elements=self.max_elements_per_obs,
-    #             max_str_len=self.max_str_len_per_obs
-    #         )
-
-    #         screenshots_bytes = obs_data.get("screenshot_bytes")
-    #         if not isinstance(screenshots_bytes, list):
-    #             screenshots_bytes = [screenshots_bytes] if screenshots_bytes else []
-
-    #         final_image_array = None
-    #         compressed_bytes = None
-    #         if screenshots_bytes:
-    #             first_shot_bytes = screenshots_bytes[0]
-    #             compressed_bytes = self._compress_single_image(first_shot_bytes)
-    #             if compressed_bytes:
-    #                 try:
-    #                     img = Image.open(io.BytesIO(compressed_bytes)).convert("RGB")
-    #                     final_image_array = np.array(img, dtype=np.uint8)
-    #                 except Exception as e:
-    #                     print(f"警告: 图像解码失败 - {e}")
-
-    #         if final_image_array is None:
-    #             final_image_array = np.zeros((256, 256, 3), dtype=np.uint8)
-
-    #         image_placeholders = "<image>\n"
-    #         obs_text = obs_data.get("simplified_elements_str", "")
-    #         final_obs_text = f"{image_placeholders}{obs_text}"
-
-    #         info_dict = {
-    #             "device_serial": serial,
-    #             "raw_obs_data": obs_data,
-    #             "compressed_screenshot_bytes": compressed_bytes
-    #         }
-    #         return final_image_array, final_obs_text, info_dict
+        ssh_configs = providers.get("ssh_forward_tunnel", {}).get("ssh_connections", [])
         
-    #     except Exception as e:
-    #         print(f"--- [设备: {serial}] 线程 'reset' 失败: {e} ---")
-    #         # 返回一个表示失败的空状态，确保批处理(batch)的形状一致
-    #         return (
-    #             np.zeros((256, 256, 3), dtype=np.uint8), 
-    #             "<image>\nERROR: Reset failed.", 
-    #             {"device_serial": serial, "raw_obs_data": {}, "compressed_screenshot_bytes": None, "error": str(e)}
-    #         )
+        best_match = None
+        for config in ssh_configs:
+            start_port = config.get("local_start_port", 0)
+            if start_port <= port:
+                if best_match is None or start_port > best_match.get("local_start_port", 0):
+                    best_match = config
+        return best_match
+
+    # [方法 2: 核心逻辑] 阻塞式等待所有服务器完成重置
+    def _trigger_remote_batch_reset(self):
+        """
+        通过 SSH 触发所有远程服务器执行本地的 inject_env 脚本。
+        【关键同步机制】：此方法会阻塞，直到所有远程服务器返回 "ALL_DONE" 信号或超时。
+        只有此方法成功返回，后续的 Rollout 才会开始。
+        """
+        print("--- [Remote Reset] 正在握手远程服务器，等待 'ALL_DONE' 信号... ---")
+        
+        unique_hosts = {} 
+        for serial in self.device_serials:
+            config = self._get_ssh_config_for_device(serial)
+            if config:
+                key = f"{config['ssh_user']}@{config['ssh_host']}:{config.get('ssh_port', 22)}"
+                unique_hosts[key] = config
+        
+        if not unique_hosts:
+            print("--- [Remote Reset] 未发现 SSH 隧道设备，跳过。 ---")
+            return
+
+        def _exec_ssh_and_wait(host_key, config):
+            user = config['ssh_user']
+            host = config['ssh_host']
+            port = str(config.get('ssh_port', 22))
+            remote_script_dir = config.get("remote_project_path", "~/agentic_rl_jarvis/KeLes-Coding/-inject_env")
+            
+            # 远程命令：进入目录 -> 执行脚本 (带强制参数)
+            remote_cmd = f"cd {remote_script_dir} && python3 main.py --force"
+            
+            ssh_cmd = [
+                "ssh", 
+                "-p", port,
+                "-o", "StrictHostKeyChecking=no",
+                f"{user}@{host}",
+                remote_cmd
+            ]
+            
+            # print(f"--- [Remote Reset] Waiting for {host}... ---")
+            try:
+                # [核心等待点] capture_output=True 会等待进程结束并获取输出
+                result = subprocess.run(ssh_cmd, capture_output=True, text=True, timeout=180) # 给3分钟超时
+                
+                # [关键校验] 检查返回码 AND 输出中是否包含成功信号
+                if result.returncode == 0 and "ALL_DONE" in result.stdout:
+                    print(f"--- [Remote Reset] ✅ {host} 信号确认: ALL_DONE ---")
+                    return True
+                else:
+                    print(f"--- [Remote Reset] ❌ {host} 失败或无信号!\nCode: {result.returncode}\nOut: {result.stdout}\nErr: {result.stderr} ---")
+                    return False
+            except subprocess.TimeoutExpired:
+                print(f"--- [Remote Reset] ❌ {host} 等待信号超时! ---")
+                return False
+            except Exception as e:
+                print(f"--- [Remote Reset] ❌ {host} 连接异常: {e} ---")
+                return False
+
+        # 并行等待所有服务器
+        all_success = True
+        with ThreadPoolExecutor(max_workers=len(unique_hosts)) as ssh_executor:
+            futures = {ssh_executor.submit(_exec_ssh_and_wait, k, v): k for k, v in unique_hosts.items()}
+            for future in futures:
+                if not future.result():
+                    all_success = False
+
+        if not all_success:
+            print("--- [Remote Reset] ⚠️  警告: 部分服务器重置失败，后续 Rollout 可能受影响。 ---")
+        else:
+            print("--- [Remote Reset] 🎉 所有服务器重置完毕，准备开启 Rollout (Observation)。 ---")
+
+    # [方法 3: 流程控制] 先等待远程，再开启本地
+    def start_background_reset(self):
+        """
+        [关键] 在当前 Rollout 结束后调用。
+        流程：
+        1. (Blocking) 触发并等待远程服务器完成物理重置 (inject_env)。
+        2. (Async) 远程准备好后，提交本地的 Observation 获取任务。
+        """
+        if self.reset_futures:
+            print("--- 警告: 后台重置已在运行中，跳过重复触发 ---")
+            return
+
+        print(f"--- [Sync-Barrier] 🛑 正在等待 {self.num_envs} 台设备的远程环境重置... ---")
+        
+        # 1. 同步屏障：在此处阻塞，直到收到所有服务器的 ALL_DONE
+        # 虽然这会暂停主线程一小会，但保证了 RL 在干净的环境中开始
+        try:
+            self._trigger_remote_batch_reset()
+        except Exception as e:
+            print(f"--- [Sync-Barrier] 严重错误: 远程重置触发失败: {e} ---")
+
+        # 2. 只有在上面执行完后，才开始本地的 Rollout 任务 (Home + Get Obs)
+        print(f"--- [Async-Rollout] 🚀 环境已就绪，正在后台获取初始 Observation... ---")
+        self.reset_futures = []
+        for serial in self.device_serials:
+            # task=None 表示只做 Observation 获取
+            self.reset_futures.append(self.executor.submit(self._reset_device, serial, None))
+
+    # [方法 3: 修改] 单机 Reset 逻辑，跳过物理注入
     def _reset_device(self, serial: str, task: Dict = None) -> Tuple[np.ndarray, str, Dict]:
         """
         (辅助函数) 在单独的线程中重置单个设备。
@@ -368,11 +438,15 @@ class JarvisMultiDeviceEnv:
         """
         mode = "BACKGROUND" if task is None else "FOREGROUND"
         try:
-            # 1. 物理重置 (耗时操作)
-            if hasattr(self, 'env_injector'):
-                self.env_injector.reset_environment(serial)
+            # 1. 物理重置 (优化点：如果是 SSH 设备，跳过本地注入，假设远程脚本已完成)
+            ssh_config = self._get_ssh_config_for_device(serial)
+            if not ssh_config and hasattr(self, 'env_injector'):
+                 # 仅当它是本地设备或者是未配置 SSH 映射的设备时，才跑原来的慢速逻辑
+                 print(f"--- [设备: {serial}] 使用本地慢速重置 (非SSH设备) ---")
+                 self.env_injector.reset_environment(serial)
             else:
-                print(f"--- [设备: {serial}] 警告: env_injector 未初始化 ---")
+                # 远程设备：什么都不做，等待下面的 UI 刷新
+                pass
 
             # 2. 状态更新 (仅在前台重置时进行)
             if task is not None:
@@ -382,7 +456,8 @@ class JarvisMultiDeviceEnv:
             # 3. 回到桌面并获取观察
             self.actuators[serial].home() 
             try:
-                self.actuators[serial].wait(1.0) 
+                # 稍微等待一下，确保远程重置后的应用冷启动完成（如果脚本里杀了进程）
+                self.actuators[serial].wait(1.5) 
             except Exception as e:
                 print(f"--- [设备: {serial}] 在reset的等待期间发生错误: {e} ---")
 
@@ -390,6 +465,9 @@ class JarvisMultiDeviceEnv:
                 max_elements=self.max_elements_per_obs,
                 max_str_len=self.max_str_len_per_obs
             )
+
+            # [新增] 将初始观察存入缓存
+            self.obs_cache[serial] = obs_data
 
             screenshots_bytes = obs_data.get("screenshot_bytes")
             if not isinstance(screenshots_bytes, list):
@@ -430,21 +508,6 @@ class JarvisMultiDeviceEnv:
                 {"device_serial": serial, "raw_obs_data": {}, "compressed_screenshot_bytes": None, "error": str(e)}
             )
 
-    def start_background_reset(self):
-        """
-        [关键] 在当前 Rollout 结束后调用。
-        在后台启动所有设备的重置流程 (不含具体 Task，只做环境恢复)。
-        """
-        if self.reset_futures:
-            print("--- 警告: 后台重置已在运行中，跳过重复触发 ---")
-            return
-
-        print(f"--- [Async] 🚀 正在后台启动 {self.num_envs} 台设备的环境重置 (Resetting while Training)... ---")
-        self.reset_futures = []
-        for serial in self.device_serials:
-            # task=None 表示只做物理重置
-            self.reset_futures.append(self.executor.submit(self._reset_device, serial, None))
-
     def reset(self, tasks: List[Dict] = None) -> Tuple[Dict[str, List], List[Dict]]:
         obs_images = []
         obs_texts = []
@@ -456,12 +519,12 @@ class JarvisMultiDeviceEnv:
         else:
             device_tasks = [{} for _ in range(self.num_envs)]
 
-        # --- 策略 A: 优先使用后台重置结果 ---
+        # --- 策略 A: 优先使用后台重置结果 (Pipeline 模式) ---
         if self.reset_futures:
             print(f"--- [Reset] ♻️  检测到 {len(self.reset_futures)} 个后台重置任务，正在等待完成并获取结果... ---")
             for i, future in enumerate(self.reset_futures):
                 try:
-                    # 获取结果 (如果后台还没跑完，这里会阻塞，但已经节省了前面的时间)
+                    # 获取结果 (如果后台还没跑完，这里会阻塞)
                     img, text, info = future.result() 
                     
                     # [关键] 补全任务状态 (因为后台重置时没有任务信息)
@@ -478,11 +541,21 @@ class JarvisMultiDeviceEnv:
                     obs_texts.append("<image>\nERROR")
                     infos.append({"device_serial": "unknown", "error": str(e)})
             
+            # 清空列表，为下一轮做准备
             self.reset_futures = []
 
-        # --- 策略 B: 如果没有后台任务，执行标准同步重置 ---
+        # --- 策略 B: 执行标准同步重置 (首轮运行或无后台任务时) ---
         else:
-            # print("--- [Reset] 无后台任务，执行标准同步重置... ---")
+            print("--- [Reset] ⚠️  无后台任务 (First Run / Cold Start)，正在执行同步阻塞式重置... ---")
+            
+            # [核心修复点] 必须在这里显式触发远程重置！
+            # 否则 _reset_device 里的 SSH 分支会直接 pass，导致“假重置”
+            try:
+                self._trigger_remote_batch_reset()
+            except Exception as e:
+                print(f"--- [Reset] 远程批量重置触发失败: {e} ---")
+
+            # 远程重置完成后，再并行采集 Observation
             futures: List[Future] = []
             for i, serial in enumerate(self.device_serials):
                 task = device_tasks[i]
@@ -501,7 +574,7 @@ class JarvisMultiDeviceEnv:
                     infos.append({"device_serial": "unknown", "error": str(e)})
 
         return {"image": obs_images, "text": obs_texts}, infos
-
+        
     # ======================= ✅ 修改：_handle_finish_action 方法签名和调用 ✅ =======================
     def _handle_finish_action(
         self, 
@@ -628,10 +701,17 @@ class JarvisMultiDeviceEnv:
         返回 (obs_image, obs_text, reward, done, info)
         """
         try:
-            pre_action_obs_data = self.observers[serial].get_current_observation(
-                max_elements=self.max_elements_per_obs,
-                max_str_len=self.max_str_len_per_obs
-            )
+            # [优化] 1. 获取 Pre-Action Observation (优先从缓存取)
+            if serial in self.obs_cache:
+                pre_action_obs_data = self.obs_cache[serial]
+            else:
+                # 缓存未命中（理论上不应发生），回退到主动获取
+                print(f"--- [设备: {serial}] 警告: 缓存未命中，主动获取 pre-action obs ---")
+                pre_action_obs_data = self.observers[serial].get_current_observation(
+                    max_elements=self.max_elements_per_obs,
+                    max_str_len=self.max_str_len_per_obs
+                )
+
             elements = pre_action_obs_data.get("simplified_elements_list")
 
             status = self._dispatch_action(self.actuators[serial], serial, action_str, elements)
@@ -642,6 +722,9 @@ class JarvisMultiDeviceEnv:
                 max_elements=self.max_elements_per_obs,
                 max_str_len=self.max_str_len_per_obs
             )
+
+            # [优化] 4. 更新缓存，供下一步骤作为 pre-action 使用
+            self.obs_cache[serial] = post_action_obs_data
 
             screenshots_bytes = post_action_obs_data.get("screenshot_bytes")
             if not isinstance(screenshots_bytes, list):
