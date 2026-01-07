@@ -71,6 +71,7 @@ from agent_system.multi_turn_rollout.utils import to_list_of_dict
 from agent_system.multi_turn_rollout import TrajectoryCollector, adjust_batch
 
 WorkerType = Type[Worker]
+from gigpo import core_ccapo
 
 
 class Role(Enum):
@@ -362,6 +363,20 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
             )
         data.batch['advantages'] = advantages
         data.batch['returns'] = returns
+    elif adv_estimator == AdvantageEstimator.CCAPO:
+        # --- 🔥 [CCAPO] 调用自定义算法 ---
+        # 假设 stdb 已经通过 kwargs 传进来，或者你是全局引用的
+        # 在 main_ppo.py 的 fit() 里调用 compute_advantage 时，需要把 self.stdb 传进去
+
+        stdb_instance = kwargs.get('stdb')
+
+        advantages, returns = core_ccapo.compute_ccapo_outcome_advantage(
+            batch=data,
+            stdb_manager=stdb_instance, # 传入 STDB
+            config=None # 如果需要配置
+        )
+        data.batch["advantages"] = advantages
+        data.batch["returns"] = returns
     else:
         raise NotImplementedError
     return data
@@ -1123,6 +1138,7 @@ class RayPPOTrainer:
                 batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids", "prompt_vector"]
                 
                 non_tensor_batch_keys_to_pop = ["raw_prompt_ids", "data_source", "prompt_index"]
+                non_tensor_batch_keys_to_pop.append("executed_action_str")
                 # ======================= 修复结束 =======================
                 
                 # --- ✅ 关键修改：在这里添加 'ground_truth_answer' ---
@@ -1370,6 +1386,7 @@ class RayPPOTrainer:
                                     pf_ppo_weight_pow=self.config.algorithm.pf_ppo.weight_pow,
                                     step_advantage_w=self.config.algorithm.gigpo.step_advantage_w,
                                     gigpo_mode=self.config.algorithm.gigpo.mode,
+                                    stdb=self.stdb
                                 )
 
                             # update critic

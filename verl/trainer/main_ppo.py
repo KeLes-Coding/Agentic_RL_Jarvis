@@ -22,6 +22,7 @@ import ray
 
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer
 from verl.trainer.ppo.reward import load_reward_manager
+from gigpo import core_ccapo # 导入你刚写的文件
 
 
 @hydra.main(config_path="config", config_name="ppo_trainer", version_base=None)
@@ -48,6 +49,7 @@ class TaskRunner:
         from pprint import pprint
 
         from omegaconf import OmegaConf
+        OmegaConf.set_struct(config, False) # 关闭结构检查，允许任意覆盖和添加
 
         from verl.utils.fs import copy_to_local
 
