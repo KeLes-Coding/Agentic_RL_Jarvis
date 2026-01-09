@@ -49,15 +49,50 @@ def set_gamefile(infos, gamefile):
 class AlfWorldEnvironmentManager(EnvironmentManagerBase):
     def __init__(self, envs, projection_f, config):
         self.memory = SimpleMemory()
+        self.pre_text_obs = None
         super().__init__(envs, projection_f, config)
+
+    @property
+    def num_envs(self):
+        # AlfworldEnvs 使用 num_processes，其他环境可能使用 num_envs
+        if hasattr(self.envs, 'num_processes'):
+            return self.envs.num_processes
+        elif hasattr(self.envs, 'num_envs'):
+            return self.envs.num_envs
+        return 1 # Fallback
     
-    def reset(self):
+    def reset(self, tasks=None, **kwargs):
+        """
+        Args:
+            tasks: List[Dict], 包含 'task', 'prompt_index', 'prompt_vector' 等信息的列表。
+                   长度应该等于 batch_size。
+        """
+        # 1. 调用底层 Ray 环境的 reset
         text_obs, image_obs, infos = self.envs.reset()
+
+        # 2. 注入 STDB 元数据到 infos (关键步骤)
+        if tasks is not None:
+            safe_len = min(len(tasks), len(infos))
+            for i in range(safe_len):
+                task_info = tasks[i]
+                if 'prompt_index' in task_info:
+                    infos[i]['prompt_index'] = task_info['prompt_index']
+                if 'prompt_vector' in task_info:
+                    infos[i]['prompt_vector'] = task_info['prompt_vector']
+                if 'ground_truth_answer' in task_info:
+                    infos[i]['ground_truth_answer'] = task_info['ground_truth_answer']
+
         self.gamefile = parse_gamefile(infos)
-        # initialize the history buffer
+        
+        # 3. 初始化记忆和状态
         self.memory.reset(batch_size = len(text_obs))
         self.tasks = []
-        self.pre_text_obs = text_obs
+        
+        # --- 🔥 [关键修复] 必须在这里赋值 pre_text_obs ---
+        self.pre_text_obs = text_obs 
+        # -----------------------------------------------
+
+        # 4. 解析任务描述
         self.extract_task(text_obs)
 
         full_text_obs = self.build_text_obs(text_obs, self.envs.get_admissible_commands, init=True)

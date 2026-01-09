@@ -486,7 +486,8 @@ class RayPPOTrainer:
             print(f"[CCAPO] 初始化 STDB，索引将保存到: {stdb_path}")
             self.stdb = SuccessTrajectoryDatabase(
                 save_path=stdb_path,
-                top_k=self.config.algorithm.ccapo.stdb_top_k
+                top_k=self.config.algorithm.ccapo.stdb_top_k,
+                tokenizer=self.tokenizer  # <--- 新增这一行
             )
         elif self.config.algorithm.adv_estimator in [
             AdvantageEstimator.GRPO,
@@ -1135,23 +1136,29 @@ class RayPPOTrainer:
                 # pop those keys for generation
                 # ======================= ✅ [ STDB 最终修复 ] =======================
                 # 确保 STDB 依赖的 'prompt_vector' 和 'prompt_index' 被 pop 到 gen_batch 中
-                batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids", "prompt_vector"]
+                potential_tensor_keys = ["input_ids", "attention_mask", "position_ids", "prompt_vector"]
+                batch_keys_to_pop = [k for k in potential_tensor_keys if k in batch.batch.keys()]
+
+                # 2. 处理 Non-Tensor Batch Keys
+                # 列出所有你希望转移到 gen_batch 的潜在键名
+                potential_non_tensor_keys = [
+                    "raw_prompt_ids", 
+                    "data_source", 
+                    "prompt_index", 
+                    "executed_action_str",
+                    "multi_modal_data",
+                    "raw_prompt",
+                    "tools_kwargs",
+                    "ground_truth_answer"
+                ]
+
+                # 动态过滤：只 pop 存在的键
+                non_tensor_batch_keys_to_pop = [
+                    k for k in potential_non_tensor_keys 
+                    if k in batch.non_tensor_batch.keys()
+                ]
                 
-                non_tensor_batch_keys_to_pop = ["raw_prompt_ids", "data_source", "prompt_index"]
-                non_tensor_batch_keys_to_pop.append("executed_action_str")
-                # ======================= 修复结束 =======================
-                
-                # --- ✅ 关键修改：在这里添加 'ground_truth_answer' ---
-                # non_tensor_batch_keys_to_pop = ["raw_prompt_ids", "data_source"] # <--- 这是你原来的代码
-                if "multi_modal_data" in batch.non_tensor_batch:
-                    non_tensor_batch_keys_to_pop.append("multi_modal_data")
-                if "raw_prompt" in batch.non_tensor_batch:
-                    non_tensor_batch_keys_to_pop.append("raw_prompt")
-                if "tools_kwargs" in batch.non_tensor_batch:
-                    non_tensor_batch_keys_to_pop.append("tools_kwargs")
-                if "ground_truth_answer" in batch.non_tensor_batch:
-                    non_tensor_batch_keys_to_pop.append("ground_truth_answer")
-                
+                # 执行 pop
                 gen_batch = batch.pop(
                     batch_keys=batch_keys_to_pop,
                     non_tensor_batch_keys=non_tensor_batch_keys_to_pop,

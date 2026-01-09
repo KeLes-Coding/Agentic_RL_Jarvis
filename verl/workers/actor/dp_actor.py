@@ -737,7 +737,16 @@ class DataParallelPPOActor(BasePPOActor):
                           mask_on = mb_online["loss_mask"][:, -response_len_on:]
 
                     # PPO Loss
-                    adv_batch = torch.clamp(mb_online["advantages"], -4.0, 4.0)
+                    # adv_batch = torch.clamp(mb_online["advantages"], -4.0, 4.0)
+                    # --- 🔥 [修改后] 增加 unsqueeze 确保广播正确 ---
+                    adv_batch = mb_online["advantages"]
+                    
+                    # 如果是 1D Tensor (Batch_Size,)，扩展为 (Batch_Size, 1) 以便广播到 (Batch_Size, Seq_Len)
+                    if adv_batch.dim() == 1:
+                        adv_batch = adv_batch.unsqueeze(-1)
+                    
+                    adv_batch = torch.clamp(adv_batch, -4.0, 4.0)
+                    # -------------------------------------------
 
                     pg_loss, pg_clipfrac, ppo_kl, _ = compute_policy_loss(
                         old_log_prob=mb_online["old_log_probs"],
