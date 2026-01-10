@@ -13,28 +13,42 @@ export CUDA_VISIBLE_DEVICES=0,1
 MODEL_PATH="/home/zzh/Workspace/modelscope/models/Qwen/Qwen2___5-VL-3B-Instruct" 
 export PYTHONPATH=$PYTHONPATH:$(pwd):$(pwd)/agent_system/environments/env_package/alfworld
 
-# --- 🔥 [修改] 稍微减小数据量，先跑通 ---
-train_data_size=8
-val_data_size=4
-group_size=4
-experiment_name="ccapo_alfworld_lora_run1"
+# ================= 配置区域 =================
+# 1. 数据集生成配置
+SAMPLE_SIZE=40        # 从ALFWorld提取多少条数据 (-1代表全量，比如3000条)
+DATA_SEED=42           # 数据提取种子，不动这个种子，提取的任务永远一样
+TRAIN_RATIO=0.8        # 训练集比例
 
-echo ">>> [1/2] Generating Local Mock Data..."
-python3 make_fake_data.py \
-    --train_size $train_data_size \
-    --val_size $val_data_size
+# 2. PPO 训练配置
+TRAIN_BATCH_SIZE=8    # PPO update 的 batch size (必须 <= 训练集数量 * rollout.n)
+VAL_BATCH_SIZE=8       # 验证时的 batch size
+GROUP_SIZE=4           # 组内样本数 (GRPO/CCAPO 核心参数)
+EXPERIMENT_NAME="ccapo_alfworld_real_run1"
+MAX_STEPS=50           # 环境最大步数
+# ===========================================
+
+echo ">>> [1/2] Generating/Updating Real ALFWorld Data..."
+# 每次运行都重新生成一次 parquet，确保配置生效 (速度很快)
+python3 make_real_alfworld_data.py \
+    --total_samples $SAMPLE_SIZE \
+    --train_ratio $TRAIN_RATIO \
+    --seed $DATA_SEED \
+    --output_dir "$(pwd)/data/verl-agent/text"
 
 DATA_DIR="$(pwd)/data/verl-agent/text"
 
 echo ">>> [2/2] Starting CCAPO Training with LoRA (2 GPUs)..."
+
+# 注意：data.train_batch_size 是 PPO 更新时的 batch 大小，不是数据集大小。
+# 数据集大小由上面的 python 脚本决定。
 
 python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=ccapo \
     actor_rollout_ref.rollout.load_format=safetensors \
     data.train_files=$DATA_DIR/train.parquet \
     data.val_files=$DATA_DIR/test.parquet \
-    data.train_batch_size=$train_data_size \
-    data.val_batch_size=$val_data_size \
+    data.train_batch_size=$TRAIN_BATCH_SIZE \
+    data.val_batch_size=$VAL_BATCH_SIZE \
     data.max_prompt_length=2048 \
     data.max_response_length=512 \
     data.filter_overlong_prompts=True \
@@ -65,12 +79,12 @@ python3 -m verl.trainer.main_ppo \
     algorithm.ccapo.stdb_top_k=1 \
     env.env_name=alfworld/AlfredTWEnv \
     env.seed=42 \
-    env.max_steps=30 \
-    env.rollout.n=$group_size \
+    env.max_steps=$MAX_STEPS \
+    env.rollout.n=$GROUP_SIZE \
     trainer.critic_warmup=0 \
     trainer.logger=['console'] \
     trainer.project_name='verl_ccapo_debug' \
-    trainer.experiment_name=$experiment_name \
+    trainer.experiment_name=$EXPERIMENT_NAME \
     trainer.n_gpus_per_node=2 \
     trainer.nnodes=1 \
     trainer.save_freq=10 \

@@ -83,6 +83,29 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
                     infos[i]['ground_truth_answer'] = task_info['ground_truth_answer']
 
         self.gamefile = parse_gamefile(infos)
+
+        # --- 🔥 CCAPO v2 新增: 提取 Task Type ---
+        for i, info in enumerate(infos):
+            # 1. 提取 Task Type
+            # Gamefile 示例: '.../pick_and_place_simple-Tomato-None-Microwave-301/trial_T20190909_...'
+            # 我们取文件夹名的一部分作为 task_type
+            gf_path = info.get("extra.gamefile", "")
+            task_type = "unknown"
+            if gf_path:
+                try:
+                    dirname = os.path.basename(os.path.dirname(gf_path))
+                    # 分割取第一部分: pick_and_place_simple
+                    task_type = dirname.split('-')[0]
+                except:
+                    pass
+            info['task_type'] = task_type
+            
+            # 2. 确保 Observation Text 存在 (用于 Milestone)
+            # 在 Envs.py 中通常已经放入了 info['observation_text']
+            # 这里做个双保险
+            if 'observation_text' not in info:
+                info['observation_text'] = text_obs[i]
+        # ---------------------------------------
         
         # 3. 初始化记忆和状态
         self.memory.reset(batch_size = len(text_obs))
@@ -109,16 +132,33 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
         if infos[0].get("extra.gamefile") is None:
             infos = set_gamefile(infos, self.gamefile)
 
-        # add action_valid to infos
+        # Update Infos
         for i, info in enumerate(infos):
             info['is_action_valid'] = to_numpy(valids[i])
             
-            # --- 🔥 [CCAPO 新增] 保存执行的动作字符串，用于 LCS 计算 ---
-            # 我们不仅需要知道动作是否有效，还需要知道动作的具体内容
-            info['executed_action_str'] = str(actions[i]) 
-            # 如果你有 prompt 的哈希或者 ID，最好也在这里传下去，用于 STDB 索引
-            # info['prompt_hash'] = ... 
-            # --------------------------------------------------------
+            # --- 🔥 CCAPO v2 新增: 传递动作字符串和 Task Type ---
+            info['executed_action_str'] = str(actions[i])
+            
+            # 传递上一轮提取的 Task Type (因为 reset 时提取过)
+            # 如果 step 的 info 中丢失了 gamefile，可能需要持久化存储 task_type
+            # 简单起见，假设 gamefile 路径不变，重新提取一遍，或者从 self.gamefile 拿
+            gf_path = info.get("extra.gamefile", "")
+            if not gf_path and self.gamefile:
+                # 尝试从 batch 级缓存恢复 (简化处理)
+                pass 
+            
+            task_type = "unknown"
+            if gf_path:
+                try:
+                    dirname = os.path.basename(os.path.dirname(gf_path))
+                    task_type = dirname.split('-')[0]
+                except: pass
+            info['task_type'] = task_type
+            
+            # 确保 Obs 用于 Milestone
+            if 'observation_text' not in info:
+                info['observation_text'] = text_obs[i]
+            # ------------------------------------------------
 
         next_observations = {'text': full_text_obs, 'image': image_obs, 'anchor': text_obs}
         rewards = to_numpy(rewards)
