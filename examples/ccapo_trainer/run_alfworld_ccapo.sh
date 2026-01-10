@@ -9,6 +9,7 @@ sleep 2
 
 export VLLM_ATTENTION_BACKEND=XFORMERS
 export CUDA_VISIBLE_DEVICES=0,1
+export SWANLAB_API_KEY="oB8w36PCJxKeqwif2ijWz"
 
 MODEL_PATH="/home/zzh/Workspace/modelscope/models/Qwen/Qwen2___5-VL-3B-Instruct" 
 export PYTHONPATH=$PYTHONPATH:$(pwd):$(pwd)/agent_system/environments/env_package/alfworld
@@ -82,12 +83,12 @@ python3 -m verl.trainer.main_ppo \
     env.max_steps=$MAX_STEPS \
     env.rollout.n=$GROUP_SIZE \
     trainer.critic_warmup=0 \
-    trainer.logger=['console'] \
+    trainer.logger='[console,swanlab]' \
     trainer.project_name='verl_ccapo_debug' \
     trainer.experiment_name=$EXPERIMENT_NAME \
     trainer.n_gpus_per_node=2 \
     trainer.nnodes=1 \
-    trainer.save_freq=10 \
+    trainer.save_freq=1 \
     trainer.test_freq=5 \
     trainer.total_epochs=1 \
     trainer.val_before_train=False \

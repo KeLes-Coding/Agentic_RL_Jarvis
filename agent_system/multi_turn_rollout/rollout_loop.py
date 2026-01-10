@@ -383,6 +383,18 @@ class TrajectoryCollector:
             # 1.2. 提取 $R_\tau$ 所需的轨迹级数据
             # R_success
             traj_task_completed = final_summary.get('task_completed', False)
+
+            # =========== 🔥 [修复开始]：直接从 info 中读取 won 作为兜底 🔥 ===========
+            if not traj_task_completed:
+                # 检查最后一个有效步骤的 info 是否包含 won
+                raw_won = last_active_info.get('won', False)
+                # 处理可能的字符串 'True'/'False' 或布尔值
+                if isinstance(raw_won, str):
+                    traj_task_completed = raw_won.lower() == 'true'
+                else:
+                    traj_task_completed = bool(raw_won)
+            # =========== [修复结束] ===========
+
             # P_steps
             traj_total_steps = episode_lengths[bs] # 这是 TotalSteps_tau
             # P_token
@@ -421,6 +433,9 @@ class TrajectoryCollector:
                     
                     # 2.1. 附加轨迹级(Macro)信息到每一步
                     data['traj_task_completed'] = traj_task_completed
+                    # =========== 🔥 [修复开始]：显式传递 won 字段 🔥 ===========
+                    data['won'] = traj_task_completed 
+                    # =========== [修复结束] ===========
                     data['traj_total_steps'] = traj_total_steps
                     data['traj_total_tokens'] = traj_total_tokens
                     data['traj_n_success_steps'] = traj_n_success_steps
@@ -429,6 +444,31 @@ class TrajectoryCollector:
                     step_info = total_infos[bs][i] if i < len(total_infos[bs]) else {}
                     
                     data['step_index'] = step_index_in_traj # $t$
+                    
+                    # 🔥 [修复 1] 确保 parsed_action 有值
+                    # 如果 info 里没有 parsed_action，就用 LLM 生成的原始 response (text_actions[bs])
+                    # 注意：text_actions 是在 rollout 循环里生成的，这里是 gather 阶段，可能访问不到当时的 text_actions
+                    # 因此，最佳方案是在 rollout 循环里就把 text_action 塞进 info 或者 batch
+                    
+                    # 检查 batch data 里是否有 response text
+                    # 你的代码里：text_actions = self.tokenizer.batch_decode(...)
+                    # 建议在 rollout 循环里 (env.step之前) 强制把 text_action 写入 info:
+                    # infos[i]['generated_text_action'] = text_actions[i] <--- 这需要改 env wrapper，比较麻烦
+                    
+                    # 替代方案：直接从 data['responses'] 解码 (如果很慢就算了)，或者信任 step_info.get('parsed_action')
+                    # ALFWORLD 的 Env 通常会把处理过的动作放在 info['parsed_action'] 或 info['action']
+                    
+                    data['parsed_action'] = step_info.get('parsed_action', step_info.get('action', ''))
+                    
+                    # 🔥 [修复 2] 显式传递 won 状态，供 Actor 识别
+                    # 使用上一轮提到的逻辑
+                    if 'won' in last_active_info:
+                        data['won'] = last_active_info['won']
+                    elif 'is_success' in last_active_info: # 某些版本叫 is_success
+                        data['won'] = last_active_info['is_success']
+                    else:
+                        data['won'] = traj_task_completed # 使用之前计算的兜底值
+
                     data['thought'] = step_info.get('thought', '') # (Sec 5.2)
                     data['parsed_action'] = step_info.get('parsed_action', '') # (Sec 5.2)
                     data['action_type'] = step_info.get('action_type', '') # (Sec 5.1.1)
@@ -745,6 +785,13 @@ class TrajectoryCollector:
             batch = batch.union(batch_output)
 
             text_actions = self.tokenizer.batch_decode(batch.batch['responses'], skip_special_tokens=True)
+
+            next_obs, rewards, dones, infos = envs.step(text_actions)
+
+            # 确保 info 里有我们需要的东西
+            for i, info in enumerate(infos):
+                if 'parsed_action' not in info:
+                    info['parsed_action'] = text_actions[i] # 兜底：如果环境没解析，就用原始文本
 
             print("\n" + "*"*50)
             print(f"--- 监控: LLM 的完整回复 (Step {_step+1}) ---")

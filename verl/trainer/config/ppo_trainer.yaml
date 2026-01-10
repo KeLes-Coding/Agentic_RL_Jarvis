@@ -259,7 +259,7 @@ algorithm:
     # R_tau (Sec 4)
     alpha: 0.2                  # P_steps 权重
     gamma_token: 0.1            # P_token 权重 (注意：原 'gamma' 冲突，重命名为 gamma_token)
-    max_steps: 25               # 必须与 env.max_steps 匹配
+    # max_steps: 25               # 必须与 env.max_steps 匹配
     max_tokens: 81920            # 轨迹的最大 token 限制
     min_reasonable_steps: 2     # P_shortcut 阈值
     lambda_shortcut: 0.5        # P_shortcut 惩罚

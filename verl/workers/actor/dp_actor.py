@@ -26,7 +26,8 @@ from verl.utils.ulysses import gather_outpus_and_unpad, ulysses_pad_and_slice_in
 from verl.workers.actor import BasePPOActor
 
 # --- ✅ [CCAPO] 新增 Imports ---
-from agent_system.reward_manager import ccapo_algos
+# from agent_system.reward_manager import ccapo_algos
+import gigpo.core_ccapo as ccapo_algos
 from agent_system.reward_manager.ccapo_algos import _group_steps_by_traj # For STDB return
 from agent_system.multi_turn_rollout.utils import to_list_of_dict
 from verl.utils.dataset.rl_dataset import collate_fn
