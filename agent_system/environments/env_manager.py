@@ -28,94 +28,115 @@ from agent_system.memory import SimpleMemory
 
 import json
 
+# def parse_gamefile(infos):
+#     gamefile = []
+#     for info in infos:
+#         if 'extra.gamefile' in info:
+#             gamefile.append(info['extra.gamefile'])
+#         else:
+#             gamefile.append(None)
+#     return gamefile
+
+# def set_gamefile(infos, gamefile):
+#     for i in range(len(infos)):
+#         if 'extra.gamefile' in infos[i]:
+#             infos[i]['extra.gamefile'] = gamefile[i]
+#         else:
+#             infos[i]['extra.gamefile'] = None
+#     return infos
+
+def to_numpy(x):
+    if isinstance(x, np.ndarray): return x
+    if hasattr(x, 'cpu'): return x.cpu().numpy()
+    return np.array(x)
+
 def parse_gamefile(infos):
-    gamefile = []
-    for info in infos:
-        if 'extra.gamefile' in info:
-            gamefile.append(info['extra.gamefile'])
-        else:
-            gamefile.append(None)
-    return gamefile
+    """从 infos 中提取 gamefile 路径作为唯一标识"""
+    if infos and len(infos) > 0:
+        # ALFWorld info 包含 'extra.gamefile'
+        return infos[0].get('extra.gamefile', None)
+    return None
 
 def set_gamefile(infos, gamefile):
-    for i in range(len(infos)):
-        if 'extra.gamefile' in infos[i]:
-            infos[i]['extra.gamefile'] = gamefile[i]
-        else:
-            infos[i]['extra.gamefile'] = None
+    for info in infos:
+        if info.get('extra.gamefile') is None:
+            info['extra.gamefile'] = gamefile
     return infos
-
 
 class AlfWorldEnvironmentManager(EnvironmentManagerBase):
     def __init__(self, envs, projection_f, config):
         self.memory = SimpleMemory()
         self.pre_text_obs = None
+        # 🔥 新增：用于维护每个环境独立的 Gamefile ID
+        self.gamefiles = [] 
         super().__init__(envs, projection_f, config)
 
     @property
     def num_envs(self):
-        # AlfworldEnvs 使用 num_processes，其他环境可能使用 num_envs
         if hasattr(self.envs, 'num_processes'):
             return self.envs.num_processes
         elif hasattr(self.envs, 'num_envs'):
             return self.envs.num_envs
-        return 1 # Fallback
+        return 1 
     
     def reset(self, tasks=None, **kwargs):
         """
-        Args:
-            tasks: List[Dict], 包含 'task', 'prompt_index', 'prompt_vector' 等信息的列表。
-                   长度应该等于 batch_size。
+        [Fix V2.0] 彻底修复多环境并发下的 ID 错位问题
         """
-        # 1. 调用底层 Ray 环境的 reset
+        # 1. Reset 底层环境
         text_obs, image_obs, infos = self.envs.reset()
+        
+        # 确保 self.gamefiles 长度正确
+        batch_size = len(text_obs)
+        self.gamefiles = [None] * batch_size
 
-        # 2. 注入 STDB 元数据到 infos (关键步骤)
-        if tasks is not None:
-            safe_len = min(len(tasks), len(infos))
-            for i in range(safe_len):
-                task_info = tasks[i]
-                if 'prompt_index' in task_info:
-                    infos[i]['prompt_index'] = task_info['prompt_index']
-                if 'prompt_vector' in task_info:
-                    infos[i]['prompt_vector'] = task_info['prompt_vector']
-                if 'ground_truth_answer' in task_info:
-                    infos[i]['ground_truth_answer'] = task_info['ground_truth_answer']
+        # 2. 遍历每个环境，分别提取并绑定真实的 Gamefile
+        for i in range(batch_size):
+            info = infos[i]
+            
+            # A. 尝试从环境 Info 获取真实 ID
+            real_gamefile = info.get('extra.gamefile')
+            
+            # B. 如果环境没给，尝试从 tasks 参数回退 (通常不需要)
+            if not real_gamefile and tasks is not None and i < len(tasks):
+                real_gamefile = tasks[i].get('prompt_index')
 
-        self.gamefile = parse_gamefile(infos)
+            # C. 强制对齐：将找到的 ID 写入 info 和 本地缓存
+            if real_gamefile:
+                info['prompt_index'] = real_gamefile
+                self.gamefiles[i] = real_gamefile # 🔥 存入列表，对应下标
+            
+            # D. 补充 Ground Truth
+            if tasks is not None and i < len(tasks):
+                if 'ground_truth_answer' in tasks[i]:
+                    info['ground_truth_answer'] = tasks[i]['ground_truth_answer']
 
-        # --- 🔥 CCAPO v2 新增: 提取 Task Type ---
+        # --- CCAPO Task Type 提取 (保持你的逻辑) ---
         for i, info in enumerate(infos):
-            # 1. 提取 Task Type
-            # Gamefile 示例: '.../pick_and_place_simple-Tomato-None-Microwave-301/trial_T20190909_...'
-            # 我们取文件夹名的一部分作为 task_type
-            gf_path = info.get("extra.gamefile", "")
+            # 优先用刚提取的 self.gamefiles[i]
+            gf_path = self.gamefiles[i] or info.get("extra.gamefile", str(info.get('prompt_index', '')))
+            
             task_type = "unknown"
             if gf_path:
                 try:
-                    dirname = os.path.basename(os.path.dirname(gf_path))
-                    # 分割取第一部分: pick_and_place_simple
-                    task_type = dirname.split('-')[0]
-                except:
-                    pass
-            info['task_type'] = task_type
+                    if '/' in gf_path:
+                        dirname = os.path.basename(os.path.dirname(gf_path))
+                        task_type = dirname.split('-')[0]
+                    else:
+                        task_type = gf_path.split('-')[0]
+                except: pass
             
-            # 2. 确保 Observation Text 存在 (用于 Milestone)
-            # 在 Envs.py 中通常已经放入了 info['observation_text']
-            # 这里做个双保险
+            info['task_type'] = task_type
             if 'observation_text' not in info:
                 info['observation_text'] = text_obs[i]
         # ---------------------------------------
         
-        # 3. 初始化记忆和状态
-        self.memory.reset(batch_size = len(text_obs))
+        # 3. Memory Reset
+        self.memory.reset(batch_size=batch_size)
         self.tasks = []
-        
-        # --- 🔥 [关键修复] 必须在这里赋值 pre_text_obs ---
         self.pre_text_obs = text_obs 
-        # -----------------------------------------------
 
-        # 4. 解析任务描述
+        # 4. Extract Tasks
         self.extract_task(text_obs)
 
         full_text_obs = self.build_text_obs(text_obs, self.envs.get_admissible_commands, init=True)
@@ -129,36 +150,38 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
         self.pre_text_obs = text_obs
 
         full_text_obs = self.build_text_obs(text_obs, self.envs.get_admissible_commands)
-        if infos[0].get("extra.gamefile") is None:
-            infos = set_gamefile(infos, self.gamefile)
-
-        # Update Infos
+        
+        # 🔥 关键修复：Step 阶段如果 info 丢失 gamefile，从 self.gamefiles 列表恢复
+        # 注意：必须按索引 i 对应恢复，不能用 global variable
         for i, info in enumerate(infos):
-            info['is_action_valid'] = to_numpy(valids[i])
+            # 1. 尝试恢复 gamefile
+            if info.get("extra.gamefile") is None:
+                if i < len(self.gamefiles) and self.gamefiles[i]:
+                    info['extra.gamefile'] = self.gamefiles[i]
             
-            # --- 🔥 CCAPO v2 新增: 传递动作字符串和 Task Type ---
+            # 2. 其他逻辑
+            info['is_action_valid'] = to_numpy(valids[i])
             info['executed_action_str'] = str(actions[i])
             
-            # 传递上一轮提取的 Task Type (因为 reset 时提取过)
-            # 如果 step 的 info 中丢失了 gamefile，可能需要持久化存储 task_type
-            # 简单起见，假设 gamefile 路径不变，重新提取一遍，或者从 self.gamefile 拿
+            # 3. 重新提取 task_type (防御性编程)
             gf_path = info.get("extra.gamefile", "")
-            if not gf_path and self.gamefile:
-                # 尝试从 batch 级缓存恢复 (简化处理)
-                pass 
-            
             task_type = "unknown"
             if gf_path:
                 try:
-                    dirname = os.path.basename(os.path.dirname(gf_path))
-                    task_type = dirname.split('-')[0]
+                    if '/' in gf_path:
+                        dirname = os.path.basename(os.path.dirname(gf_path))
+                        task_type = dirname.split('-')[0]
                 except: pass
+            
+            if task_type == "unknown" and i < len(self.gamefiles) and self.gamefiles[i]:
+                 p_idx = self.gamefiles[i]
+                 if p_idx and '-' in str(p_idx):
+                     task_type = str(p_idx).split('-')[0]
+
             info['task_type'] = task_type
             
-            # 确保 Obs 用于 Milestone
             if 'observation_text' not in info:
                 info['observation_text'] = text_obs[i]
-            # ------------------------------------------------
 
         next_observations = {'text': full_text_obs, 'image': image_obs, 'anchor': text_obs}
         rewards = to_numpy(rewards)
@@ -173,13 +196,11 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
             if task_start != -1:
                 self.tasks.append(obs[task_start + len('Your task is to: '):].strip())
             else:
-                raise ValueError("Task description not found in text observation.")
-        
+                # Fallback: 如果找不到标准前缀，使用整个 obs 或占位符
+                # ALFWorld 有时重置后不显示 'Your task is to'，取决于 wrapper 配置
+                self.tasks.append(obs.strip()) 
 
     def build_text_obs(self, text_obs: List[str], admissible_actions: List[List[str]], init: bool = False) -> List[str]:
-        """
-        This function builds the text observation for the agent.
-        """
         postprocess_text_obs = []
         if not init and self.config.env.history_length > 0:
             memory_contexts, valid_lens = self.memory.fetch(

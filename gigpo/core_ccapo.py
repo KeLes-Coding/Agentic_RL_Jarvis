@@ -48,7 +48,10 @@ def is_success_step(s: Dict) -> bool:
         if str(val).lower() == 'true': return True
     
     # 3. 检查 R_core
-    if s.get('R_core', 0) == 1.0:
+    # 注意：R_core 可能是 tensor，安全获取
+    r_core = s.get('R_core', 0)
+    if hasattr(r_core, 'item'): r_core = r_core.item()
+    if r_core == 1.0:
         return True
         
     return False
@@ -93,7 +96,7 @@ def _group_steps_by_traj(steps_list):
     grouped = collections.defaultdict(list)
     for s in steps_list:
         uid = s.get('traj_uid', 'unknown')
-        if isinstance(uid, torch.Tensor): uid = uid.item() # tensor -> scalar
+        if hasattr(uid, 'item'): uid = uid.item() # tensor -> scalar
         grouped[uid].append(s)
     # 确保按 step_index 排序
     for uid in grouped:
@@ -117,12 +120,9 @@ def _calculate_R_tau(g_calc_trajs, config):
         # 计算基础 R_core
         R_core = 1.0 if is_success else -1.0
         
-        # 简单的 R_tau 计算 (可根据需要恢复复杂公式)
-        R_tau = R_core 
-        
-        # 写入步骤
+        # 写入步骤 (确保所有步骤都有 R_core)
         for step in steps:
-            step['R_tau'] = R_tau
+            step['R_tau'] = R_core 
             step['R_core'] = R_core
 
 def _calculate_A_traj(g_calc_steps, current_sr):
@@ -130,9 +130,10 @@ def _calculate_A_traj(g_calc_steps, current_sr):
     traj_map = {}
     for step in g_calc_steps:
         uid = step.get('traj_uid')
-        if isinstance(uid, torch.Tensor): uid = uid.item()
+        if hasattr(uid, 'item'): uid = uid.item()
         if uid not in traj_map:
-            traj_map[uid] = step.get('R_tau', 0.0)
+            # 优先使用 R_tau，如果没有则用 R_core
+            traj_map[uid] = step.get('R_tau', step.get('R_core', 0.0))
     
     unique_r_taus = list(traj_map.values())
     if not unique_r_taus: return
@@ -158,7 +159,7 @@ def _calculate_A_traj(g_calc_steps, current_sr):
     # 回写
     for step in g_calc_steps:
         uid = step.get('traj_uid')
-        if isinstance(uid, torch.Tensor): uid = uid.item()
+        if hasattr(uid, 'item'): uid = uid.item()
         adv = traj_adv_map.get(uid, 0.0)
         step['A_traj'] = float(np.clip(adv, -3.0, 3.0))
 
@@ -224,14 +225,31 @@ def compute_ccapo_advantages(
     _calculate_R_tau(g_calc_trajs, config)
 
     # 4. 计算 LCS 匹配 (内存版)
-    success_trajs = {uid: steps for uid, steps in g_calc_trajs.items() if steps[0]['R_core'] == 1.0}
+    # Debug: 找出成功的 UID
+    success_uids = []
+    for uid, steps in g_calc_trajs.items():
+        # R_core 已经被赋给所有步骤，检查第一个即可
+        r_core = steps[0].get('R_core', 0)
+        if hasattr(r_core, 'item'): r_core = r_core.item()
+        if r_core == 1.0:
+            success_uids.append(uid)
+            
     match_logger.info(f"-> Total Trajs: {len(g_calc_trajs)}")
-    match_logger.info(f"-> Success Trajs: {len(success_trajs)}")
+    match_logger.info(f"-> Success Trajs Count: {len(success_uids)}")
+    if len(success_uids) > 0:
+        match_logger.info(f"-> Success UIDs (Sample): {success_uids[:5]}") # 打印前5个ID，方便追踪
+
+    success_trajs = {uid: g_calc_trajs[uid] for uid in success_uids}
 
     # 按 Prompt 分组
     trajs_by_prompt = collections.defaultdict(list)
     for uid, steps in g_calc_trajs.items():
-        p_key = str(steps[0].get('prompt_index', steps[0].get('raw_prompt', 'default')))
+        # 尝试多种 key 获取 prompt
+        p_key = steps[0].get('prompt_index')
+        if not p_key:
+            p_key = steps[0].get('raw_prompt', 'default')
+        p_key = str(p_key)
+        
         trajs_by_prompt[p_key].append((uid, steps))
 
     # LCS 计算
@@ -250,7 +268,7 @@ def compute_ccapo_advantages(
                     best_anchor_actions = actions
         
         if best_anchor_uid:
-            match_logger.info(f"   [Anchor] Prompt: {p_key[:20]}... | UID: {str(best_anchor_uid)[:8]}")
+            match_logger.info(f"   [Anchor] PromptID: {p_key[:10]} | AnchorUID: {str(best_anchor_uid)}")
         
         # 奖励分配
         if best_anchor_actions:
@@ -264,44 +282,38 @@ def compute_ccapo_advantages(
                     if act_str:
                         if action_ptr in matched_indices:
                             s['R_match_raw'] = 1.0 
-                            s['R_core'] = 1.0 # 核心奖励
+                            # R_core 已经在 _calculate_R_tau 中根据 Success 设置过了
+                            # 这里不再重复覆盖 R_core，除非是为了强调
                         action_ptr += 1
                 
                 # Anchor 自身
                 if uid == best_anchor_uid:
                     for s in steps:
                         s['is_anchor'] = True
+                        # Anchor 必须是 1.0，虽然本来就是
                         s['R_core'] = 1.0
 
     # 5. 聚合 R_step
-    # R_step = R_core_raw + R_match_raw + ...
-    w_N = 0.2 # 权重
     for s in g_calc_steps:
-        # 简单聚合公式
-        base = 1.0 if s.get('R_core') == 1.0 else 0.0
+        # 获取 scalar R_core
+        r_core_val = s.get('R_core', 0.0)
+        if hasattr(r_core_val, 'item'): r_core_val = r_core_val.item()
+        
+        base = 1.0 if r_core_val == 1.0 else 0.0
         match = s.get('R_match_raw', 0.0)
-        s['R_step'] = base + match # 这里可以加更多项 (format, novelty)
+        s['R_step'] = base + match 
 
-    # 6. 🔥 [关键] 计算 Advantage (A_traj + A_step -> advantages)
-    # 计算当前 Success Rate
-    online_succ_count = sum(1 for steps in online_trajs.values() if steps[0].get('R_core') == 1.0)
+    # 6. 🔥 [关键] 计算 Advantage
+    online_succ_count = len(success_uids) # 直接使用上面统计的
     sr = online_succ_count / (len(online_trajs) + 1e-6)
     
     online_subset = [s for s in g_calc_steps if not s.get('is_buffer_data', False)]
     buffer_subset = [s for s in g_calc_steps if s.get('is_buffer_data', False)]
     
-    omega = getattr(config, 'omega', 0.5) # 默认权重
+    omega = getattr(config, 'omega', 0.5) 
     
     _calculate_separated_advantages(online_subset, omega, sr)
     _calculate_separated_advantages(buffer_subset, omega, sr)
 
     match_logger.info("=== [CCAPO Algo Done] ===\n")
     return g_calc_steps, sr
-
-def _group_steps_by_traj(steps_list):
-    grouped = collections.defaultdict(list)
-    for s in steps_list:
-        uid = s.get('traj_uid', 'unknown')
-        if isinstance(uid, torch.Tensor): uid = uid.item()
-        grouped[uid].append(s)
-    return grouped

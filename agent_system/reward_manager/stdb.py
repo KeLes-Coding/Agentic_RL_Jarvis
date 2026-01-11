@@ -35,12 +35,15 @@ class SuccessTrajectoryDatabase:
         self.abstract_path = os.path.join(self.save_dir, "stdb_abstract.json")
         
         self.top_k = top_k
-        self.tokenizer = tokenizer
+        self.tokenizer = tokenizer  # Tokenizer is crucial for recovery
         
         self.exact_db: Dict[str, List[str]] = {} 
         self.abstract_db: Dict[str, Dict[str, int]] = collections.defaultdict(lambda: collections.defaultdict(int))
         
         stdb_file_logger.info(f"=== STDB Initialized. Save Path: {self.save_dir} ===")
+        if not self.tokenizer:
+            stdb_file_logger.warning("⚠️ [STDB] Initialized WITHOUT Tokenizer. Action decoding from tensors will fail.")
+        
         self.load()
 
     def get_abstract_id(self, action_str: str) -> str:
@@ -72,7 +75,6 @@ class SuccessTrajectoryDatabase:
 
     def save(self):
         try:
-            # 确保目录存在
             for p in (self.exact_path, self.abstract_path):
                 parent = os.path.dirname(p)
                 if parent:
@@ -98,7 +100,7 @@ class SuccessTrajectoryDatabase:
                 if val: return True
             elif isinstance(val, (str,)):
                 if val.lower() == 'true': return True
-            elif isinstance(val, (torch.Tensor, np.ndarray)):
+            elif hasattr(val, 'item'): # Tensor check
                 try:
                     if val.item(): return True
                 except: pass
@@ -111,6 +113,35 @@ class SuccessTrajectoryDatabase:
             
         return False
 
+    def _extract_action_string(self, step: Dict) -> Optional[str]:
+        """尝试从多种来源提取动作字符串"""
+        # 1. 优先尝试明确的文本字段
+        for key in ['parsed_action', 'executed_action_str', 'action', 'response_str']:
+            val = step.get(key)
+            if val and isinstance(val, str):
+                return val.strip().lower()
+        
+        # 2. 尝试解码 Token (如果没有文本字段)
+        if self.tokenizer and 'responses' in step:
+            token_ids = step['responses']
+            if hasattr(token_ids, 'tolist'):
+                token_ids = token_ids.tolist()
+            elif isinstance(token_ids, np.ndarray):
+                token_ids = token_ids.tolist()
+            
+            if isinstance(token_ids, list):
+                # 过滤特殊 token (如 padding -100, pad_token_id 等)
+                # 这里假设 > 0 即可，具体可视 tokenizer 调整
+                valid_ids = [t for t in token_ids if isinstance(t, int) and t >= 0]
+                if valid_ids:
+                    try:
+                        decoded = self.tokenizer.decode(valid_ids, skip_special_tokens=True)
+                        if decoded and decoded.strip():
+                            return decoded.strip().lower()
+                    except Exception:
+                        pass
+        return None
+
     def get_best_sequence(self, prompt: str) -> List[str]:
         key = str(prompt).strip()
         return self.exact_db.get(key, [])
@@ -121,7 +152,6 @@ class SuccessTrajectoryDatabase:
     def add_online_trajectories(self, trajectories_input: Union[List[Dict], Dict[str, List[Dict]]]):
         stdb_file_logger.info(f"[ADD] Received input batch...")
         
-        updated = False
         trajectory_iter = []
         if isinstance(trajectories_input, dict):
             trajectory_iter = list(trajectories_input.values())
@@ -131,46 +161,66 @@ class SuccessTrajectoryDatabase:
             return
 
         success_count = 0
+        updated = False
         
+        # Debug 计数器
+        debug_fail_reasons = collections.defaultdict(int)
+        last_fail_sample = None
+
         for traj_item in trajectory_iter:
             concrete_actions = []
             prompt_str = None
             task_type = "unknown"
             is_success = False
-
+            
             # --- 解析 ---
             if isinstance(traj_item, list) and len(traj_item) > 0:
+                # 检查轨迹中是否有任意一步标记为成功
+                for s in traj_item:
+                    if self.is_success_step(s):
+                        is_success = True
+                        break
+                
+                if not is_success:
+                    debug_fail_reasons['not_marked_success'] += 1
+                    continue
+                
+                # 提取 prompt (通常在第一步)
                 first_step = traj_item[0]
-                
-                # 🔥 [重点] 使用类型安全的检查
-                if self.is_success_step(first_step):
-                    is_success = True
-                
-                if not is_success: continue
-                
                 prompt_str = str(first_step.get('prompt_index', '')).strip()
                 if not prompt_str and 'raw_prompt' in first_step:
                     prompt_str = str(first_step['raw_prompt']).strip()
                 
+                if not prompt_str:
+                    debug_fail_reasons['no_prompt_str'] += 1
+                    last_fail_sample = list(first_step.keys())
+                    continue
+
                 task_type = first_step.get('task_type', 'unknown')
                 
-                # 🔥 [重点] 提取动作逻辑
+                # 提取 actions (🔥 使用增强版提取逻辑)
                 concrete_actions = []
                 for s in traj_item:
-                    act = s.get('parsed_action') or s.get('executed_action_str')
-                    if act:
-                        concrete_actions.append(str(act).strip().lower())
-            
+                    act_str = self._extract_action_string(s)
+                    if act_str:
+                        concrete_actions.append(act_str)
+                
+                if not concrete_actions:
+                    debug_fail_reasons['no_actions'] += 1
+                    # 记录一下第一步的 keys 以便排查
+                    if last_fail_sample is None:
+                        last_fail_sample = list(first_step.keys())
+                    continue
+
             elif isinstance(traj_item, dict):
                 # 兼容旧格式
-                if not traj_item.get('success', False): continue
+                if not traj_item.get('success', False): 
+                    debug_fail_reasons['not_marked_success'] += 1
+                    continue
                 prompt_str = str(traj_item.get('prompt', '')).strip()
                 task_type = traj_item.get('task_type', 'unknown')
                 concrete_actions = traj_item.get('actions', [])
             
-            if not concrete_actions or not prompt_str: 
-                continue
-
             success_count += 1
 
             # --- 1. 更新 Exact DB ---
@@ -178,7 +228,7 @@ class SuccessTrajectoryDatabase:
             if existing is None or len(concrete_actions) < len(existing):
                 self.exact_db[prompt_str] = concrete_actions
                 updated = True
-                stdb_file_logger.info(f"  -> New Best Exact for '{prompt_str[:30]}...': {len(concrete_actions)} steps")
+                stdb_file_logger.info(f"  -> New Best Exact for '{prompt_str[:20]}...': {len(concrete_actions)} steps")
             
             # --- 2. 更新 Abstract DB ---
             if task_type and task_type != 'unknown':
@@ -189,6 +239,11 @@ class SuccessTrajectoryDatabase:
                     updated = True
 
         stdb_file_logger.info(f"[ADD] Processed {len(trajectory_iter)} trajs. Valid Success: {success_count}. Updated: {updated}")
+        
+        if len(debug_fail_reasons) > 0:
+            stdb_file_logger.warning(f"[DEBUG] Rejection Reasons: {dict(debug_fail_reasons)}")
+            if last_fail_sample and debug_fail_reasons['no_actions'] > 0:
+                stdb_file_logger.warning(f"[DEBUG] Sample Keys of Failed 'no_actions' Entry: {last_fail_sample}")
 
         if updated:
             self.save()

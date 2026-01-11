@@ -615,13 +615,12 @@ class DataParallelPPOActor(BasePPOActor):
     @GPUMemoryLogger(role="dp actor (CCAPO)", logger=logger)
     def update_policy_ccapo(self, G_online_batch: DataProto, G_buffer_batch: DataProto, embedding_model, ccapo_config: DictConfig):
         """
-        [CCAPO Refactored V9.4] 修复 STDB 判定逻辑
+        [CCAPO Refactored V9.6] 修复 Action 丢失问题 + 强制日志输出
         """
         self.actor_module.train()
 
         # --- 1. 准备数据列表 ---
         g_online_steps = to_list_of_dict(G_online_batch)
-        
         g_calc_steps = g_online_steps
         g_buffer_steps = []
         if G_buffer_batch:
@@ -629,7 +628,7 @@ class DataParallelPPOActor(BasePPOActor):
             if g_buffer_steps:
                 g_calc_steps = g_online_steps + g_buffer_steps 
         
-        # --- 2. 计算优势 (Advantage Calculation) ---
+        # --- 2. 计算优势 (CCAPO Algo) ---
         g_calc_steps_with_adv, lambda_sr = ccapo_algos.compute_ccapo_advantages(
             g_calc_steps,
             g_online_steps,
@@ -647,7 +646,6 @@ class DataParallelPPOActor(BasePPOActor):
         online_steps_final = [s for s in g_calc_steps_with_adv if not s.get('is_buffer_data', False)]
         G_online_batch_final = DataProto.from_single_dict(collate_fn(online_steps_final))
         
-        # [修改点] 强制置空 Buffer Batch
         G_buffer_batch_final = None 
 
         def _fix_advantages_tensor(batch_proto):
@@ -660,13 +658,11 @@ class DataParallelPPOActor(BasePPOActor):
         
         _fix_advantages_tensor(G_online_batch_final)
         
-        # --- 4. 准备训练参数 ---
+        # --- 4. 训练循环 (省略，保持原样) ---
         temperature = G_online_batch.meta_info.get("temperature", 1.0)
         ppo_mini_batch_size = self.config.ppo_mini_batch_size
         ppo_micro_batch_size = self.config.ppo_micro_batch_size_per_gpu or 1
         
-        logger.info(f"[CCAPO Training] BC Update Removed. Using Only Online Data. (Online=1.0)")
-
         # --- 5. 联合训练循环 ---
         metrics = {}
         debug_notes = {}
@@ -676,7 +672,6 @@ class DataParallelPPOActor(BasePPOActor):
 
         for epoch in range(self.config.ppo_epochs):
             indices_online = torch.randperm(n_online)
-            
             for i_mini in range(n_minis):
                 start_idx_mini = i_mini * ppo_mini_batch_size
                 end_idx_mini = min((i_mini + 1) * ppo_mini_batch_size, n_online)
@@ -685,28 +680,20 @@ class DataParallelPPOActor(BasePPOActor):
                 n_micros_in_this_mini = (n_samples_in_mini + ppo_micro_batch_size - 1) // ppo_micro_batch_size
                 
                 self.actor_optimizer.zero_grad()
-                
                 for i_micro in range(n_micros_in_this_mini):
-                    # Online Forward/Backward
                     start_micro = i_micro * ppo_micro_batch_size
                     end_micro = min((i_micro + 1) * ppo_micro_batch_size, n_samples_in_mini)
                     batch_idx = current_mini_indices[start_micro:end_micro]
                     
                     mb_online = self._extract_micro_batch(G_online_batch_final, batch_idx)
-                    
-                    entropy_on, log_prob_on = self._forward_micro_batch(
-                        mb_online, temperature, calculate_entropy=(self.config.entropy_coeff != 0.0)
-                    )
+                    entropy_on, log_prob_on = self._forward_micro_batch(mb_online, temperature, calculate_entropy=(self.config.entropy_coeff != 0.0))
                     
                     response_len_on = mb_online["responses"].size(1)
                     mask_on = mb_online["attention_mask"][:, -response_len_on:]
-                    if "loss_mask" in mb_online:
-                          mask_on = mb_online["loss_mask"][:, -response_len_on:]
+                    if "loss_mask" in mb_online: mask_on = mb_online["loss_mask"][:, -response_len_on:]
 
                     adv_batch = mb_online["advantages"]
-                    if adv_batch.dim() == 1:
-                        adv_batch = adv_batch.unsqueeze(-1)
-                    
+                    if adv_batch.dim() == 1: adv_batch = adv_batch.unsqueeze(-1)
                     adv_batch = torch.clamp(adv_batch, -4.0, 4.0)
 
                     pg_loss, pg_clipfrac, ppo_kl, _ = compute_policy_loss(
@@ -743,54 +730,77 @@ class DataParallelPPOActor(BasePPOActor):
         buffer_steps_for_stats = [s for s in g_calc_steps_with_adv if s.get('is_buffer_data', False)]
         self._log_dashboard_metrics(metrics, online_steps_final, buffer_steps_for_stats, lambda_sr)
 
-        # --- 7. 准备 STDB 更新数据 (修复逻辑) ---
+        # --- 7. 准备 STDB 更新数据 ---
         online_trajs_for_stdb = ccapo_algos._group_steps_by_traj(online_steps_final)
         
-        # --- 🔥 [关键修复] 扩宽成功判定逻辑 ---
         success_count_stdb = 0
+        success_uids = []
+        
+        # 强制 stdout 输出，确保日志可见
+        print(f"\n[CCAPO-DEBUG] Actor reviewing {len(online_trajs_for_stdb)} trajs for STDB...", flush=True)
+
         for uid, steps in online_trajs_for_stdb.items():
             if not steps: continue
-            
-            # 判定优先级:
-            # 1. R_core == 1.0 (CCAPO 计算出的最终成功)
-            # 2. won == True (ALFWorld 原生标记)
-            # 3. traj_task_completed == True (Legacy)
-            
-            first_step = steps[0]
+
             is_success = False
-            
-            if first_step.get('R_core', 0) == 1.0:
-                is_success = True
-            elif first_step.get('won', False) or str(first_step.get('won', '')).lower() == 'true':
-                is_success = True
-            elif first_step.get('traj_task_completed', False):
-                is_success = True
-            
+            # 宽泛的成功判定
+            for step in steps:
+                # Check R_core
+                rc = step.get('R_core', 0)
+                if hasattr(rc, 'item'): rc = rc.item()
+                if rc == 1.0: is_success = True
+                
+                # Check won
+                won = step.get('won', False)
+                if str(won).lower() == 'true': is_success = True
+                if hasattr(won, 'item') and won.item(): is_success = True
+                
+                # Check legacy
+                legacy = step.get('traj_task_completed', False)
+                if str(legacy).lower() == 'true': is_success = True
+                
+                if is_success: break
+
             if is_success:
-                # 必须显式写回 traj_task_completed，因为 stdb.py 依赖这个字段
+                success_count_stdb += 1
+                success_uids.append(uid)
+                # 强制回写标记
                 for s in steps:
                     s['traj_task_completed'] = True
-                success_count_stdb += 1
-                
-        logger.info(f"[CCAPO Actor] Prepared {len(online_trajs_for_stdb)} trajs for STDB. (Success: {success_count_stdb})")
-        
-        if success_count_stdb > 0:
-            logger.info(f">>> SUCCESS CONFIRMED ({success_count_stdb}). Expecting STDB update.")
-        else:
-            # Debug: 打印第一条失败轨迹的 keys，方便排查
-            if len(online_trajs_for_stdb) > 0:
-                sample_step = list(online_trajs_for_stdb.values())[0][0]
-                logger.warning(f">>> NO Success detected. Sample Keys: {list(sample_step.keys())}")
-                logger.warning(f"    Sample R_core: {sample_step.get('R_core')}, Won: {sample_step.get('won')}")
-        # ----------------------------------------------------
+                    s['R_core'] = 1.0
 
+        print(f"[CCAPO-DEBUG] Found {success_count_stdb} Success Trajs. UIDs: {success_uids[:5]}", flush=True)
+
+        # --- 构建 CPU 字典 ---
         cpu_trajs_for_stdb = {}
+        
         for uid, steps in online_trajs_for_stdb.items():
             cpu_steps = []
             for s in steps:
-                cpu_s = {k: (v.cpu().detach() if isinstance(v, torch.Tensor) else v) for k, v in s.items()}
+                cpu_s = {}
+                for k, v in s.items():
+                    if isinstance(v, torch.Tensor):
+                        v = v.cpu().detach()
+                    cpu_s[k] = v
                 cpu_steps.append(cpu_s)
+            
             cpu_trajs_for_stdb[uid] = cpu_steps
+
+        # 🔥 终极核查：检查第一条成功轨迹的 KEYS
+        if success_count_stdb > 0 and len(success_uids) > 0:
+            first_succ_uid = success_uids[0]
+            first_succ_traj = cpu_trajs_for_stdb.get(first_succ_uid, [])
+            if first_succ_traj:
+                chk_step = first_succ_traj[0]
+                keys = list(chk_step.keys())
+                print(f"[CCAPO-DEBUG] Sample Success Step Keys: {keys}", flush=True)
+                
+                # 检查是否存在动作字段
+                has_act = 'parsed_action' in chk_step or 'executed_action_str' in chk_step
+                has_responses = 'responses' in chk_step
+                print(f"[CCAPO-DEBUG] Has Action String: {has_act}, Has Responses Tensor: {has_responses}", flush=True)
+        else:
+            print("[CCAPO-DEBUG] No success detected in Actor. STDB will be empty.", flush=True)
 
         return metrics, cpu_trajs_for_stdb, debug_notes
 
