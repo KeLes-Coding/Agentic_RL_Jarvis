@@ -80,63 +80,36 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
         return 1 
     
     def reset(self, tasks=None, **kwargs):
-        """
-        [Fix V2.0] 彻底修复多环境并发下的 ID 错位问题
-        """
-        # 1. Reset 底层环境
         text_obs, image_obs, infos = self.envs.reset()
         
-        # 确保 self.gamefiles 长度正确
         batch_size = len(text_obs)
         self.gamefiles = [None] * batch_size
 
-        # 2. 遍历每个环境，分别提取并绑定真实的 Gamefile
+        # 1. Reset 阶段：建立初始 ID 映射
         for i in range(batch_size):
             info = infos[i]
             
-            # A. 尝试从环境 Info 获取真实 ID
+            # A. 获取真实 Gamefile
             real_gamefile = info.get('extra.gamefile')
-            
-            # B. 如果环境没给，尝试从 tasks 参数回退 (通常不需要)
             if not real_gamefile and tasks is not None and i < len(tasks):
                 real_gamefile = tasks[i].get('prompt_index')
 
-            # C. 强制对齐：将找到的 ID 写入 info 和 本地缓存
+            # B. 存入缓存
             if real_gamefile:
                 info['prompt_index'] = real_gamefile
-                self.gamefiles[i] = real_gamefile # 🔥 存入列表，对应下标
+                self.gamefiles[i] = real_gamefile
             
-            # D. 补充 Ground Truth
+            # C. 处理 Task Type
+            self._inject_task_type(info, text_obs[i])
+
+            # D. Ground Truth
             if tasks is not None and i < len(tasks):
                 if 'ground_truth_answer' in tasks[i]:
                     info['ground_truth_answer'] = tasks[i]['ground_truth_answer']
 
-        # --- CCAPO Task Type 提取 (保持你的逻辑) ---
-        for i, info in enumerate(infos):
-            # 优先用刚提取的 self.gamefiles[i]
-            gf_path = self.gamefiles[i] or info.get("extra.gamefile", str(info.get('prompt_index', '')))
-            
-            task_type = "unknown"
-            if gf_path:
-                try:
-                    if '/' in gf_path:
-                        dirname = os.path.basename(os.path.dirname(gf_path))
-                        task_type = dirname.split('-')[0]
-                    else:
-                        task_type = gf_path.split('-')[0]
-                except: pass
-            
-            info['task_type'] = task_type
-            if 'observation_text' not in info:
-                info['observation_text'] = text_obs[i]
-        # ---------------------------------------
-        
-        # 3. Memory Reset
         self.memory.reset(batch_size=batch_size)
         self.tasks = []
         self.pre_text_obs = text_obs 
-
-        # 4. Extract Tasks
         self.extract_task(text_obs)
 
         full_text_obs = self.build_text_obs(text_obs, self.envs.get_admissible_commands, init=True)
@@ -151,43 +124,66 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
 
         full_text_obs = self.build_text_obs(text_obs, self.envs.get_admissible_commands)
         
-        # 🔥 关键修复：Step 阶段如果 info 丢失 gamefile，从 self.gamefiles 列表恢复
-        # 注意：必须按索引 i 对应恢复，不能用 global variable
+        # --- [Fix V3.1] 强力防止 ID 错位 ---
         for i, info in enumerate(infos):
-            # 1. 尝试恢复 gamefile
-            if info.get("extra.gamefile") is None:
-                if i < len(self.gamefiles) and self.gamefiles[i]:
-                    info['extra.gamefile'] = self.gamefiles[i]
+            is_done = to_numpy(dones[i])
             
-            # 2. 其他逻辑
+            # 1. 如果 Done=True，obs 已经是新任务了，但 info 可能还残留旧任务的 ID
+            #    必须强制清除旧缓存，避免"僵尸 ID"附着在新任务上
+            if is_done:
+                self.gamefiles[i] = None # 🔥 清空缓存，不再信任旧 ID
+                # 如果 info 里有旧 ID，最好也删掉或者标记为过期，
+                # 但为了不破坏 Reward 计算（可能需要旧 ID 算分），我们不动 info 里的原始数据，
+                # 只是不让它更新进 self.gamefiles，也不让它作为新 Obs 的 ID。
+                
+                # 尝试从 info 获取新 ID (有些环境 wrapper 会在 done 时把 next_info 放进去)
+                # 但通常比较混乱，所以最安全的是：
+                # 新任务暂时标记为 unknown，等待下一次 step 或通过 text_obs 解析
+                pass 
+            else:
+                # 2. 如果没 Done，且环境没给 ID，尝试用缓存恢复
+                current_gf = info.get("extra.gamefile")
+                if current_gf:
+                    self.gamefiles[i] = current_gf # 更新缓存
+                elif self.gamefiles[i]:
+                    info['extra.gamefile'] = self.gamefiles[i] # 恢复 ID
+
+            # 3. 记录验证位
             info['is_action_valid'] = to_numpy(valids[i])
             info['executed_action_str'] = str(actions[i])
             
-            # 3. 重新提取 task_type (防御性编程)
-            gf_path = info.get("extra.gamefile", "")
-            task_type = "unknown"
-            if gf_path:
-                try:
-                    if '/' in gf_path:
-                        dirname = os.path.basename(os.path.dirname(gf_path))
-                        task_type = dirname.split('-')[0]
-                except: pass
-            
-            if task_type == "unknown" and i < len(self.gamefiles) and self.gamefiles[i]:
-                 p_idx = self.gamefiles[i]
-                 if p_idx and '-' in str(p_idx):
-                     task_type = str(p_idx).split('-')[0]
-
-            info['task_type'] = task_type
-            
-            if 'observation_text' not in info:
-                info['observation_text'] = text_obs[i]
+            # 4. 重新注入 Task Type (基于当前这一帧的 ID 或 文本)
+            # 注意：如果是 Done 帧，这里注入的应该是 unknown 或者尝试从 text_obs 解析
+            self._inject_task_type(info, text_obs[i])
 
         next_observations = {'text': full_text_obs, 'image': image_obs, 'anchor': text_obs}
         rewards = to_numpy(rewards)
         dones = to_numpy(dones)
 
         return next_observations, rewards, dones, infos
+    
+    def _inject_task_type(self, info, obs_text):
+        """辅助函数：安全地注入 task_type"""
+        # 1. 优先从 gamefile 路径提取
+        gf_path = info.get("extra.gamefile", "")
+        # 如果是 Done 后的第一帧，info 可能残留旧 ID，这里要做个简单的防御：
+        # 如果 info 里的 ID 和 obs_text 严重不符（例如 ID 是 Cup，Text 是 CD），那这就是错位。
+        # 但这里很难做这种语义检查。
+        # 最简单的策略：如果 external code 已经清空了 gamefile (在 Done 时)，这里就会由 unknown 接管。
+        
+        task_type = "unknown"
+        if gf_path:
+            try:
+                if '/' in gf_path:
+                    dirname = os.path.basename(os.path.dirname(gf_path))
+                    task_type = dirname.split('-')[0]
+                else:
+                    task_type = gf_path.split('-')[0]
+            except: pass
+        
+        info['task_type'] = task_type
+        if 'observation_text' not in info:
+            info['observation_text'] = obs_text
     
     def extract_task(self, text_obs: List[str]):
         for obs in text_obs:

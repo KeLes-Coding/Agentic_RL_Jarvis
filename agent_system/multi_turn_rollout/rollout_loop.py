@@ -347,16 +347,16 @@ class TrajectoryCollector:
         self.file_logger.info(f"[gather_rollout_data] gen_batch.non_tensor_batch keys: {list(gen_batch.non_tensor_batch.keys())}")
         
         # 1. prompt_index 是非张量, 来自 non_tensor_batch
-        prompt_index_list = gen_batch.non_tensor_batch.get('prompt_index', [None] * batch_size)
+        input_prompt_index_list = gen_batch.non_tensor_batch.get('prompt_index', [None] * batch_size)
         
         # 2. prompt_vector 是张量, 来自 batch
         # ❗️ [修复] 使用 default=None 防止 KeyError 崩溃
         prompt_vector_tensor = gen_batch.batch.get('prompt_vector', None) 
         
-        if any(p is None for p in prompt_index_list) or prompt_vector_tensor is None:
+        if any(p is None for p in input_prompt_index_list) or prompt_vector_tensor is None:
              # ❗️ 这个警告现在是关键：如果它在修复 ray_trainer.py 后仍然出现，说明 pop 列表还是错了
              print(f"警告: (gather_rollout_data) 未能从 gen_batch 中提取 'prompt_index' 或 'prompt_vector'。STDB 录入可能会失败。")
-             self.file_logger.warning(f"[gather_rollout_data] 未能从 gen_batch 中提取 'prompt_index' (found: {not any(p is None for p in prompt_index_list)}) 或 'prompt_vector' (found: {prompt_vector_tensor is not None})。STDB 将失败。")
+             self.file_logger.warning(f"[gather_rollout_data] 未能从 gen_batch 中提取 'prompt_index' (found: {not any(p is None for p in input_prompt_index_list)}) 或 'prompt_vector' (found: {prompt_vector_tensor is not None})。STDB 将失败。")
         else:
              self.file_logger.info(f"[gather_rollout_data] 成功从 gen_batch 中提取了 'prompt_index' 和 'prompt_vector'。")
         # ======================= 修复结束 =======================
@@ -408,8 +408,31 @@ class TrajectoryCollector:
                 if step_info.get('action_success', False):
                     traj_n_success_steps += 1
             
-            # ======================= ✅ [修复] 获取此轨迹(bs)的 Prompt 级信息 =======================
-            traj_prompt_index = prompt_index_list[bs]
+            # ======================= ✅ [修复 & DEBUG] 纠正 ID 错位 =======================
+            # 逻辑：不再盲目信任 input_prompt_index_list (gen_batch)。
+            # 而是检查环境返回的 info (total_infos)。环境里的 extra.gamefile 才是真理。
+            
+            real_env_id = None
+            if num_active_steps > 0 and total_infos[bs]:
+                # 检查第一步的 info
+                first_info = total_infos[bs][0]
+                # 优先找 extra.gamefile (ALFWORLD 特有)
+                real_env_id = first_info.get('extra.gamefile')
+                # 其次找 prompt_index (如果环境 wrapper 写回去了)
+                if not real_env_id:
+                    real_env_id = first_info.get('prompt_index')
+            
+            if real_env_id:
+                # 如果环境明确报告了 ID，就用环境的 (这就修复了 Cup 变 CD 的问题)
+                traj_prompt_index = real_env_id
+                
+                # [可选] Debug 日志：发现修正 (只打印前几个以防刷屏)
+                if bs < 5 and str(real_env_id) != str(input_prompt_index_list[bs]):
+                    self.file_logger.info(f"[ID-FIX] Traj {bs} Input='{input_prompt_index_list[bs]}' -> Env='{real_env_id}'")
+            else:
+                # 只有在环境没说话时，才用输入的 (Fallback)
+                traj_prompt_index = input_prompt_index_list[bs]
+
             # ❗️ [修复] 安全地从张量中索引
             traj_prompt_vector = prompt_vector_tensor[bs] if prompt_vector_tensor is not None else None
             # ======================= 修复结束 =======================
@@ -420,7 +443,8 @@ class TrajectoryCollector:
             # ======================= ✅ 日志：在聚合前打印第一个步骤的 STDB 关键信息 =======================
             if bs == 0 and num_active_steps > 0: # 只为第一个轨迹打印
                 self.file_logger.info(f"--- [gather_rollout_data] 轨迹 {bs} (uid={traj_uid[bs]}) 的 STDB 关键信息预览 ---")
-                self.file_logger.info(f"  - traj_prompt_index: {traj_prompt_index} (Type: {type(traj_prompt_index)})")
+                self.file_logger.info(f"  - traj_prompt_index (FINAL): {traj_prompt_index} (Type: {type(traj_prompt_index)})")
+                self.file_logger.info(f"  - input_prompt_index (ORIG): {input_prompt_index_list[bs]}")
                 self.file_logger.info(f"  - traj_prompt_vector: {'Tensor' if traj_prompt_vector is not None else 'None'} (Type: {type(traj_prompt_vector)})")
                 first_step_info = total_infos[bs][0] if total_infos[bs] else {}
                 self.file_logger.info(f"  - log_dir_path (from info): {first_step_info.get('log_dir_path', 'N/A')}")
@@ -484,6 +508,7 @@ class TrajectoryCollector:
                     # `data['values']` (如果存在) 也已自动添加
                     
                     # ======================= ✅ [修复] 将 Prompt 级信息附加到每一步 =======================
+                    # 🔥 这里使用的是纠正后的真实 ID
                     data['prompt_index'] = traj_prompt_index
                     data['prompt_vector'] = traj_prompt_vector
                     # ======================= 修复结束 =======================
@@ -648,6 +673,9 @@ class TrajectoryCollector:
                 prompt_index_list = gen_batch.non_tensor_batch['prompt_index']
                 prompt_vector_tensor = gen_batch.batch.get('prompt_vector')
                 
+                # 🔥 [DEBUG-TRACE] 打印输入的 Prompt Index，确保 DataLoader 没错
+                self.file_logger.info(f"[ROLLOUT-DEBUG] Input Batch Prompt Indices (First 3): {prompt_index_list[:3]}")
+                
                 if prompt_vector_tensor is None:
                     self.file_logger.error("!!! [vanilla_multi_turn_loop] 'prompt_vector' is missing from gen_batch.batch! STDB will fail. !!!")
                 
@@ -701,7 +729,15 @@ class TrajectoryCollector:
             tasks_for_this_batch = [{} for _ in range(len(gen_batch))]
         
         # 重置环境
+        # 🔥 [DEBUG-TRACE]
+        self.file_logger.info(f"[ROLLOUT-DEBUG] Calling envs.reset()...")
+        
         obs, infos = envs.reset(tasks=tasks_for_this_batch)
+        
+        # 🔥 [DEBUG-TRACE] 检查环境返回的 info (如果支持 extra.gamefile)
+        if infos and len(infos) > 0:
+            first_env_file = infos[0].get('extra.gamefile', 'N/A')
+            self.file_logger.info(f"[ROLLOUT-DEBUG] Post-Reset Env 0 Info Gamefile: {first_env_file}")
         # ====================================================================================
 
         lenght_obs = len(obs['text']) if obs['text'] is not None else len(obs['image'])

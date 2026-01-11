@@ -21,6 +21,7 @@ import numpy as np
 import torch
 import torchvision.transforms as T
 import ray
+import sys # Added for flush
 
 from agent_system.environments.env_package.alfworld.alfworld.agents.environment import get_environment
 
@@ -62,6 +63,9 @@ class AlfworldWorker:
     def __init__(self, config, seed, base_env):
         self.env = base_env.init_env(batch_size=1)  # Each worker holds only one sub-environment
         self.env.seed(seed)
+        # 🔥 [Cache] 用来存储原始的游戏列表，防止被我们修改后找不回去了
+        self._original_game_files = None
+        self.worker_id = seed # Just for debug ID
     
     def step(self, action):
         """Execute a step in the environment"""
@@ -71,9 +75,82 @@ class AlfworldWorker:
         infos['observation_text'] = obs
         return obs, scores, dones, infos
     
-    def reset(self):
-        """Reset the environment"""
+    def reset(self, game_file=None):
+        """
+        Reset the environment.
+        🔥 [Fix V4.0] 强制指定游戏文件，并重置内部索引，确保环境真的加载该文件。
+        """
+        # 1. 打印接收到的请求 (Debug)
+        print(f"[ALF-WORKER-{self.worker_id}] Reset request. Target: '{game_file}'", flush=True)
+
+        if game_file:
+            # A. 首次运行时备份原始游戏列表
+            if self._original_game_files is None:
+                # 递归查找含有 game_files 的层级
+                env_ptr = self.env
+                while hasattr(env_ptr, 'env') and not hasattr(env_ptr, 'game_files'):
+                    env_ptr = env_ptr.env
+                
+                if hasattr(env_ptr, 'game_files'):
+                    self._original_game_files = env_ptr.game_files
+                else:
+                    self._original_game_files = []
+                    print(f"[ALF-WORKER-{self.worker_id}] ⚠️ Error: Cannot find 'game_files' in env hierarchy.", flush=True)
+
+            # B. 在原始列表中查找目标文件
+            if self._original_game_files:
+                target_file = None
+                search_key = str(game_file).strip()
+                
+                # 模糊匹配
+                for f in self._original_game_files:
+                    if search_key in f:
+                        target_file = f
+                        break
+                
+                if target_file:
+                    # C. 核心 HACK: 穿透所有 Wrapper，修改底层环境的列表和索引
+                    found_layer = False
+                    curr = self.env
+                    # 尝试最多 5 层穿透
+                    for _ in range(5):
+                        if hasattr(curr, 'game_files'):
+                            # 1. 锁定列表
+                            curr.game_files = [target_file]
+                            # 2. 锁定数量
+                            if hasattr(curr, 'num_games'): 
+                                curr.num_games = 1
+                            # 3. 🔥 [CRITICAL] 重置索引，防止越界或错位
+                            if hasattr(curr, 'game_file_index'): 
+                                curr.game_file_index = 0
+                            # 某些变体可能叫 file_index
+                            if hasattr(curr, 'file_index'): 
+                                curr.file_index = 0
+                            
+                            found_layer = True
+                            # 继续向下查找，防止有多个层级都缓存了列表
+                        
+                        if hasattr(curr, 'env'):
+                            curr = curr.env
+                        else:
+                            break
+                    
+                    if found_layer:
+                        print(f"[ALF-WORKER-{self.worker_id}] ✅ Hack applied. Locked to: ...{target_file[-40:]}", flush=True)
+                    else:
+                        print(f"[ALF-WORKER-{self.worker_id}] ❌ Failed to apply hack: 'game_files' attr not found.", flush=True)
+
+                else:
+                    print(f"[ALF-WORKER-{self.worker_id}] ❌ Warning: Requested game '{search_key}' NOT FOUND in env list.", flush=True)
+
+        # 2. 执行 Reset
         obs, infos = self.env.reset()
+        
+        # 3. 结果验证日志
+        loaded_file = infos.get('extra.gamefile', 'Unknown')
+        match_status = "MATCH" if (game_file and str(game_file) in str(loaded_file)) else "MISMATCH"
+        print(f"[ALF-WORKER-{self.worker_id}] Post-Reset Status: {match_status} | Loaded: ...{str(loaded_file)[-40:]}", flush=True)
+        
         infos['observation_text'] = obs
         return obs, infos
     
@@ -87,7 +164,6 @@ class AlfworldEnvs(gym.Env):
     def __init__(self, alf_config_path, seed=0, env_num=1, group_n=1, is_train=True, env_kwargs={}):
         super().__init__()
         
-        # Initialize Ray if not already initialized
         if not ray.is_initialized():
             ray.init()
             
@@ -99,7 +175,6 @@ class AlfworldEnvs(gym.Env):
         self.num_processes = env_num * group_n
         self.group_n = group_n
 
-        # Create Ray remote actors instead of processes
         self.workers = []
         for i in range(self.num_processes):
             worker = AlfworldWorker.remote(config, seed + (i // self.group_n), base_env)
@@ -111,13 +186,11 @@ class AlfworldEnvs(gym.Env):
         assert len(actions) == self.num_processes, \
             "The num of actions must be equal to the num of processes"
 
-        # Send step commands to all workers
         futures = []
         for i, worker in enumerate(self.workers):
             future = worker.step.remote(actions[i])
             futures.append(future)
 
-        # Collect results
         text_obs_list = []
         image_obs_list = []
         rewards_list = []
@@ -143,7 +216,7 @@ class AlfworldEnvs(gym.Env):
 
         return text_obs_list, image_obs_list, rewards_list, dones_list, info_list
 
-    def reset(self):
+    def reset(self, tasks=None, **kwargs):
         """
         Send the reset command to all workers at once and collect initial obs/info from each environment.
         """
@@ -153,8 +226,14 @@ class AlfworldEnvs(gym.Env):
 
         # Send reset commands to all workers
         futures = []
-        for worker in self.workers:
-            future = worker.reset.remote()
+        for i, worker in enumerate(self.workers):
+            # 提取目标游戏文件
+            target_game = None
+            if tasks is not None and i < len(tasks):
+                target_game = tasks[i].get('prompt_index')
+            
+            # 传递给 worker (带参数)
+            future = worker.reset.remote(game_file=target_game)
             futures.append(future)
 
         # Collect results
@@ -174,10 +253,6 @@ class AlfworldEnvs(gym.Env):
         return text_obs_list, image_obs_list, info_list
 
     def getobs(self):
-        """
-        Ask each worker to return its current frame image.
-        Usually needed only for multi-modal environments; otherwise can return None.
-        """
         futures = []
         for worker in self.workers:
             future = worker.getobs.remote()
@@ -188,17 +263,9 @@ class AlfworldEnvs(gym.Env):
 
     @property
     def get_admissible_commands(self):
-        """
-        Simply return the prev_admissible_commands stored by the main process.
-        You could also design it to fetch after each step or another method.
-        """
         return self.prev_admissible_commands
 
     def close(self):
-        """
-        Close all workers
-        """
-        # Kill all Ray actors
         for worker in self.workers:
             ray.kill(worker)
 
