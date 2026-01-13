@@ -822,13 +822,6 @@ class TrajectoryCollector:
 
             text_actions = self.tokenizer.batch_decode(batch.batch['responses'], skip_special_tokens=True)
 
-            next_obs, rewards, dones, infos = envs.step(text_actions)
-
-            # 确保 info 里有我们需要的东西
-            for i, info in enumerate(infos):
-                if 'parsed_action' not in info:
-                    info['parsed_action'] = text_actions[i] # 兜底：如果环境没解析，就用原始文本
-
             print("\n" + "*"*50)
             print(f"--- 监控: LLM 的完整回复 (Step {_step+1}) ---")
             for i, response in enumerate(text_actions):
@@ -901,6 +894,11 @@ class TrajectoryCollector:
                 self.file_logger.error(f"[vanilla_multi_turn_loop] Step {_step+1}: 计算 Token 和置信度时出错: {e}\n{traceback.format_exc()}")
 
             next_obs, rewards, dones, infos = envs.step(text_actions)
+
+            # 确保 info 里有我们需要的东西
+            for i, info in enumerate(infos):
+                if 'parsed_action' not in info:
+                    info['parsed_action'] = text_actions[i] # 兜底：如果环境没解析，就用原始文本
 
             if len(rewards.shape) == 2:
                 rewards = rewards.squeeze(1)

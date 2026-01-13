@@ -310,12 +310,18 @@ class AlfredThorEnv(object):
             env.init_env(self.config)
         return self
 
-    def reset(self):
+    def reset(self, tasks=None):
         # set tasks
         batch_size = self.batch_size
-        # reset envs
-
-        if self.train_eval == 'train':
+        
+        # --- [CCAPO FIX START] ---
+        # 如果外部传入了指定的 tasks (通常是特定 Seed 的 GameFile)，直接使用
+        if tasks is not None:
+            assert len(tasks) == batch_size, f"Provided tasks count {len(tasks)} != batch size {batch_size}"
+            # 这里的 tasks 应该是完整的文件路径列表
+        # --- [CCAPO FIX END] ---
+        elif self.train_eval == 'train':
+            # 原有的随机逻辑
             tasks = random.sample(self.json_file_list, k=batch_size)
         else:
             if len(self.json_file_list)-batch_size > batch_size:
@@ -325,6 +331,7 @@ class AlfredThorEnv(object):
                 self.get_env_paths()
 
         for n in range(batch_size):
+            # 将任务文件路径传给 Worker 线程
             self.action_queues[n].put((None, True, tasks[n]))
 
         obs, dones, infos = self.wait_and_get_info()

@@ -169,6 +169,39 @@ class AlfworldEnvs(gym.Env):
             
         eval_dataset = env_kwargs.get('eval_dataset', 'eval_in_distribution')
         config = load_config_file(alf_config_path)
+
+        # 🔥 [Fix V2] 强力覆盖策略
+        # 1. 打印传入的所有参数，确认 max_steps 是否存在
+        print(f"[ALFWorld Wrapper] env_kwargs keys: {list(env_kwargs.keys())}", flush=True)
+
+        target_steps = 50 # 默认保底值
+        
+        # 尝试从 kwargs 获取并转为 int
+        if 'max_steps' in env_kwargs:
+            target_steps = int(env_kwargs['max_steps'])
+            print(f"[ALFWorld Wrapper] 🚀 Found max_steps in kwargs: {target_steps}", flush=True)
+        else:
+            print(f"[ALFWorld Wrapper] ⚠️ max_steps NOT found in kwargs, using default: {target_steps}", flush=True)
+
+        # 2. 覆盖 config 中的每一个角落
+        if 'general' not in config: config['general'] = {}
+        config['general']['max_steps'] = target_steps
+        
+        if 'rl' in config:
+            if 'training' not in config['rl']: config['rl']['training'] = {}
+            config['rl']['training']['max_nb_steps_per_episode'] = target_steps
+            
+        if 'dagger' in config:
+            if 'training' not in config['dagger']: config['dagger']['training'] = {}
+            config['dagger']['training']['max_nb_steps_per_episode'] = target_steps
+
+        # 3. 强制修改 env 部分（部分旧版本会读这里）
+        if 'env' not in config: config['env'] = {}
+        config['env']['max_steps'] = target_steps
+        
+        print(f"[ALFWorld Wrapper] Config updated. General: {config['general'].get('max_steps')}, RL: {config.get('rl',{}).get('training',{}).get('max_nb_steps_per_episode')}", flush=True)
+        # -------------------------------------------------------------
+
         env_type = config['env']['type']
         base_env = get_environment(env_type)(config, train_eval='train' if is_train else eval_dataset)
         self.multi_modal = (env_type == 'AlfredThorEnv')

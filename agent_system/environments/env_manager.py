@@ -115,8 +115,104 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
         full_text_obs = self.build_text_obs(text_obs, self.envs.get_admissible_commands, init=True)
         return {'text': full_text_obs, 'image': image_obs, 'anchor': text_obs}, infos
     
+    # ---------------- Helper: 解析模型输出 ----------------
+    def _parse_model_output(self, text: str) -> tuple[str, str]:
+        """
+        从模型输出中提取 <think> 和 <action> 块。
+        返回: (think_content, action_content)
+        """
+        if not text: return "", ""
+        
+        # 1. 提取 Action
+        action_match = re.search(r"<action>(.*?)</action>", text, re.DOTALL | re.IGNORECASE)
+        if action_match:
+            action_content = action_match.group(1).strip()
+        else:
+            # Fallback: 如果没有标签，假设最后一行或者是整个文本是动作（视你的模型训练方式而定）
+            # 这里为了安全，如果没标签，尝试去除 think 标签后剩下的部分
+            clean_text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE).strip()
+            action_content = clean_text.split('\n')[-1].strip() if clean_text else "look" # 最极端的兜底
+
+        # 2. 提取 Think
+        think_match = re.search(r"<think>(.*?)</think>", text, re.DOTALL | re.IGNORECASE)
+        think_content = think_match.group(1).strip() if think_match else ""
+        
+        return think_content, action_content
+
+    # ---------------- [修改] 辅助方法：暴力解析 ----------------
+    def _parse_model_output(self, text: str) -> tuple[str, str]:
+        """
+        从模型输出中提取 <think> 和 <action>。
+        采用多级降级策略，确保尽可能提取出有效动作。
+        """
+        if not isinstance(text, str):
+            text = str(text)
+            
+        think_content = ""
+        action_content = ""
+
+        # --- 策略 1: 标准 XML 正则 (最准确) ---
+        # dotall 让 . 匹配换行符
+        think_match = re.search(r"<think>(.*?)</think>", text, re.DOTALL | re.IGNORECASE)
+        if think_match:
+            think_content = think_match.group(1).strip()
+        
+        action_match = re.search(r"<action>(.*?)</action>", text, re.DOTALL | re.IGNORECASE)
+        if action_match:
+            action_content = action_match.group(1).strip()
+
+        # --- 策略 2: 如果 XML 失败，尝试基于关键词的启发式提取 ---
+        if not action_content:
+            # 移除 think 部分，防止干扰
+            clean_text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL | re.IGNORECASE)
+            
+            # ALFWorld 常见动作动词
+            valid_verbs = ["go to", "goto", "put", "take", "pick", "open", "close", "toggle", "heat", "cool", "clean", "slice", "examine", "look", "inventory", "use"]
+            
+            # 按行倒序查找，找到第一行包含有效动词的作为动作
+            lines = clean_text.strip().split('\n')
+            for line in reversed(lines):
+                line_lower = line.lower().strip()
+                # 简单清洗 line
+                line_clean = re.sub(r"</?action>", "", line_lower)
+                
+                # 检查是否以动词开头
+                for v in valid_verbs:
+                    if line_clean.startswith(v):
+                        action_content = line_clean
+                        break
+                if action_content: break
+            
+            # 如果还没找到，尝试直接查找 "Action:" 标记
+            if not action_content:
+                parts = re.split(r"action\s*:", clean_text, flags=re.IGNORECASE)
+                if len(parts) > 1:
+                    action_content = parts[-1].strip().split('\n')[0]
+
+        # --- 策略 3: 最后的兜底 ---
+        # 如果依然为空，且文本很短，可能整个文本就是动作
+        if not action_content and len(text.strip()) < 50:
+             action_content = text.strip()
+
+        return think_content, action_content
+
+    # ---------------- [修改] Step 方法 ----------------
     def step(self, text_actions: List[str]):
-        actions, valids = self.projection_f(text_actions, self.envs.get_admissible_commands)
+        # 1. 预处理：提取纯净指令
+        parsed_actions = []
+        parsed_thinks = []
+        
+        for t in text_actions:
+            think_str, act_str = self._parse_model_output(t)
+            parsed_thinks.append(think_str)
+            # 如果解析失败，这里先给一个空字符串，让下面的 projection_f 去处理或 fallback
+            parsed_actions.append(act_str if act_str else "look") 
+            
+        # 2. 投影与执行
+        # 必须传给 projection_f 清洗后的动作
+        actions, valids = self.projection_f(parsed_actions, self.envs.get_admissible_commands)
+        
+        # 执行环境步
         text_obs, image_obs, rewards, dones, infos = self.envs.step(actions)
         
         self.memory.store({'text_obs': self.pre_text_obs, 'action': actions})
@@ -124,36 +220,55 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
 
         full_text_obs = self.build_text_obs(text_obs, self.envs.get_admissible_commands)
         
-        # --- [Fix V3.1] 强力防止 ID 错位 ---
+        # --- [Fix V3.3] 强制结构化存储 ---
         for i, info in enumerate(infos):
-            is_done = to_numpy(dones[i])
+            final_action_str = ""
+            raw_act = actions[i]
             
-            # 1. 如果 Done=True，obs 已经是新任务了，但 info 可能还残留旧任务的 ID
-            #    必须强制清除旧缓存，避免"僵尸 ID"附着在新任务上
-            if is_done:
-                self.gamefiles[i] = None # 🔥 清空缓存，不再信任旧 ID
-                # 如果 info 里有旧 ID，最好也删掉或者标记为过期，
-                # 但为了不破坏 Reward 计算（可能需要旧 ID 算分），我们不动 info 里的原始数据，
-                # 只是不让它更新进 self.gamefiles，也不让它作为新 Obs 的 ID。
-                
-                # 尝试从 info 获取新 ID (有些环境 wrapper 会在 done 时把 next_info 放进去)
-                # 但通常比较混乱，所以最安全的是：
-                # 新任务暂时标记为 unknown，等待下一次 step 或通过 text_obs 解析
-                pass 
+            # A. 优先从索引还原 (最准确，绝对纯净)
+            if isinstance(raw_act, (int, np.integer)) or (hasattr(raw_act, 'item') and isinstance(raw_act.item(), int)):
+                idx = int(raw_act)
+                admissible = self.envs.get_admissible_commands[i]
+                if 0 <= idx < len(admissible):
+                    final_action_str = admissible[idx]
+                else:
+                    final_action_str = "look"
+            
+            # B. 其次使用解析出的 parsed_actions (纯文本)
+            elif parsed_actions[i] and parsed_actions[i] != "look":
+                final_action_str = parsed_actions[i]
+            
+            # C. 绝对不要使用原始 raw_output 作为 action，除非它非常短
             else:
-                # 2. 如果没 Done，且环境没给 ID，尝试用缓存恢复
+                raw_text = str(text_actions[i])
+                if len(raw_text) < 50: 
+                    final_action_str = raw_text
+                else:
+                    final_action_str = "look" # 放弃治疗，标记为 look，防止污染 DB
+
+            # 存入 Info
+            info['executed_action_str'] = final_action_str
+            info['parsed_think'] = parsed_thinks[i] 
+            info['is_action_valid'] = to_numpy(valids[i])
+            
+            # 🔥 [结构化存储] 供 STDB 读取
+            info['step_details'] = {
+                "thought": parsed_thinks[i],
+                "action": final_action_str,       # 这里应该是干净的 "put cd 1 safe 1"
+                "raw_output": text_actions[i]
+            }
+
+            # D. ID 与 Task Type 维护
+            is_done = to_numpy(dones[i])
+            if is_done:
+                self.gamefiles[i] = None 
+            else:
                 current_gf = info.get("extra.gamefile")
                 if current_gf:
-                    self.gamefiles[i] = current_gf # 更新缓存
+                    self.gamefiles[i] = current_gf 
                 elif self.gamefiles[i]:
-                    info['extra.gamefile'] = self.gamefiles[i] # 恢复 ID
+                    info['extra.gamefile'] = self.gamefiles[i] 
 
-            # 3. 记录验证位
-            info['is_action_valid'] = to_numpy(valids[i])
-            info['executed_action_str'] = str(actions[i])
-            
-            # 4. 重新注入 Task Type (基于当前这一帧的 ID 或 文本)
-            # 注意：如果是 Done 帧，这里注入的应该是 unknown 或者尝试从 text_obs 解析
             self._inject_task_type(info, text_obs[i])
 
         next_observations = {'text': full_text_obs, 'image': image_obs, 'anchor': text_obs}
@@ -162,16 +277,13 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
 
         return next_observations, rewards, dones, infos
     
+    # ---------------- 修改 _inject_task_type 方法 ----------------
     def _inject_task_type(self, info, obs_text):
-        """辅助函数：安全地注入 task_type"""
+        """辅助函数：安全地注入 task_type，增加基于 Obs 的兜底"""
+        task_type = "unknown"
+        
         # 1. 优先从 gamefile 路径提取
         gf_path = info.get("extra.gamefile", "")
-        # 如果是 Done 后的第一帧，info 可能残留旧 ID，这里要做个简单的防御：
-        # 如果 info 里的 ID 和 obs_text 严重不符（例如 ID 是 Cup，Text 是 CD），那这就是错位。
-        # 但这里很难做这种语义检查。
-        # 最简单的策略：如果 external code 已经清空了 gamefile (在 Done 时)，这里就会由 unknown 接管。
-        
-        task_type = "unknown"
         if gf_path:
             try:
                 if '/' in gf_path:
@@ -181,6 +293,16 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
                     task_type = gf_path.split('-')[0]
             except: pass
         
+        # 2. 🔥 [新增] 如果路径提取失败，从 Obs 文本推断 (ALFWorld 特性)
+        if task_type == "unknown" and obs_text:
+            lower_obs = obs_text.lower()
+            if "cool" in lower_obs and "fridge" in lower_obs: task_type = "cool_object"
+            elif "heat" in lower_obs and "microwave" in lower_obs: task_type = "heat_object"
+            elif "lamp" in lower_obs or "light" in lower_obs: task_type = "look_at_obj_in_light"
+            elif "clean" in lower_obs and "sink" in lower_obs: task_type = "clean_object" # clean 通常伴随 sink/basin
+            elif "two" in lower_obs: task_type = "pick_two_obj_and_place"
+            elif "put" in lower_obs or "find" in lower_obs: task_type = "pick_and_place_simple" # 最常见类型作为兜底
+            
         info['task_type'] = task_type
         if 'observation_text' not in info:
             info['observation_text'] = obs_text

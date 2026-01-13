@@ -207,11 +207,12 @@ def compute_ccapo_advantages(
     """CCAPO 优势计算 (ALFWORLD In-Memory 完整版)"""
     match_logger.info("\n=== [CCAPO Algo Start (GigPO Core + Pipeline)] ===")
     
-    # 1. 初始化默认值 (防止 Key Error)
+    # 1. 初始化默认值 (防止 Key Error 和 Batch 长度不一致)
     default_keys = {
         'R_core_raw': 0.0, 'R_match_raw': 0.0, 'R_format_penalty': 0.0,
         'Z_novelty': 0.0, 'R_repetition': 0.0, 'R_step': 0.0,
-        'A_traj': 0.0, 'A_step': 0.0, 'advantages': 0.0 # 默认有值
+        'A_traj': 0.0, 'A_step': 0.0, 'advantages': 0.0, # 默认有值
+        'is_anchor': False # 🔥 [Fix] 必须给所有步骤设置默认值，否则 collate 时长度不匹配！
     }
     for step in g_calc_steps:
         for k, v in default_keys.items():

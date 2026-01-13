@@ -25,7 +25,7 @@ TRAIN_BATCH_SIZE=8    # PPO update 的 batch size (必须 <= 训练集数量 * r
 VAL_BATCH_SIZE=8       # 验证时的 batch size
 GROUP_SIZE=4           # 组内样本数 (GRPO/CCAPO 核心参数)
 EXPERIMENT_NAME="ccapo_alfworld_real_run1"
-MAX_STEPS=50           # 环境最大步数
+MAX_STEPS=25           # 环境最大步数
 # ===========================================
 
 echo ">>> [1/2] Generating/Updating Real ALFWorld Data..."
