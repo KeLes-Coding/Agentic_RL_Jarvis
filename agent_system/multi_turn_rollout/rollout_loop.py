@@ -49,44 +49,31 @@ class TrajectoryCollector:
         """
         Process a single observation sample, organizing environment observations (text and/or images) 
         into a format processable by the model.
-        
-        Parameters:
-            item (int): Sample index in the batch
-            gen_batch (DataProto): Batch data containing original prompts
-            obs (Dict): Environment observation, may contain 'text', 'image', 'anchor' keys
-        
-        Returns:
-            dict: Contains processed input data such as input_ids, attention_mask, etc.
         """
+        # --- ✅ [修复] 安全提取 Image，防止 NoneType 报错 ---
+        obs_texts = obs.get('text', None)
+        obs_images = obs.get('image', None)
+        obs_anchors = obs.get('anchor', None)
+        
+        # 安全获取当前 item 的数据
+        obs_text = obs_texts[item] if obs_texts is not None else None
+        
+        # 关键修复：先判断 obs_images 是否为 None，再进行索引
+        obs_image = obs_images[item] if obs_images is not None else None
+        
+        obs_anchor = obs_anchors[item] if obs_anchors is not None else None
+        is_multi_modal = obs_image is not None
 
-        print(f"\n--- 监控: 进入 preprocess_single_sample (item {item}) ---")
-        obs_text_sample = obs.get('text', [''])[item]
-        print(f"收到的 obs['text'] (前200字符): '{obs_text_sample[:200]}'")
-        print(f"收到的 obs['image'] 类型: {type(obs.get('image', [None])[item])}")
+        # 调试打印 (可选，已修复)
+        # print(f"--- preprocess_single_sample item {item} | Image: {type(obs_image)} ---")
 
         raw_prompt = gen_batch.non_tensor_batch['raw_prompt'][item]
         data_source = gen_batch.non_tensor_batch['data_source'][item]
         
         # --- 新增: 提取 ground_truth_answer ---
-        # 使用 .get() 来安全地获取，如果键不存在，则提供一个默认值
         ground_truth_answer = gen_batch.non_tensor_batch.get('ground_truth_answer', [""]*len(gen_batch.non_tensor_batch['raw_prompt']))[item]
 
-        
-        # Get observation components
-        obs_texts = obs.get('text', None)
-        obs_images = obs.get('image', None)
-        obs_anchors = obs.get('anchor', None)
-        obs_text = obs_texts[item] if obs_texts is not None else None
-        obs_image = obs_images[item] if obs_images is not None else None
-        obs_anchor = obs_anchors[item] if obs_anchors is not None else None
-        is_multi_modal = obs_image is not None
-
         _obs_anchor = torch_to_numpy(obs_anchor, is_object=True) if isinstance(obs_anchor, torch.Tensor) else obs_anchor
-
-        # Build chat structure
-        # obs_content = raw_prompt[0]['content']
-        # if '<image>' in obs_content: 
-        #     obs_content = obs_content.replace('<image>', '')
 
         # Build chat structure
         obs_content = ''
@@ -94,7 +81,6 @@ class TrajectoryCollector:
             obs_content += obs_text
         else:
             print(f"Warning: No text observation found!")
-
         
         chat = np.array([{
             "content": obs_content,
@@ -108,8 +94,6 @@ class TrajectoryCollector:
             tokenize=False
         )
 
-        print(f"生成的 prompt_with_chat_template (前200字符): '{prompt_with_chat_template[:200]}'")
-        
         # Initialize return dict
         row_dict = {}
         
@@ -146,16 +130,13 @@ class TrajectoryCollector:
                                                                          left_pad=True,
                                                                          truncation=self.config.data.truncation,)
         
-        
-
         if is_multi_modal:
-
             position_ids = get_rope_index(
                 self.processor,
                 input_ids=input_ids[0],
                 image_grid_thw=image_grid_thw,
                 attention_mask=attention_mask[0],
-            )  # (3, seq_len)
+            ) 
         else:
             position_ids = compute_position_id_with_mask(attention_mask)
 
@@ -181,16 +162,11 @@ class TrajectoryCollector:
             'anchor_obs': _obs_anchor,
             'index': item,
             'data_source': data_source,
-            # --- 新增: 将 ground_truth_answer 添加到样本字典中 ---
             'ground_truth_answer': ground_truth_answer,
         })
 
         if self.config.data.get('return_raw_chat', False):
             row_dict['raw_prompt'] = chat.tolist()
-
-        print(f"最终 raw_prompt (前200字符): '{raw_prompt[:200]}'")
-        print(f"检查 '<|image_pad|>' 是否在最终 raw_prompt 中: {'<|image_pad|>' in raw_prompt}")
-        print(f"--- 监控: 退出 preprocess_single_sample (item {item}) ---\n")
 
         return row_dict
 
@@ -308,7 +284,15 @@ class TrajectoryCollector:
             ) -> DataProto:
         """
         为物理设备环境优化的轨迹收集循环。
+        [Modified] 支持 env.rollout.n > 1 的自动 Batch 扩展。
         """
+        
+        # [CCAPO/GRPO Fix] 如果配置了 n > 1 (如 Group Sampling)，需要先扩充 batch
+        # 否则 8 个 prompt 无法对应 32 个环境，导致后面的 Assert 失败
+        if self.config.env.rollout.n > 1:
+            # interleave=True: [A, B] -> [A, A, B, B] (符合 Group ID 分组逻辑)
+            gen_batch = gen_batch.repeat(repeat_times=self.config.env.rollout.n, interleave=True)
+
         # ======================= ✅ 1. 准备并传递任务信息给 reset 方法 ✅ =======================
         tasks_for_this_batch = []
         try:
@@ -342,10 +326,10 @@ class TrajectoryCollector:
         lenght_obs = len(obs['text']) if obs['text'] is not None else len(obs['image'])
 
         # 对于物理环境，我们期望批次大小与环境数直接匹配。
-        # 不再使用 gen_batch.repeat()，因为它适用于可无限实例化的模拟环境。
+        # [CCAPO Note] 现在 gen_batch 已经通过上面的 repeat 扩充过了，所以这里应该相等了。
         assert len(gen_batch.batch) == lenght_obs, \
-            f"对于物理设备环境，初始数据批次大小 ({len(gen_batch.batch)}) 必须与检测到的设备数 ({lenght_obs}) 完全匹配。" \
-            "请检查你的 data.train_batch_size 和 data.val_batch_size 配置。"
+            f"Batch Size mismatch! Input Batch: {len(gen_batch.batch)}, Envs: {lenght_obs}. " \
+            f"If you use rollout.n > 1, ensure batch expansion logic is active."
 
         batch_size = len(gen_batch.batch['input_ids'])
         batch_output = None
@@ -353,6 +337,7 @@ class TrajectoryCollector:
         if self.config.env.rollout.n > 0:
             uid_batch = []
             for i in range(batch_size):
+                # 这里的逻辑假设 batch 是 [A, A, B, B]，每 n 个样本共享一个 UID
                 if i % self.config.env.rollout.n == 0:
                     uid = str(uuid.uuid4())
                 uid_batch.append(uid)
@@ -394,7 +379,7 @@ class TrajectoryCollector:
             print("\n" + "="*50)
             print(f"--- 监控: 即将输入到 LLM 的完整 Prompt (Batch Item 0) (Step {_step+1}) ---")
             full_prompt_for_llm = self.tokenizer.decode(batch.batch['input_ids'][0], skip_special_tokens=False)
-            print(full_prompt_for_llm)
+            # print(full_prompt_for_llm)
             print("="*50 + "\n")
 
             batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]

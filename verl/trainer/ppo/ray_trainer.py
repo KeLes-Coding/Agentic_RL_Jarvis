@@ -94,6 +94,7 @@ class AdvantageEstimator(str, Enum):
     RLOO = "rloo"
     GRPO_PASSK = "grpo_passk"
     GiGPO = 'gigpo'
+    CCAPO = 'ccapo'
 
 
 @dataclass
@@ -355,6 +356,29 @@ def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_re
             )
         data.batch['advantages'] = advantages
         data.batch['returns'] = returns
+    elif adv_estimator == AdvantageEstimator.CCAPO:
+        # [新增] CCAPO Advantage 计算
+        # 当前阶段：作为 Dense Reward 的 Group Relative Policy Optimization (GRPO)
+        # 注意：这里我们暂时复用 GRPO 的 Outcome Advantage 接口。
+        # 原理：CCAPO Reward Manager 产生的 Dense Reward 会被求和成为 total return。
+        # 即使只用 Outcome Logic，更密集的 Reward 也能减少方差。
+        # 未来升级：可以在这里引入 Step-wise Group Normalization。
+        
+        # 确保如果是多轮对话，使用正确的 mask
+        grpo_calculation_mask = data.batch["response_mask"]
+        if multi_turn:
+            response_length = grpo_calculation_mask.size(1)
+            grpo_calculation_mask = data.batch["loss_mask"][:, -response_length:]
+
+        advantages, returns = core_algos.compute_grpo_outcome_advantage(
+            token_level_rewards=data.batch["token_level_rewards"],
+            response_mask=grpo_calculation_mask,
+            index=data.non_tensor_batch["uid"],
+            traj_index=data.non_tensor_batch['traj_uid'],
+            norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
+        )
+        data.batch["advantages"] = advantages
+        data.batch["returns"] = returns
     else:
         raise NotImplementedError
     return data
@@ -449,7 +473,8 @@ class RayPPOTrainer:
             AdvantageEstimator.REMAX,
             AdvantageEstimator.RLOO,
             AdvantageEstimator.REINFORCE_PLUS_PLUS_BASELINE,
-            AdvantageEstimator.GiGPO
+            AdvantageEstimator.GiGPO,
+            AdvantageEstimator.CCAPO
         ]:
             self.use_critic = False
         else:

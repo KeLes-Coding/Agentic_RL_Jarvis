@@ -133,16 +133,31 @@ class TaskRunner:
             mapping[Role.RefPolicy] = global_pool_id
 
         reward_manager_name = config.reward_model.get("reward_manager", "episode")
+        # if reward_manager_name == 'episode':
+        #     from agent_system.reward_manager.episode import EpisodeRewardManager
+        #     reward_manager_cls = EpisodeRewardManager
+        # else:
+        #     raise NotImplementedError
+
+        # reward_fn = reward_manager_cls(tokenizer=tokenizer, num_examine=0, normalize_by_length=False)
+
+        # # Note that we always use function-based RM for validation
+        # val_reward_fn = reward_manager_cls(tokenizer=tokenizer, num_examine=1, normalize_by_length=False)
         if reward_manager_name == 'episode':
             from agent_system.reward_manager.episode import EpisodeRewardManager
-            reward_manager_cls = EpisodeRewardManager
+            # 保持原有逻辑
+            reward_fn = EpisodeRewardManager(tokenizer=tokenizer, num_examine=0, normalize_by_length=False)
+            val_reward_fn = EpisodeRewardManager(tokenizer=tokenizer, num_examine=1, normalize_by_length=False)
+            
+        elif reward_manager_name == 'ccapo':
+            print("[Main]>>> Using CCAPO Reward Manager")
+            from CCAPO.reward_manager import CCAPORewardManager
+            # CCAPO 需要 config 来读取 STDB 和 Reward 相关的超参
+            reward_fn = CCAPORewardManager(tokenizer=tokenizer, num_examine=0, config=config)
+            val_reward_fn = CCAPORewardManager(tokenizer=tokenizer, num_examine=1, config=config)
+            
         else:
-            raise NotImplementedError
-
-        reward_fn = reward_manager_cls(tokenizer=tokenizer, num_examine=0, normalize_by_length=False)
-
-        # Note that we always use function-based RM for validation
-        val_reward_fn = reward_manager_cls(tokenizer=tokenizer, num_examine=1, normalize_by_length=False)
+            raise NotImplementedError(f"Unknown reward_manager: {reward_manager_name}")
 
         resource_pool_manager = ResourcePoolManager(resource_pool_spec=resource_pool_spec, mapping=mapping)
 

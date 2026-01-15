@@ -249,6 +249,16 @@ algorithm:
   gigpo:
     step_advantage_w: 1.0
     mode: "mean_norm" # "mean_norm" or "mean_std_norm"
+  # ================= [新增 CCAPO 配置] =================
+  ccapo:
+    stdb_save_path: null      # STDB 存储路径 (例如: stdb/alfworld.pkl)
+    stdb_top_k: 1             # 仅保留 Top K 最优轨迹作为 Anchor
+    r_exec_on: 0.2            # Execution Stream: 在骨架上的奖励
+    r_exec_off: -0.01         # Execution Stream: 偏离骨架的惩罚
+    r_logic_scale: 0.05       # Logic Stream: 抽象共识奖励系数
+    r_milestone: 0.3          # Milestone: 里程碑事件奖励
+    r_loop_penalty: -0.5      # Aux: 死循环惩罚
+  # ====================================================
   filter_groups: # DAPO from https://arxiv.org/abs/2503.14476
     enable: False
     max_num_gen_batches: 10
