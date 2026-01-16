@@ -64,9 +64,6 @@ class TrajectoryCollector:
         obs_anchor = obs_anchors[item] if obs_anchors is not None else None
         is_multi_modal = obs_image is not None
 
-        # 调试打印 (可选，已修复)
-        # print(f"--- preprocess_single_sample item {item} | Image: {type(obs_image)} ---")
-
         raw_prompt = gen_batch.non_tensor_batch['raw_prompt'][item]
         data_source = gen_batch.non_tensor_batch['data_source'][item]
         
@@ -96,6 +93,11 @@ class TrajectoryCollector:
 
         # Initialize return dict
         row_dict = {}
+        
+        # --- ✅ [修复] 强制统一 Keys，防止 DataProto.concat 失败 ---
+        # 无论是否有图像，都初始化这些键，确保所有 batch 的结构一致
+        row_dict['multi_modal_data'] = None
+        row_dict['multi_modal_inputs'] = None
         
         # Process multimodal data
         if is_multi_modal:
@@ -223,16 +225,7 @@ class TrajectoryCollector:
             ) -> DataProto:
         """
         Collect and organize trajectory data, handling batch size adjustments to meet parallel training requirements.
-        
-        Parameters:
-            total_batch_list (List[List[Dict]): List of trajectory data for each environment
-            episode_rewards (np.ndarray): Total rewards for each environment
-            episode_lengths (np.ndarray): Total steps for each environment
-            success (Dict[str, np.ndarray]): Success samples for each environment
-            traj_uid (np.ndarray): Trajectory unique identifiers
-        
-        Returns:
-            DataProto: Collected and organized trajectory data
+        [Modified] Sanitizes success metrics to ensure consistent keys for DataProto concatenation.
         """
         batch_size = len(total_batch_list)
 
@@ -246,8 +239,20 @@ class TrajectoryCollector:
 
         success_rate = {}
         for key, value in success.items():
-            success_rate[key] = np.mean(value)
+            if len(value) > 0:
+                success_rate[key] = np.mean(value)
+            else:
+                success_rate[key] = 0.0
         
+        # --- ✅ [Fix] Sanitize keys to prevent DataProto.concat mismatch ---
+        # 仅保留通用的 'success_rate' 键。
+        # 任务特定的 keys (如 'pick_and_place_success_rate') 会随 batch 内容变化，
+        # 导致验证阶段 DataProto.concat 失败。
+        safe_success_rate = {}
+        if 'success_rate' in success_rate:
+            safe_success_rate['success_rate'] = success_rate['success_rate']
+        # -------------------------------------------------------------------
+
         effective_batch = []
         for bs in range(batch_size):
             # sum the rewards for each data in total_batch_list[bs]
@@ -264,8 +269,9 @@ class TrajectoryCollector:
                     data['episode_lengths_mean'] = episode_lengths_mean
                     data['episode_lengths_min'] = episode_lengths_min
                     data['episode_lengths_max'] = episode_lengths_max
-                    # success_rate
-                    for key, value in success_rate.items():
+                    
+                    # success_rate (Use sanitized dict)
+                    for key, value in safe_success_rate.items():
                         data[key] = value
 
                     effective_batch.append(data)
@@ -285,6 +291,8 @@ class TrajectoryCollector:
         """
         为物理设备环境优化的轨迹收集循环。
         [Modified] 支持 env.rollout.n > 1 的自动 Batch 扩展。
+        [Modified] 支持 Partial Batch (Padding & Slicing) 以防止验证集末尾崩溃。
+        [Modified] 修复 infos 传递问题，确保 STDB 能接收到 ccapo_trajectory。
         """
         
         # [CCAPO/GRPO Fix] 如果配置了 n > 1 (如 Group Sampling)，需要先扩充 batch
@@ -324,14 +332,15 @@ class TrajectoryCollector:
         # ====================================================================================
 
         lenght_obs = len(obs['text']) if obs['text'] is not None else len(obs['image'])
-
-        # 对于物理环境，我们期望批次大小与环境数直接匹配。
-        # [CCAPO Note] 现在 gen_batch 已经通过上面的 repeat 扩充过了，所以这里应该相等了。
-        assert len(gen_batch.batch) == lenght_obs, \
-            f"Batch Size mismatch! Input Batch: {len(gen_batch.batch)}, Envs: {lenght_obs}. " \
-            f"If you use rollout.n > 1, ensure batch expansion logic is active."
-
         batch_size = len(gen_batch.batch['input_ids'])
+
+        # --- Fix for Partial Batches (Allow batch_size < lenght_obs) ---
+        if batch_size < lenght_obs:
+            print(f"Warning: Batch size ({batch_size}) < Envs ({lenght_obs}). Padding actions and slicing returns will be applied.")
+        elif batch_size > lenght_obs:
+            # This is still a critical error as we can't process more data than we have environments
+            raise AssertionError(f"Batch Size mismatch! Input Batch: {batch_size} > Envs: {lenght_obs}. Cannot handle more data than envs.")
+
         batch_output = None
 
         if self.config.env.rollout.n > 0:
@@ -357,7 +366,8 @@ class TrajectoryCollector:
         # 注意：这里的 'task' 依赖于 envs 对象正确地存储了任务信息
         if hasattr(envs, 'info_pool_managers') and hasattr(envs, 'tasks'):
             for i in range(len(infos)):
-                if i in envs.info_pool_managers:
+                # Only record for the active batch
+                if i < batch_size and i in envs.info_pool_managers:
                     step_data = {
                         "task": envs.tasks[i],
                         "thought": "Episode started.",
@@ -461,7 +471,35 @@ class TrajectoryCollector:
                 print(traceback.format_exc())
             # ==============================================================================
 
-            next_obs, rewards, dones, infos = envs.step(text_actions)
+            # --- Pad actions to match environment workers if batch is smaller ---
+            if len(text_actions) < lenght_obs:
+                pad_width = lenght_obs - len(text_actions)
+                padded_actions = text_actions + ["look"] * pad_width
+            else:
+                padded_actions = text_actions
+
+            next_obs, rewards, dones, infos = envs.step(padded_actions)
+
+            # --- Slice returns back to batch_size ---
+            if len(padded_actions) > batch_size:
+                if next_obs['text'] is not None:
+                    next_obs['text'] = next_obs['text'][:batch_size]
+                if next_obs['image'] is not None:
+                    next_obs['image'] = next_obs['image'][:batch_size]
+                if next_obs.get('anchor') is not None:
+                    next_obs['anchor'] = next_obs['anchor'][:batch_size]
+                
+                if hasattr(rewards, 'shape') and len(rewards.shape) > 0:
+                     rewards = rewards[:batch_size]
+                elif isinstance(rewards, list):
+                     rewards = rewards[:batch_size]
+                
+                if hasattr(dones, 'shape') and len(dones.shape) > 0:
+                     dones = dones[:batch_size]
+                elif isinstance(dones, list):
+                     dones = dones[:batch_size]
+                
+                infos = infos[:batch_size]
 
             if len(rewards.shape) == 2:
                 rewards = rewards.squeeze(1)
@@ -477,6 +515,11 @@ class TrajectoryCollector:
             episode_lengths[active_masks] += 1
 
             assert len(rewards) == batch_size, f"env should return rewards for all environments, got {len(rewards)} rewards for {batch_size} environments"
+            
+            # --- ✅ [CCAPO FIX] 将 infos 显式注入 batch，确保 RewardManager 能读取到 ccapo_trajectory ---
+            batch.non_tensor_batch['infos'] = np.array(infos, dtype=object)
+            # ----------------------------------------------------------------------------------------
+
             batch.non_tensor_batch['rewards'] = torch_to_numpy(rewards, is_object=True)
             batch.non_tensor_batch['active_masks'] = torch_to_numpy(active_masks, is_object=True)
 
@@ -493,16 +536,12 @@ class TrajectoryCollector:
         # ======================= ✅ 2. 修复超时的终结逻辑 ✅ =======================
         # 确保因超时而结束的轨迹也被正确终结
         for i in range(batch_size):
-            # 如果环境没有被标记为 'done'，说明它是因达到 max_steps 而超时的
-            # 同时检查 info_pool_managers 是否存在且包含该环境的 manager
             if not is_done[i] and hasattr(envs, 'info_pool_managers') and i in envs.info_pool_managers:
                 print(f"--- [rollout_loop.py] 正在为超时的环境 {i} 强制终结日志 ---")
                 final_status = "TIMEOUT"
                 summary_text = f"Task stopped due to reaching max steps ({self.config.env.max_steps})."
 
-                # 检查 info_pool_managers[i] 是否仍然存在
                 if i in envs.info_pool_managers:
-                    # 使用新的 finalize_run 签名，task_completed 明确设置为 False
                     envs.info_pool_managers[i].finalize_run(
                         status=final_status,
                         summary=summary_text,
@@ -510,7 +549,6 @@ class TrajectoryCollector:
                         task=envs.tasks[i],
                         task_completed=False 
                     )
-                    # 终结后从池中移除
                     envs.info_pool_managers.pop(i, None)
         # ========================================================================
 

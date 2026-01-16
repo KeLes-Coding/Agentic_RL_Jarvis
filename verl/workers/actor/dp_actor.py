@@ -80,7 +80,10 @@ class DataParallelPPOActor(BasePPOActor):
         """
         response_length = micro_batch["responses"].size(-1)
         multi_modal_inputs = {}
-        if "multi_modal_inputs" in micro_batch:
+        
+        # --- [修复] 增加对 NoneType 的检查 ---
+        # 只有当键存在且第一个元素不为 None 时，才被视为有效的多模态输入
+        if "multi_modal_inputs" in micro_batch and micro_batch["multi_modal_inputs"][0] is not None:
             for key in micro_batch["multi_modal_inputs"][0].keys():
                 multi_modal_inputs[key] = torch.cat([inputs[key] for inputs in micro_batch["multi_modal_inputs"]], dim=0)
 
@@ -108,7 +111,8 @@ class DataParallelPPOActor(BasePPOActor):
 
                 # pad and slice the inputs if sp > 1
                 if self.use_ulysses_sp:
-                    is_vlm_model = "multi_modal_inputs" in micro_batch
+                    # --- [修复] 同样增加对 None 的检查 ---
+                    is_vlm_model = "multi_modal_inputs" in micro_batch and micro_batch["multi_modal_inputs"][0] is not None
                     if is_vlm_model:
                         # vlm model's inputs will be sliced after embedding
                         input_ids_rmpad, position_ids_rmpad, pad_size = ulysses_pad(
