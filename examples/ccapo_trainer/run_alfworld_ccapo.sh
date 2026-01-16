@@ -42,7 +42,7 @@ MODEL_PATH="/home/zzh/Workspace/modelscope/models/Qwen/Qwen2___5-VL-3B-Instruct"
 export PYTHONPATH=$PYTHONPATH:$(pwd):$(pwd)/agent_system/environments/env_package/alfworld
 
 # ================= 配置区域 =================
-SAMPLE_SIZE=40
+SAMPLE_SIZE=200
 DATA_SEED=42
 TRAIN_RATIO=0.8
 
