@@ -293,6 +293,23 @@ class TrajectoryCollector:
             # interleave=True: [A, B] -> [A, A, B, B] (符合 Group ID 分组逻辑)
             gen_batch = gen_batch.repeat(repeat_times=self.config.env.rollout.n, interleave=True)
 
+        expected_envs = getattr(envs, "num_envs", None)
+        if expected_envs is not None:
+            if len(gen_batch) < expected_envs:
+                pad_size = expected_envs - len(gen_batch)
+                print(
+                    f"Warning: gen_batch size {len(gen_batch)} is smaller than envs {expected_envs}. "
+                    f"Padding with last sample to avoid env/batch mismatch."
+                )
+                pad_batch = gen_batch[-1:].repeat(repeat_times=pad_size, interleave=True)
+                gen_batch = DataProto.concat([gen_batch, pad_batch])
+            elif len(gen_batch) > expected_envs:
+                print(
+                    f"Warning: gen_batch size {len(gen_batch)} is larger than envs {expected_envs}. "
+                    "Trimming to match env count."
+                )
+                gen_batch = gen_batch[:expected_envs]
+
         # ======================= ✅ 1. 准备并传递任务信息给 reset 方法 ✅ =======================
         tasks_for_this_batch = []
         try:

@@ -770,20 +770,24 @@ class RayPPOTrainer:
                 chunk_batch = test_gen_batch[i:i + num_val_envs]
                 
                 # 确保最后一块的大小也正确 (如果需要，可以添加填充逻辑，但通常直接处理即可)
-                if len(chunk_batch) != num_val_envs and len(chunk_batch) > 0:
-                    print(f"Warning: The last validation chunk has size {len(chunk_batch)}, while num_val_envs is {num_val_envs}. This might cause issues if the environment cannot handle smaller batches.")
-                    # 如果环境不能处理小于num_envs的批次，你可能需要在这里跳过或者填充
-                    # continue 
+                original_chunk_size = len(chunk_batch)
+                if original_chunk_size != num_val_envs and original_chunk_size > 0:
+                    print(f"Warning: The last validation chunk has size {original_chunk_size}, while num_val_envs is {num_val_envs}. Padding to avoid env/batch mismatch.")
+                    pad_size = num_val_envs - original_chunk_size
+                    pad_batch = chunk_batch[-1:].repeat(repeat_times=pad_size, interleave=True)
+                    chunk_batch = DataProto.concat([chunk_batch, pad_batch])
                 
                 if len(chunk_batch) == 0:
                     continue
 
                 output_chunk = self.traj_collector.multi_turn_loop(
-                    gen_batch=chunk_batch,
-                    actor_rollout_wg=self.actor_rollout_wg,
-                    envs=self.val_envs,
+                    chunk_batch,
+                    self.actor_rollout_wg,
+                    self.val_envs,
                     is_train=False,
                 )
+                if original_chunk_size > 0 and original_chunk_size != num_val_envs:
+                    output_chunk = output_chunk[:original_chunk_size]
                 all_output_batches.append(output_chunk)
             
             # 将所有处理完的块合并回一个大的 batch
