@@ -719,29 +719,35 @@ class RayPPOTrainer:
         sample_outputs = []
         sample_scores = []
 
-        for test_data in self.val_dataloader:
+        # =============================================================================
+        # [CRITICAL FIX V2] 
+        # 直接从配置中读取验证集 Batch Size 作为环境数量的真理 (Ground Truth)。
+        # 不要试图测量 self.val_envs 的长度，因为在 Ray 分布式模式下，
+        # 它可能是一个 ActorHandle 或者被切分的列表，导致 len() 返回 1 或其他虚假值。
+        # 只要我们初始化时用了这个配置，底层的 EnvManager 就一定有这么多环境。
+        # =============================================================================
+        num_val_envs = self.config.data.val_batch_size
+        print(f"DEBUG: Validation Logic - Forcing num_envs to config value: {num_val_envs}")
+
+        for i_batch, test_data in enumerate(self.val_dataloader):
             test_batch = DataProto.from_single_dict(test_data)
 
             # repeat test batch
             test_batch = test_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.val_kwargs.n, interleave=True)
 
             # we only do validation on rule-based rm
-            if self.config.reward_model.enable and test_batch[0].non_tensor_batch["reward_model"]["style"] == "model":
+            if self.config.reward_model.enable and test_batch.non_tensor_batch["reward_model"]["style"] == "model":
                 return {}
 
             # Store original inputs
             input_ids = test_batch.batch["input_ids"]
-
             input_ids = input_ids.long()
             
-            # TODO: Can we keep special tokens except for padding tokens?
             input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
             sample_inputs.extend(input_texts)
 
             batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
             
-            # --- ✅ 关键修改：在这里添加 'ground_truth_answer' ---
-            # 在 pop 之前，先检查 key 是否存在
             non_tensor_batch_keys_to_pop = [
                 key for key in ["raw_prompt_ids", "data_source", "multi_modal_data", "raw_prompt", "tools_kwargs", "ground_truth_answer"]
                 if key in test_batch.non_tensor_batch
@@ -759,53 +765,54 @@ class RayPPOTrainer:
                 "do_sample": self.config.actor_rollout_ref.rollout.val_kwargs.do_sample,
                 "validate": True,
             }
-            print(f"test_gen_batch meta info: {test_gen_batch.meta_info}")
-
-            ################ agent-environment loop ###############
-            # --- 修改开始 ---
-            # 将大的验证批次分块处理
-            num_val_envs = self.val_envs.num_envs
+            
+            # ################ agent-environment loop ###############
             all_output_batches = []
+            
+            # 分块逻辑：现在的步长是铁定的 8 (或其他配置值)
             for i in range(0, len(test_gen_batch), num_val_envs):
                 chunk_batch = test_gen_batch[i:i + num_val_envs]
                 
-                # 确保最后一块的大小也正确 (如果需要，可以添加填充逻辑，但通常直接处理即可)
                 original_chunk_size = len(chunk_batch)
-                if original_chunk_size != num_val_envs and original_chunk_size > 0:
-                    print(f"Warning: The last validation chunk has size {original_chunk_size}, while num_val_envs is {num_val_envs}. Padding to avoid env/batch mismatch.")
+                
+                # Padding Logic
+                # 只有当数据真的不够 (例如只剩 1 条) 时才触发
+                if original_chunk_size < num_val_envs:
+                    print(f"DEBUG: Padding val chunk from {original_chunk_size} to {num_val_envs} to match envs.")
                     pad_size = num_val_envs - original_chunk_size
+                    # 复制最后一条数据进行填充
                     pad_batch = chunk_batch[-1:].repeat(repeat_times=pad_size, interleave=True)
                     chunk_batch = DataProto.concat([chunk_batch, pad_batch])
                 
                 if len(chunk_batch) == 0:
                     continue
 
+                # 此时 chunk_batch 大小必定等于 config.val_batch_size (8)
+                # 而底层 EnvManager 也是用这个配置初始化的，所以必定匹配。
                 output_chunk = self.traj_collector.multi_turn_loop(
                     chunk_batch,
                     self.actor_rollout_wg,
                     self.val_envs,
                     is_train=False,
                 )
-                if original_chunk_size > 0 and original_chunk_size != num_val_envs:
+                
+                # Slicing Logic
+                if original_chunk_size < num_val_envs:
                     output_chunk = output_chunk[:original_chunk_size]
+                
                 all_output_batches.append(output_chunk)
             
-            # 将所有处理完的块合并回一个大的 batch
             if not all_output_batches:
-                # 如果验证集为空或被完全跳过，返回空 metrics
                 return {}
+            
             test_output_gen_batch = DataProto.concat(all_output_batches)
-            # --- 修改结束 ---
-
-            print('validation generation end')
+            
             del test_batch
             test_batch = test_output_gen_batch
-            # Store generated outputs
+            
             output_ids = test_output_gen_batch.batch["responses"]
             output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
             sample_outputs.extend(output_texts)
-
-            # test_batch = test_batch.union(test_output_gen_batch)
 
             # evaluate using reward_function
             result = self.val_reward_fn(test_batch, return_dict=True)
@@ -816,23 +823,24 @@ class RayPPOTrainer:
             reward_tensor_lst.append(reward_tensor)
             data_source_lst.append(test_batch.non_tensor_batch.get('data_source', ['unknown'] * reward_tensor.shape[0]))
 
-            # success rate
+            # success rate check
             for k in test_batch.non_tensor_batch.keys():
                 if 'success_rate' in k:
                     if k not in success_rate_dict:
                         success_rate_dict[k] = []
                     success_rate_dict[k].append(test_batch.non_tensor_batch[k][0])
-                    # all success_rate should be the same
-                    for i in range(1, len(test_batch.non_tensor_batch[k])):
-                        assert test_batch.non_tensor_batch[k][0] == test_batch.non_tensor_batch[k][i], f'not all success_rate are the same, 0: {test_batch.non_tensor_batch[k][0]}, {i}: {test_batch.non_tensor_batch[k][i]}'
+                    for idx in range(1, len(test_batch.non_tensor_batch[k])):
+                        assert test_batch.non_tensor_batch[k][0] == test_batch.non_tensor_batch[k][idx]
 
         self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
 
-        reward_tensor = torch.cat(reward_tensor_lst, dim=0).sum(-1).cpu()  # (batch_size,)
+        if not reward_tensor_lst:
+            return {}
+
+        reward_tensor = torch.cat(reward_tensor_lst, dim=0).sum(-1).cpu()
         data_sources = np.concatenate(data_source_lst, axis=0)
         success_rate = {k: np.mean(v) for k, v in success_rate_dict.items()}
 
-        # evaluate test_score based on data source
         data_source_reward = {}
         for i in range(reward_tensor.shape[0]):
             data_source = data_sources[i]

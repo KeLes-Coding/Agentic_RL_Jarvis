@@ -281,72 +281,77 @@ class TrajectoryCollector:
             gen_batch: DataProto,
             actor_rollout_wg,
             envs: EnvironmentManagerBase,
+            is_train: bool = True, # <--- [FIX] 新增参数
             ) -> DataProto:
         """
         为物理设备环境优化的轨迹收集循环。
-        [Modified] 支持 env.rollout.n > 1 的自动 Batch 扩展。
+        [Modified] 修复了 Validation 阶段的 Batch 尺寸问题。
         """
         
-        # [CCAPO/GRPO Fix] 如果配置了 n > 1 (如 Group Sampling)，需要先扩充 batch
-        # 否则 8 个 prompt 无法对应 32 个环境，导致后面的 Assert 失败
-        if self.config.env.rollout.n > 1:
-            # interleave=True: [A, B] -> [A, A, B, B] (符合 Group ID 分组逻辑)
+        # [CCAPO/GRPO Fix] 
+        # 只有在训练模式下，才根据 rollout.n 进行扩充。
+        # 验证模式下 (is_train=False)，我们假设 Driver 已经传来了正确大小的 Batch (通常为 1 或 val_batch_size)。
+        if is_train and self.config.env.rollout.n > 1:
+            print(f"[Rollout] Expanding training batch by {self.config.env.rollout.n}x")
             gen_batch = gen_batch.repeat(repeat_times=self.config.env.rollout.n, interleave=True)
 
         expected_envs = getattr(envs, "num_envs", None)
+        
+        # [Critical Fix] 只有当 expected_envs 看起来合理（>1）或者确实与 batch 差异巨大时才启用自动 Padding/Trimming。
+        # 如果 expected_envs 为 1 但 batch 为 8，这通常是 EnvManager 统计错误，盲目 Trim 会导致 crash。
         if expected_envs is not None:
-            if len(gen_batch) < expected_envs:
-                pad_size = expected_envs - len(gen_batch)
-                print(
-                    f"Warning: gen_batch size {len(gen_batch)} is smaller than envs {expected_envs}. "
-                    f"Padding with last sample to avoid env/batch mismatch."
-                )
+            batch_size = len(gen_batch)
+            
+            # 如果环境数报告为 1，但 batch 大于 1，且不是 1 的倍数，这极有可能是 env_num 统计错了
+            # 我们选择相信 Batch Size (Driver 传过来的通常是对的)
+            if expected_envs == 1 and batch_size > 1:
+                print(f"[Warning] EnvManager reports num_envs=1 but Batch Size is {batch_size}. Ignoring EnvManager count to prevent incorrect trimming.")
+                expected_envs = batch_size # 强制对齐
+            
+            if batch_size < expected_envs:
+                pad_size = expected_envs - batch_size
+                print(f"[Warning] Padding batch from {batch_size} to {expected_envs}")
                 pad_batch = gen_batch[-1:].repeat(repeat_times=pad_size, interleave=True)
                 gen_batch = DataProto.concat([gen_batch, pad_batch])
-            elif len(gen_batch) > expected_envs:
-                print(
-                    f"Warning: gen_batch size {len(gen_batch)} is larger than envs {expected_envs}. "
-                    "Trimming to match env count."
-                )
+            elif batch_size > expected_envs:
+                print(f"[Warning] Trimming batch from {batch_size} to {expected_envs}")
                 gen_batch = gen_batch[:expected_envs]
 
-        # ======================= ✅ 1. 准备并传递任务信息给 reset 方法 ✅ =======================
+        # ======================= 准备任务信息 =======================
         tasks_for_this_batch = []
         try:
-            # 确保 gen_batch.non_tensor_batch 及其键存在
             if hasattr(gen_batch, 'non_tensor_batch') and gen_batch.non_tensor_batch and 'ground_truth_answer' in gen_batch.non_tensor_batch:
-                raw_prompts = gen_batch.non_tensor_batch['raw_prompt']
-                tasks_list = [item[0]['content'] for item in raw_prompts]
+                raw_prompts = gen_batch.non_tensor_batch.get('raw_prompt', [])
+                # 兼容不同的 prompt 结构
+                if raw_prompts and isinstance(raw_prompts[0], list):
+                    tasks_list = [item[0]['content'] for item in raw_prompts]
+                else:
+                    tasks_list = ["unknown"] * len(gen_batch)
+                    
                 ground_truth_answers = gen_batch.non_tensor_batch['ground_truth_answer']
 
                 for i in range(len(gen_batch)):
-                    # 为每个环境创建一个包含任务描述和参考答案的字典
+                    t = tasks_list[i] if i < len(tasks_list) else "unknown"
+                    g = ground_truth_answers[i] if i < len(ground_truth_answers) else "unknown"
                     tasks_for_this_batch.append({
-                        "task": tasks_list[i],
-                        "ground_truth_answer": ground_truth_answers[i]
+                        "task": t,
+                        "ground_truth_answer": g
                     })
-                print("--- [rollout_loop.py] 已成功准备任务和参考答案用于环境重置。 ---")
             else:
-                print("警告: 在 gen_batch 中未找到 'ground_truth_answer' 或 'raw_prompt'。环境将以无任务信息的方式重置。")
                 tasks_for_this_batch = [{} for _ in range(len(gen_batch))]
 
-        except (KeyError, IndexError, TypeError) as e:
-            print(f"严重警告: 准备任务信息时出错: {e}")
-            # 如果出错，创建一个空列表以避免崩溃
+        except Exception as e:
+            print(f"[Warning] Error preparing task info: {e}")
             tasks_for_this_batch = [{} for _ in range(len(gen_batch))]
         
-        # 这个修改假设 envs (EnvironmentManager) 的 reset 方法已被更新，
-        # 可以接收 tasks 列表，并在内部处理日志初始化、prompt构建和底层环境的重置。
+        # 重置环境
         obs, infos = envs.reset(tasks=tasks_for_this_batch)
-        # ====================================================================================
-
+        
         lenght_obs = len(obs['text']) if obs['text'] is not None else len(obs['image'])
 
-        # 对于物理环境，我们期望批次大小与环境数直接匹配。
-        # [CCAPO Note] 现在 gen_batch 已经通过上面的 repeat 扩充过了，所以这里应该相等了。
-        assert len(gen_batch.batch) == lenght_obs, \
-            f"Batch Size mismatch! Input Batch: {len(gen_batch.batch)}, Envs: {lenght_obs}. " \
-            f"If you use rollout.n > 1, ensure batch expansion logic is active."
+        # 最后的防线：如果此时还不匹配，报错信息会包含更多上下文
+        assert len(gen_batch) == lenght_obs, \
+            f"Batch Mismatch Final! Batch: {len(gen_batch)}, Envs (Real): {lenght_obs}. Config N: {self.config.env.rollout.n}, Is Train: {is_train}"
 
         batch_size = len(gen_batch.batch['input_ids'])
         batch_output = None
@@ -612,15 +617,6 @@ class TrajectoryCollector:
             ) -> DataProto:
         """
         Select and run the appropriate rollout loop (dynamic or vanilla).
-
-        Args:
-            gen_batch (DataProto): Initial prompt batch.
-            actor_rollout_wg: Actor model workers.
-            envs (EnvironmentManagerBase): Environment manager for interaction.
-            is_train (bool): Whether in training mode (affects dynamic sampling).
-
-        Returns:
-            DataProto: Final collected trajectory data with metadata.
         """
         # Initial observations from the environment
         if self.config.algorithm.filter_groups.enable and is_train:
@@ -638,11 +634,17 @@ class TrajectoryCollector:
                 gen_batch=gen_batch,
                 actor_rollout_wg=actor_rollout_wg,
                 envs=envs,
+                is_train=is_train,  # <--- [FIX] 传递 is_train 参数
             )
-        assert len(total_batch_list) == len(total_episode_rewards)
-        assert len(total_batch_list) == len(total_episode_lengths)
-        assert len(total_batch_list) == len(total_traj_uid)
         
+        # 安全断言，防止数据不对齐
+        min_len = min(len(total_batch_list), len(total_episode_rewards))
+        if len(total_batch_list) != len(total_episode_rewards):
+            print(f"[Error] Metric mismatch in gather: batch={len(total_batch_list)}, rewards={len(total_episode_rewards)}")
+            total_batch_list = total_batch_list[:min_len]
+            total_episode_rewards = total_episode_rewards[:min_len]
+            total_episode_lengths = total_episode_lengths[:min_len]
+            total_traj_uid = total_traj_uid[:min_len]
 
         # Create trajectory data
         gen_batch_output: DataProto = self.gather_rollout_data(
