@@ -42,21 +42,25 @@ MODEL_PATH="/home/zzh/Workspace/modelscope/models/Qwen/Qwen2___5-VL-3B-Instruct"
 export PYTHONPATH=$PYTHONPATH:$(pwd):$(pwd)/agent_system/environments/env_package/alfworld
 
 # ================= 配置区域 =================
-SAMPLE_SIZE=40
+# SAMPLE_SIZE=40  <-- 不再需要总数，直接指定分集大小
 DATA_SEED=42
-TRAIN_RATIO=0.8
+# TRAIN_RATIO=0.8 <-- 不再需要
 
 TRAIN_BATCH_SIZE=8
 VAL_BATCH_SIZE=8
 GROUP_SIZE=4
 EXPERIMENT_NAME="ccapo_alfworld_real_run1"
 MAX_STEPS=25
+
+# 新增：显式控制数据集大小
+TRAIN_SET_SIZE=160             # 例如：4个 batch
+VAL_SET_SIZE=$VAL_BATCH_SIZE  # 强制让验证集大小等于验证 Batch Size
 # ===========================================
 
 echo ">>> [1/2] Generating/Updating Real ALFWorld Data..."
 python3 make_real_alfworld_data.py \
-    --total_samples $SAMPLE_SIZE \
-    --train_ratio $TRAIN_RATIO \
+    --train_size $TRAIN_SET_SIZE \
+    --val_size $VAL_SET_SIZE \
     --seed $DATA_SEED \
     --output_dir "$(pwd)/data/verl-agent/text"
 
