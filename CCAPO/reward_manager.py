@@ -26,6 +26,9 @@ class CCAPORewardManager:
         # [CCAPO 修改] 初始化 Adapter 和 Logger
         self.adapter = ALFWorldAdapter()
         self.logger = get_logger()
+
+        # [CCAPO 修复] 内部维护全局步数计数器
+        self.global_batch_cnt = 0
         
         # 初始化 STDB (会自动连接到 Global Ray Actor)
         ccapo_cfg = config.get('algorithm', {}).get('ccapo', {}) if config else {}
@@ -72,12 +75,15 @@ class CCAPORewardManager:
         """
         计算奖励的核心入口。
         """
+        # [CCAPO 修复] 步数自增
+        self.global_batch_cnt += 1
+        
         # 1. 准备空 Reward Tensor
         responses = data.batch['responses']
         batch_size, seq_len = responses.shape
         rewards_tensor = torch.zeros_like(responses, dtype=torch.float32, device=responses.device)
         
-        # 获取 infos (包含 ccapo_trajectory)
+        # 获取 infos
         infos = data.non_tensor_batch.get('infos', [])
         if len(infos) == 0:
             self.logger.log_event("missing_infos", {"reason": "non_tensor_batch missing infos", "batch_size": int(batch_size)})
@@ -97,12 +103,11 @@ class CCAPORewardManager:
         """
         遍历 Batch，计算奖励填入 tensor，并保存轨迹日志。
         """
-        # [CCAPO 新增] 初始化本 Batch 的统计计数器
         batch_stats = {
             "success_count": 0,
             "fail_count": 0,
-            "exec_hits": 0,          # 命中骨架的步数
-            "logic_score_sum": 0.0,  # 获得的逻辑奖励总和
+            "exec_hits": 0,
+            "logic_score_sum": 0.0,
             "milestones_triggered": 0,
             "loops_detected": 0
         }
@@ -124,9 +129,6 @@ class CCAPORewardManager:
             else:
                 batch_stats["fail_count"] += 1
             
-            # --- 保存轨迹到本地 (Log) ---
-            # self._save_trajectory_to_disk(traj)
-            
             # --- 准备计算数据 ---
             raw_actions = [s['action_raw'] for s in steps]
             group_id = meta['group_id']
@@ -138,61 +140,81 @@ class CCAPORewardManager:
             
             current_token_offset = 0
             history_actions = []
-            
-            # 累积环境本身的 Outcome Reward
             final_env_reward = metrics.get('final_env_reward', 0.0)
             
             for t, step in enumerate(steps):
                 n_tokens = step['llm_stats'].get('completion_tokens', 0)
-                if n_tokens <= 0: continue # 保护
+                if n_tokens <= 0: continue
                 
-                # Reward 施加在当前 Action 结束的那个 Token 上
                 reward_idx = current_token_offset + n_tokens - 1
                 current_token_offset += n_tokens
                 
                 if reward_idx >= rewards_tensor.shape[1]:
                     break
                 
-                # === 计算各种 Dense Rewards ===
-                r_val = 0.0
+                # === [CCAPO v2.3 准备] 奖励计算与归因 ===
+                # 我们将各项分值先分开计算，方便 Logging
+                r_exec = 0.0
+                r_logic = 0.0
+                r_milestone = 0.0
+                r_loop = 0.0
+                r_env = 0.0
                 
                 # 1. Exec
                 if lcs_mask[t]:
-                    r_val += self.exec_reward_on
-                    batch_stats["exec_hits"] += 1  # [统计]
+                    r_exec = self.exec_reward_on
+                    batch_stats["exec_hits"] += 1
                 else:
-                    r_val += self.exec_reward_off
+                    r_exec = self.exec_reward_off
                 
                 # 2. Logic (Skip first step)
                 if t > 0:
                     prev_act = steps[t-1]['action_abstract']
                     curr_act = step['action_abstract']
                     score = self.stdb.get_transition_score(task_type, prev_act, curr_act)
-                    r_val += self.logic_scale * score
-                    batch_stats["logic_score_sum"] += score # [统计]
+                    r_logic = self.logic_scale * score
+                    batch_stats["logic_score_sum"] += score
                 
                 # 3. Milestone
                 if step.get('milestones'):
                     ms_count = len(step['milestones'])
-                    r_val += self.milestone_reward * ms_count
-                    batch_stats["milestones_triggered"] += ms_count # [统计]
+                    r_milestone = self.milestone_reward * ms_count
+                    batch_stats["milestones_triggered"] += ms_count
                 
                 # 4. Loop Penalty
                 history_actions.append(step['action_raw'])
                 if detect_loop(history_actions):
-                    r_val += self.loop_penalty
-                    batch_stats["loops_detected"] += 1 # [统计]
+                    r_loop = self.loop_penalty
+                    batch_stats["loops_detected"] += 1
                     
                 # 5. Environment Outcome Reward
                 if t == len(steps) - 1:
-                    r_val += final_env_reward
+                    r_env = final_env_reward
 
-                # 写入 Tensor (CPU 操作)
-                rewards_tensor[b_idx, reward_idx] = r_val
+                # 汇总
+                total_val = r_exec + r_logic + r_milestone + r_loop + r_env
+                rewards_tensor[b_idx, reward_idx] = total_val
+                
+                # [CCAPO 新增] 采样记录奖励归因 (为避免日志爆炸，我们可以加一个采样率，或者全记)
+                # 这里暂时全记，因为 Debug 阶段数据最重要
+                self.logger.log_reward_composition(
+                    step=self.global_batch_cnt,
+                    trace_id=group_id,
+                    step_idx=t,
+                    total_reward=total_val,
+                    components={
+                        "exec": r_exec,
+                        "logic": r_logic,
+                        "milestone": r_milestone,
+                        "loop": r_loop,
+                        "env": r_env
+                    },
+                    meta={"act": step['action_abstract'], "valid": step['is_valid']}
+                )
 
-        # [CCAPO 新增] 将本 Batch 的统计指标写入本地日志文件
-        # Step 暂时填 0，或者您可以尝试从 infos 中获取 global step
-        self.logger.log_step_metrics(step=0, metrics=batch_stats)
+        # [CCAPO 修复] 使用真实的 batch count
+        self.logger.log_step_metrics(step=self.global_batch_cnt, metrics=batch_stats)
+        
         if traj_found == 0:
             self.logger.log_event("missing_trajectory", {"reason": "no ccapo_trajectory in infos", "batch_size": int(len(infos))})
 
