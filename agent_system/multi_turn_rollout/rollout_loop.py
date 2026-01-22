@@ -494,6 +494,7 @@ class TrajectoryCollector:
                 batch.non_tensor_batch['is_action_valid'] = np.array([info['is_action_valid'] for info in infos], dtype=bool)
             else:
                 batch.non_tensor_batch['is_action_valid'] = np.ones(batch_size, dtype=bool)
+            batch.non_tensor_batch['infos'] = np.array(infos, dtype=object)
 
             episode_rewards += torch_to_numpy(rewards) * torch_to_numpy(active_masks)
             episode_lengths[active_masks] += 1

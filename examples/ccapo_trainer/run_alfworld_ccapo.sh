@@ -120,5 +120,5 @@ python3 -m verl.trainer.main_ppo \
     trainer.save_freq=1 \
     trainer.test_freq=5 \
     trainer.total_epochs=1 \
-    trainer.val_before_train=True \
+    trainer.val_before_train=False \
     2>&1 | tee logger/ccapo_run.log

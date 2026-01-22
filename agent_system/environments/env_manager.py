@@ -188,6 +188,9 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
         current_rewards = to_numpy(rewards)
         current_dones = to_numpy(dones)
         
+        # [新增] 获取配置中的最大步数，默认 50 以防万一
+        max_steps = self.config.env.get('max_steps', 50)
+        
         for i in range(len(text_actions)):
             # A. 动作抽象
             raw_action = text_actions[i]
@@ -215,8 +218,12 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
             
             self.trajectory_buffer[i].append(step_record)
             
-            # F. 如果 Episode 结束
-            if current_dones[i]:
+            # [关键修复]：检测是否超时截断 (Buffer长度 >= MaxSteps)
+            # 注意：这里我们用 >= 是为了保险，防止之前 missed 掉
+            is_truncated = len(self.trajectory_buffer[i]) >= max_steps
+            
+            # F. 如果 Episode 结束 (Done 或 Truncated)
+            if current_dones[i] or is_truncated:
                 is_success = bool(infos[i].get('won', False))
                 
                 full_trajectory_log = {
@@ -224,7 +231,9 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
                     "metrics": {
                         "total_steps": len(self.trajectory_buffer[i]),
                         "is_success": is_success,
-                        "final_env_reward": float(current_rewards[i])
+                        "final_env_reward": float(current_rewards[i]),
+                        # [新增] 标记是否为超时截断，方便后续分析
+                        "is_truncated": is_truncated and not current_dones[i]
                     },
                     "steps": self.trajectory_buffer[i]
                 }
@@ -235,8 +244,9 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
                 # 2. [关键] 立即保存到本地磁盘 (Worker 本地)
                 self._save_trajectory_to_disk(full_trajectory_log)
                 
-                # 3. 清理 Buffer 在 reset 中进行，这里可以不做，
-                # 但为了防止复用错位，下次 reset 会覆盖
+                # 3. 如果是 Truncated 但还没 Done，为了保证 RewardManager 能统计到 fail，
+                #    这里不需要手动把 current_dones 改为 True (因为 verl 外层循环会处理)，
+                #    只要确保 ccapo_trajectory 挂载到了 infos[i] 上即可。
 
         # ================= [CCAPO 修改结束] =================
 

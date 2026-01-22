@@ -79,6 +79,8 @@ class CCAPORewardManager:
         
         # 获取 infos (包含 ccapo_trajectory)
         infos = data.non_tensor_batch.get('infos', [])
+        if len(infos) == 0:
+            self.logger.log_event("missing_infos", {"reason": "non_tensor_batch missing infos", "batch_size": int(batch_size)})
         
         # 2. 更新 STDB
         self._update_stdb(infos)
@@ -105,10 +107,12 @@ class CCAPORewardManager:
             "loops_detected": 0
         }
 
+        traj_found = 0
         for b_idx, info in enumerate(infos):
             traj = info.get('ccapo_trajectory')
             if not traj: 
                 continue
+            traj_found += 1
                 
             steps = traj['steps']
             meta = traj['meta']
@@ -189,6 +193,8 @@ class CCAPORewardManager:
         # [CCAPO 新增] 将本 Batch 的统计指标写入本地日志文件
         # Step 暂时填 0，或者您可以尝试从 infos 中获取 global step
         self.logger.log_step_metrics(step=0, metrics=batch_stats)
+        if traj_found == 0:
+            self.logger.log_event("missing_trajectory", {"reason": "no ccapo_trajectory in infos", "batch_size": int(len(infos))})
 
     def _save_trajectory_to_disk(self, traj: Dict):
         """
