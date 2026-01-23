@@ -36,7 +36,7 @@ export VLLM_ATTENTION_BACKEND=XFORMERS
 export SWANLAB_API_KEY="oB8w36PCJxKeqwif2ijWz"
 
 # 模型路径 (请确保路径存在)
-MODEL_PATH="/home/zzh/Workspace/modelscope/models/Qwen/Qwen2___5-VL-3B-Instruct"
+MODEL_PATH="/home/zzh/Workspace/modelscope/models/Qwen/Qwen2.5-0.5B-Instruct"
 
 # 确保 PYTHONPATH 包含当前目录和 ALFWorld 环境包
 export PYTHONPATH=$PYTHONPATH:$(pwd):$(pwd)/agent_system/environments/env_package/alfworld
@@ -50,10 +50,10 @@ TRAIN_BATCH_SIZE=8
 VAL_BATCH_SIZE=8
 GROUP_SIZE=4
 EXPERIMENT_NAME="ccapo_alfworld_real_run1"
-MAX_STEPS=25
+MAX_STEPS=50
 
 # 新增：显式控制数据集大小
-TRAIN_SET_SIZE=160             # 例如：4个 batch
+TRAIN_SET_SIZE=320             # 例如：4个 batch
 VAL_SET_SIZE=$VAL_BATCH_SIZE  # 强制让验证集大小等于验证 Batch Size
 # ===========================================
 

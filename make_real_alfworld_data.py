@@ -50,6 +50,64 @@ def process_files(file_list, split_label):
         })
     return data_list
 
+def extract_task_type(game_file_path: str, data_root: str) -> str:
+    """
+    从 game 文件路径中提取任务类型（task type）。
+    约定：data_root 下通常是 <split>/<task_type>/.../game.tw-pddl
+    """
+    full_dir = os.path.dirname(game_file_path)
+    try:
+        rel_dir = os.path.relpath(full_dir, data_root)
+    except Exception:
+        rel_dir = full_dir
+
+    parts = rel_dir.split(os.sep)
+    if not parts:
+        return "unknown"
+
+    # 常见结构：train/<task_type>/...
+    if parts[0] in {"train", "valid", "test"}:
+        return parts[1] if len(parts) > 1 else "unknown"
+
+    # 兜底：没有 split 前缀时，取第一段
+    return parts[0]
+
+def balanced_sample(file_pool, k, rng, data_root):
+    """
+    尽量按 task_type 均匀抽样 k 条（round-robin），并保持确定性（由 rng 控制）。
+    返回：selected(list)
+    """
+    if k <= 0:
+        return []
+
+    task_to_files = {}
+    for fp in file_pool:
+        t = extract_task_type(fp, data_root)
+        task_to_files.setdefault(t, []).append(fp)
+
+    # 每个 task 内部打乱
+    for t in task_to_files:
+        rng.shuffle(task_to_files[t])
+
+    # task 列表顺序也由 rng 决定（在 seed 固定时保持确定性）
+    tasks = sorted(task_to_files.keys())
+    rng.shuffle(tasks)
+
+    selected = []
+    # round-robin 抽取，直到凑够 k 或者所有 task 耗尽
+    while len(selected) < k:
+        progressed = False
+        for t in tasks:
+            if len(selected) >= k:
+                break
+            if task_to_files[t]:
+                selected.append(task_to_files[t].pop())
+                progressed = True
+        if not progressed:
+            break
+
+    return selected
+
 def get_config_hash(args):
     """
     计算配置的哈希值。
@@ -58,12 +116,14 @@ def get_config_hash(args):
     config_dict = {
         "data_root": args.data_root,
         "seed": args.seed,
+        # 采样策略（新增：均匀按任务类型抽样）
+        "sampling_strategy": "balanced_by_task_type_round_robin_v1",
         # 核心：将两种模式的参数都放入字典
         "mode_params": {
             "total_samples": args.total_samples,
             "train_ratio": args.train_ratio,
-            "explicit_train_size": args.train_size, # 关键：纳入显式大小
-            "explicit_val_size": args.val_size      # 关键：纳入显式大小
+            "explicit_train_size": args.train_size,  # 关键：纳入显式大小
+            "explicit_val_size": args.val_size       # 关键：纳入显式大小
         }
     }
     # 按照 Key 排序转字符串，确保确定性
@@ -74,18 +134,18 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--data_root", type=str, default=os.path.expanduser("~/.cache/alfworld/json_2.1.1"))
     parser.add_argument("--output_dir", type=str, default="data/verl-agent/text")
-    
+
     # === 模式 A: 比例采样 (Legacy) ===
     parser.add_argument("--total_samples", type=int, default=-1, help="[Ratio Mode] 总数据量，-1为全量")
     parser.add_argument("--train_ratio", type=float, default=0.8, help="[Ratio Mode] 训练集占比")
-    
+
     # === 模式 B: 显式指定大小 (New) ===
     parser.add_argument("--train_size", type=int, default=0, help="[Explicit Mode] 显式指定训练集数量")
     parser.add_argument("--val_size", type=int, default=0, help="[Explicit Mode] 显式指定验证集数量")
 
     parser.add_argument("--seed", type=int, default=42, help="随机种子")
     parser.add_argument("--force", action="store_true", help="强制重新生成")
-    
+
     args = parser.parse_args()
 
     # --- 1. 检查缓存 (决定是否跳过) ---
@@ -93,10 +153,10 @@ def main():
     meta_path = os.path.join(args.output_dir, "dataset_meta.json")
     train_path = os.path.join(args.output_dir, "train.parquet")
     test_path = os.path.join(args.output_dir, "test.parquet")
-    
+
     # 计算当前的指纹
     current_hash, current_config = get_config_hash(args)
-    
+
     need_regenerate = True
     if os.path.exists(meta_path) and os.path.exists(train_path) and not args.force:
         try:
@@ -107,7 +167,9 @@ def main():
                 logger.info(f"✅ Config Check: Hash matched ({current_hash[:8]}). Using cached dataset.")
                 need_regenerate = False
             else:
-                logger.info(f"⚠️  Config Check: Hash mismatch! (Saved: {saved_meta.get('config_hash')[:8]} vs Current: {current_hash[:8]}). Regenerating...")
+                logger.info(
+                    f"⚠️  Config Check: Hash mismatch! (Saved: {saved_meta.get('config_hash')[:8]} vs Current: {current_hash[:8]}). Regenerating..."
+                )
         except Exception as e:
             logger.warning(f"⚠️  Config Check: Error reading meta ({e}). Regenerating...")
     else:
@@ -127,10 +189,11 @@ def main():
         logger.error("No game files found!")
         return
 
-    # 统一 shuffle
+    # 为确定性：先排序，再用固定 seed 的 rng 控制抽样过程
     raw_files.sort()
-    random.seed(args.seed)
-    random.shuffle(raw_files)
+    rng = random.Random(args.seed)
+    rng.shuffle(raw_files)
+
     total_available = len(raw_files)
 
     train_files = []
@@ -140,10 +203,10 @@ def main():
     # 判定优先级：如果 train_size 或 val_size 被设置(>0)，则强制进入 Explicit Mode
     if args.train_size > 0 or args.val_size > 0:
         logger.info(f"🔵 Mode: EXPLICIT SIZE (Train: {args.train_size}, Val: {args.val_size})")
-        
+
         req_train = args.train_size
         req_val = args.val_size
-        
+
         # 边界检查
         if req_train + req_val > total_available:
             logger.warning(f"⚠️  Requested {req_train + req_val} > Available {total_available}. Truncating Train set first.")
@@ -152,24 +215,28 @@ def main():
                 req_train = 0
             else:
                 req_train = total_available - req_val
-        
-        train_files = raw_files[:req_train]
-        test_files = raw_files[req_train : req_train + req_val]
+
+        # 先均匀抽 train，再从剩余里均匀抽 val，保证不重叠
+        train_files = balanced_sample(raw_files, req_train, rng, args.data_root)
+        remaining = [fp for fp in raw_files if fp not in set(train_files)]
+        test_files = balanced_sample(remaining, req_val, rng, args.data_root)
 
     else:
         logger.info(f"🟣 Mode: RATIO SAMPLING (Total: {args.total_samples}, Ratio: {args.train_ratio})")
-        
+
         num_to_take = args.total_samples
         if num_to_take == -1 or num_to_take > total_available:
             num_to_take = total_available
-        
-        selected_files = raw_files[:num_to_take]
+
         num_train = int(num_to_take * args.train_ratio)
-        if num_train == 0 and num_to_take > 0: 
-            num_train = 1 # 至少保证训练集有1条
-        
-        train_files = selected_files[:num_train]
-        test_files = selected_files[num_train:]
+        if num_train == 0 and num_to_take > 0:
+            num_train = 1  # 至少保证训练集有1条
+        num_val = max(0, num_to_take - num_train)
+
+        # 在全池里做“按任务类型尽量均匀”的抽样：先 train 再 val（不重叠）
+        train_files = balanced_sample(raw_files, num_train, rng, args.data_root)
+        remaining = [fp for fp in raw_files if fp not in set(train_files)]
+        test_files = balanced_sample(remaining, num_val, rng, args.data_root)
     # =================================================
 
     logger.info(f"Result -> Train: {len(train_files)} | Val: {len(test_files)}")
@@ -177,7 +244,7 @@ def main():
     # 保存 Parquet
     df_train = pd.DataFrame(process_files(train_files, "train"))
     df_train.to_parquet(train_path)
-    
+
     if test_files:
         df_test = pd.DataFrame(process_files(test_files, "test"))
         df_test.to_parquet(test_path)
@@ -198,7 +265,7 @@ def main():
     }
     with open(meta_path, 'w') as f:
         json.dump(meta_info, f, indent=2)
-    
+
     logger.info(f"✅ Dataset generated and saved to {args.output_dir}")
 
 if __name__ == "__main__":

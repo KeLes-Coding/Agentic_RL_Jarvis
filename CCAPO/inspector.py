@@ -2,111 +2,156 @@
 
 import os
 import json
-import re
-from openai import OpenAI
+import glob
+import pandas as pd
+import numpy as np
+from datetime import datetime
 
-# 配置你的 Key 和 Base URL (如果使用第三方/中转)
-API_KEY = "sk-65b9208aa589434db22f3863e772b213" 
-BASE_URL = "https://api.deepseek.com" 
+class CCAPOInspector:
+    def __init__(self, log_dir_root="experiments/ccapo_logs"):
+        self.log_dir_root = log_dir_root
+        try:
+            self.latest_run_dir = self._get_latest_run()
+            print(f"🔍 [Inspector] Analyzing Run: {self.latest_run_dir}")
+        except Exception as e:
+            print(f"❌ Initialization failed: {e}")
+            self.latest_run_dir = None
+        
+    def _get_latest_run(self):
+        # 找到最近的一个 run_YYYYMMDD_HHMMSS 文件夹
+        if not os.path.exists(self.log_dir_root):
+            raise FileNotFoundError(f"Log root not found: {self.log_dir_root}")
+        runs = glob.glob(os.path.join(self.log_dir_root, "run_*"))
+        if not runs:
+            raise FileNotFoundError("No log directories found!")
+        return max(runs, key=os.path.getmtime)
 
-client = OpenAI(api_key=API_KEY, base_url=BASE_URL)
+    def load_data(self):
+        if not self.latest_run_dir: return
 
-def parse_training_log(log_path):
-    """解析 TaskRunner 的标准输出日志，提取关键指标"""
-    metrics = []
-    if not os.path.exists(log_path): return metrics
-    
-    with open(log_path, 'r') as f:
-        for line in f:
-            if "global_seqlen/mean" in line: # 关键行特征
-                # 简单正则提取 step 和 success_rate
-                step_match = re.search(r'step:(\d+)', line)
-                sr_match = re.search(r'episode/success_rate:([\d\.]+)', line)
-                rwd_match = re.search(r'episode/reward/mean:([\d\.]+)', line)
-                
-                if step_match and sr_match:
-                    metrics.append({
-                        "step": int(step_match.group(1)),
-                        "success_rate": float(sr_match.group(1)),
-                        "mean_reward": float(rwd_match.group(1) if rwd_match else 0.0)
-                    })
-    return metrics
+        # 1. Load Metrics (Batch Level)
+        metrics_path = os.path.join(self.latest_run_dir, "ccapo_metrics.jsonl")
+        self.df_metrics = self._read_jsonl(metrics_path)
+        
+        # 2. Load Rewards (Step Level)
+        rewards_path = os.path.join(self.latest_run_dir, "ccapo_rewards.jsonl")
+        self.df_rewards = self._read_jsonl(rewards_path)
+        
+        # Flatten components column
+        if not self.df_rewards.empty and 'components' in self.df_rewards.columns:
+            comps = pd.json_normalize(self.df_rewards['components'])
+            self.df_rewards = pd.concat([self.df_rewards.drop('components', axis=1), comps], axis=1)
+            
+        # Flatten meta column
+        if not self.df_rewards.empty and 'meta' in self.df_rewards.columns:
+            metas = pd.json_normalize(self.df_rewards['meta'])
+            # [Fix] 这里的 meta 展开后，列名会直接变成 'act', 'valid', 'status' 等
+            self.df_rewards = pd.concat([self.df_rewards.drop('meta', axis=1), metas], axis=1)
 
-def parse_ccapo_log(log_dir):
-    """解析 CCAPO 内部日志"""
-    events = []
-    # 读取 stdb_server.jsonl
-    stdb_path = os.path.join(log_dir, "stdb_server.jsonl")
-    if os.path.exists(stdb_path):
-        with open(stdb_path, 'r') as f:
+    def _read_jsonl(self, path):
+        data = []
+        if not os.path.exists(path):
+            print(f"⚠️ Warning: {path} not found.")
+            return pd.DataFrame()
+        with open(path, 'r', encoding='utf-8') as f:
             for line in f:
                 try:
-                    events.append(json.loads(line))
-                except: pass
-    return events
+                    data.append(json.loads(line))
+                except:
+                    pass
+        return pd.DataFrame(data)
 
-def analyze_with_llm(training_metrics, ccapo_events):
-    """调用 LLM 生成分析报告"""
-    
-    # 构造 Prompt Context
-    context = f"""
-    You are an expert in Reinforcement Learning, specifically analyzing the CCAPO (Consensus-based Context-Aware Policy Optimization) framework.
-    
-    I will provide you with two sets of data from a training run:
-    1. **Training Metrics**: PPO metrics like Success Rate, Reward, etc.
-    2. **CCAPO Internal Events**: Logs from the STDB (State-Trajectory Database), showing Anchor updates and Logic consensus.
-    
-    **Your Task**: Analyze the effectiveness of the CCAPO mechanism.
-    
-    **Specific Questions to Answer**:
-    1. **Is the Execution Stream working?** (Are we finding better anchors? Is the step count of anchors decreasing?)
-    2. **Is the STDB growing?** (Are we accumulating knowledge or just stagnating?)
-    3. **Correlation**: Do updates in STDB correlate with increases in Success Rate?
-    4. **Potential Issues**: Are there signs of collapse (e.g., Success Rate drops while Anchors update)?
-    
-    --- DATA START ---
-    
-    [Training Metrics (Last 5 steps)]:
-    {json.dumps(training_metrics[-5:], indent=2)}
-    
-    [CCAPO Anchor Updates (Sample)]:
-    {json.dumps([e for e in ccapo_events if e.get('event') == 'anchor_update'][-10:], indent=2)}
-    
-    --- DATA END ---
-    
-    Please output the report in Chinese (Markdown format).
-    """
-    
-    response = client.chat.completions.create(
-        model="deepseek-chat", # 或 gpt-3.5-turbo / deepseek-chat
-        messages=[
-            {"role": "system", "content": "You are a helpful AI research assistant."},
-            {"role": "user", "content": context}
-        ]
-    )
-    
-    return response.choices[0].message.content
+    def analyze_health(self):
+        """维度 1: 基础生命体征"""
+        print("\n=== 1. Health Check (Validity) ===")
+        if self.df_rewards.empty:
+            print("No reward data found.")
+            return
+
+        total_steps = len(self.df_rewards)
+        print(f"Total Micro Steps Recorded: {total_steps}")
+
+        # [Fix] 健壮性检查：确认 'valid' 列是否存在
+        if 'valid' in self.df_rewards.columns:
+            valid_steps = self.df_rewards[self.df_rewards['valid'] == True]
+            valid_rate = len(valid_steps) / total_steps
+            print(f"✅ Valid Action Rate:       {valid_rate:.2%}")
+            
+            if valid_rate < 0.2:
+                print("   🔴 CRITICAL: 模型几乎没有输出合法指令。")
+                if 'act' in self.df_rewards.columns:
+                    invalid_samples = self.df_rewards[self.df_rewards['valid'] == False]['act'].head(3).values
+                    print(f"   Sample Invalid Actions: {invalid_samples}")
+        else:
+            print("⚠️ 'valid' column missing in logs. Skipping validity check.")
+
+    def analyze_pioneers(self):
+        """维度 2: 先锋与成败"""
+        print("\n=== 2. Evolution (Pioneers) ===")
+        if self.df_rewards.empty: return
+        
+        # [Fix] 健壮性检查
+        required_cols = ['trace_id', 'status']
+        if not all(col in self.df_rewards.columns for col in required_cols):
+            print(f"⚠️ Missing columns {required_cols}. Cannot analyze pioneers.")
+            # 尝试回退到 metrics 分析
+            if not self.df_metrics.empty:
+                 print("   [Fallback to Metrics Log]")
+                 last_metric = self.df_metrics.iloc[-1]['metrics']
+                 print(f"   Success Count (Total): {last_metric.get('success_count', 'N/A')}")
+            return
+
+        unique_trajs = self.df_rewards[['trace_id', 'status']].drop_duplicates()
+        status_counts = unique_trajs['status'].value_counts()
+        
+        total_trajs = len(unique_trajs)
+        print(f"Total Trajectories: {total_trajs}")
+        print(status_counts.to_string())
+        
+        pioneer_cnt = status_counts.get('PIONEER', 0)
+        success_cnt = status_counts.get('SUCCESS', 0)
+        
+        if total_trajs > 0:
+            print(f"🌟 Pioneer Rate: {pioneer_cnt/total_trajs:.2%}")
+            print(f"📈 Success Rate: {(pioneer_cnt + success_cnt)/total_trajs:.2%}")
+
+    def analyze_reward_composition(self):
+        """维度 3: 奖励成分解剖"""
+        print("\n=== 3. Reward Composition Analysis ===")
+        if self.df_rewards.empty: return
+        
+        if 'status' not in self.df_rewards.columns:
+            print("⚠️ 'status' column missing. Showing aggregate stats.")
+            statuses = ['ALL']
+            self.df_rewards['status'] = 'ALL'
+        else:
+            statuses = ['FAIL', 'SUCCESS', 'PIONEER']
+
+        cols_to_check = ['exec', 'logic', 'milestone', 'loop']
+        available_cols = [c for c in cols_to_check if c in self.df_rewards.columns]
+
+        for status in statuses:
+            subset = self.df_rewards[self.df_rewards['status'] == status]
+            if subset.empty: continue
+            
+            print(f"\n--- Status: {status} (n={len(subset)} steps) ---")
+            
+            for col in available_cols:
+                avg_val = subset[col].mean()
+                print(f"   Avg {col.capitalize()} Reward: {avg_val:.4f}")
+            
+            # 简单诊断
+            if status == 'FAIL' and 'logic' in available_cols:
+                avg_logic = subset['logic'].mean()
+                if avg_logic == 0:
+                    print("   🔴 WARNING: 失败轨迹 Logic 得分为 0。STDB 可能为空或未匹配。")
+
+    def run(self):
+        self.load_data()
+        self.analyze_health()
+        self.analyze_pioneers()
+        self.analyze_reward_composition()
 
 if __name__ == "__main__":
-    # 这里填入你实际的日志路径
-    # 提示：运行训练时请使用: ./run_script.sh | tee training.log
-    TRAIN_LOG = "training.log" 
-    CCAPO_LOG_DIR = "experiments/ccapo_logs" # 假设这是 Server 写入的目录
-    
-    print(">>> Parsing logs...")
-    t_metrics = parse_training_log(TRAIN_LOG)
-    c_events = parse_ccapo_log(CCAPO_LOG_DIR)
-    
-    print(f"Found {len(t_metrics)} training steps and {len(c_events)} CCAPO events.")
-    
-    if len(t_metrics) > 0:
-        print(">>> Generating AI Report...")
-        report = analyze_with_llm(t_metrics, c_events)
-        print("\n" + "="*30 + " AI ANALYSIS REPORT " + "="*30 + "\n")
-        print(report)
-        
-        # 保存报告
-        with open("latest_analysis_report.md", "w") as f:
-            f.write(report)
-    else:
-        print("No metrics found. Did you pipe stdout to 'training.log'?")
+    inspector = CCAPOInspector()
+    inspector.run()

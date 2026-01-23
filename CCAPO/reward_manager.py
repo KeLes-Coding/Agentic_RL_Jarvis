@@ -6,13 +6,13 @@ import os
 import json
 import logging
 from datetime import datetime
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Set
 
-# [CCAPO 修改] 引入分布式 STDB 客户端、适配器和日志系统
+# [CCAPO 依赖]
 from CCAPO.stdb import STDB
 from CCAPO.utils import compute_lcs_mask, detect_loop
-from CCAPO.adapter import ALFWorldAdapter  # 新增：适配器
-from CCAPO.logger import get_logger        # 新增：日志系统
+from CCAPO.adapter import ALFWorldAdapter
+from CCAPO.logger import get_logger
 
 logger = logging.getLogger(__name__)
 
@@ -23,171 +23,213 @@ class CCAPORewardManager:
         self.compute_score = compute_score
         self.config = config or {}
         
-        # [CCAPO 修改] 初始化 Adapter 和 Logger
+        # [Component Init]
         self.adapter = ALFWorldAdapter()
         self.logger = get_logger()
-
-        # [CCAPO 修复] 内部维护全局步数计数器
         self.global_batch_cnt = 0
         
-        # 初始化 STDB (会自动连接到 Global Ray Actor)
+        # [STDB Init]
         ccapo_cfg = config.get('algorithm', {}).get('ccapo', {}) if config else {}
         self.stdb = STDB(ccapo_cfg)
         
-        # 验证连接 (打印 Actor 名称以确认是 Client 模式)
+        # 验证连接
         actor_name = getattr(self.stdb, 'actor_name', 'Local')
         print(f">>> [CCAPO] Reward Manager Connected to Global STDB. Actor Name: {actor_name}")
-        # self.stdb.save_checkpoint() # 可选：测试保存
         
+        # [Hyperparameters]
         self.exec_reward_on = ccapo_cfg.get('r_exec_on', 0.2)
         self.exec_reward_off = ccapo_cfg.get('r_exec_off', -0.01)
         self.logic_scale = ccapo_cfg.get('r_logic_scale', 0.05)
         self.milestone_reward = ccapo_cfg.get('r_milestone', 0.3)
         self.loop_penalty = ccapo_cfg.get('r_loop_penalty', -0.5)
 
-    def _update_stdb(self, infos):
-        updated = False
+    def _update_stdb(self, infos) -> Set[str]:
+        """
+        更新 STDB 并识别先锋轨迹 (Pioneers)。
+        Returns:
+            pioneer_groups: 本次更新中打破纪录的 Group ID 集合。
+        """
+        pioneer_groups = set()
         success_count = 0
         
         for info in infos:
             traj = info.get('ccapo_trajectory')
+            # 只用成功轨迹更新 STDB
             if traj and traj['metrics'].get('is_success', False):
                 success_count += 1
-                
-                # 获取 Group ID (兼容旧逻辑)
                 group_id = traj['meta']['group_id']
                 
-                # Update Exec
+                # 1. Update Execution Stream (Check for Pioneer)
+                # 如果 update_execution_anchor 返回 True，说明这是该环境下的新最优解
                 if self.stdb.update_execution_anchor(group_id, traj):
-                    updated = True
-                    print(f">>> [STDB] New Anchor Found! Group: {group_id}, Steps: {traj['metrics']['total_steps']}")
+                    pioneer_groups.add(group_id)
+                    print(f">>> [STDB] 🔥 Pioneer Found! Group: {group_id[:6]}, Steps: {traj['metrics']['total_steps']}")
                 
-                # Update Logic
+                # 2. Update Logic Stream (Skip-Gram Mining)
                 abs_acts = [s['action_abstract'] for s in traj['steps']]
-                self.stdb.update_logic_consensus(traj['meta']['task_type'], abs_acts)
+                # 注意：Client 端 API 已升级为直接接收 list
+                self.stdb.update_logic_consensus(traj['meta']['task_type'], abs_acts, is_success=True)
         
-        # 只要有成功样本就触发保存建议 (Server 端决定是否真正落盘)
+        # 异步触发保存
         if success_count > 0:
-            # print(f">>> [CCAPO] Processed {success_count} success trajectories.")
             self.stdb.save_checkpoint()
+            
+        return pioneer_groups
 
     def __call__(self, data: Any, return_dict: bool = False) -> Any:
-        """
-        计算奖励的核心入口。
-        """
-        # [CCAPO 修复] 步数自增
         self.global_batch_cnt += 1
         
-        # 1. 准备空 Reward Tensor
+        # 1. Init Buffer
         responses = data.batch['responses']
-        batch_size, seq_len = responses.shape
         rewards_tensor = torch.zeros_like(responses, dtype=torch.float32, device=responses.device)
         
-        # 获取 infos
         infos = data.non_tensor_batch.get('infos', [])
         if len(infos) == 0:
-            self.logger.log_event("missing_infos", {"reason": "non_tensor_batch missing infos", "batch_size": int(batch_size)})
+            self.logger.log_event("missing_infos", {"reason": "no infos", "batch": self.global_batch_cnt})
+            return rewards_tensor
         
-        # 2. 更新 STDB
-        self._update_stdb(infos)
+        # 2. Update STDB & Identify Pioneers
+        pioneer_groups = self._update_stdb(infos)
         
-        # 3. 计算 Dense Rewards & 记录详细日志
-        self._compute_and_log(infos, rewards_tensor)
+        # 3. Compute Rewards with Routing Logic
+        self._compute_and_log(infos, rewards_tensor, pioneer_groups)
         
-        # 4. 返回结果
         if return_dict:
             return {"reward_tensor": rewards_tensor}
         return rewards_tensor
 
-    def _compute_and_log(self, infos: List[Dict], rewards_tensor: torch.Tensor):
+    def _compute_and_log(self, infos: List[Dict], rewards_tensor: torch.Tensor, pioneer_groups: Set[str]):
         """
-        遍历 Batch，计算奖励填入 tensor，并保存轨迹日志。
+        核心计算逻辑：根据 成功/失败/先锋 状态路由奖励函数。
         """
+        # Batch 级统计容器
         batch_stats = {
-            "success_count": 0,
-            "fail_count": 0,
-            "exec_hits": 0,
-            "logic_score_sum": 0.0,
-            "milestones_triggered": 0,
-            "loops_detected": 0
+            "success_count": 0, "fail_count": 0, "pioneer_count": len(pioneer_groups),
+            "exec_hits": 0, "logic_score_sum": 0.0, "milestones_triggered": 0, "loops_detected": 0
         }
 
         traj_found = 0
         for b_idx, info in enumerate(infos):
             traj = info.get('ccapo_trajectory')
-            if not traj: 
-                continue
+            if not traj: continue
             traj_found += 1
                 
             steps = traj['steps']
             meta = traj['meta']
             metrics = traj['metrics']
             
-            # 统计成败
-            if metrics.get('is_success', False):
-                batch_stats["success_count"] += 1
-            else:
-                batch_stats["fail_count"] += 1
-            
-            # --- 准备计算数据 ---
-            raw_actions = [s['action_raw'] for s in steps]
+            # --- 状态判定 ---
+            is_success = metrics.get('is_success', False)
             group_id = meta['group_id']
-            task_type = meta['task_type']
+            # 如果是先锋，必然是成功
+            is_pioneer = group_id in pioneer_groups
             
-            # Exec Stream Logic
-            anchor_actions = self.stdb.get_execution_anchor(group_id)
-            lcs_mask = compute_lcs_mask(raw_actions, anchor_actions) if anchor_actions else [False]*len(steps)
+            # 统计
+            if is_success: batch_stats["success_count"] += 1
+            else: batch_stats["fail_count"] += 1
+
+            # --- [CCAPO v2.3] 奖励路由配置 (Reward Routing Config) ---
+            enable_exec = False
+            enable_logic = False
+            enable_milestone = False
             
+            if is_success:
+                if is_pioneer:
+                    # 【先锋轨迹】：
+                    # 1. 它是新标准，所以视为完全符合 Exec (Self-Alignment)
+                    # 2. 不受旧 Logic 约束
+                    # 3. 不受 Milestone 干扰
+                    enable_exec = True
+                    enable_logic = False # 保护创新，不受旧逻辑图打分
+                    enable_milestone = False
+                else:
+                    # 【普通成功】：
+                    # 1. Exec: 必须对齐 Anchor (压缩冗余)
+                    # 2. Logic: 鼓励高概率转移 (Step Quality)
+                    # 3. Milestone: 关闭 (防止 Reward Hacking)
+                    enable_exec = True
+                    enable_logic = True
+                    enable_milestone = False
+            else:
+                # 【失败轨迹】：
+                # 1. Exec: 关闭 (没有正确路径可对齐，避免扣分冤案)
+                # 2. Logic: 开启 (提供基础常识引导)
+                # 3. Milestone: 开启 (Failure-as-Teaching)
+                enable_exec = False
+                enable_logic = True
+                enable_milestone = True
+
+            # --- 预计算数据 ---
+            lcs_mask = []
+            if enable_exec:
+                if is_pioneer:
+                    # 先锋自己就是标准，全 True
+                    lcs_mask = [True] * len(steps)
+                else:
+                    # 普通成功，计算与 Anchor 的 LCS
+                    raw_actions = [s['action_raw'] for s in steps]
+                    anchor_actions = self.stdb.get_execution_anchor(group_id)
+                    lcs_mask = compute_lcs_mask(raw_actions, anchor_actions) if anchor_actions else [False]*len(steps)
+
+            # --- Step 循环计算 ---
             current_token_offset = 0
             history_actions = []
             final_env_reward = metrics.get('final_env_reward', 0.0)
             
+            task_type = meta['task_type']
+
             for t, step in enumerate(steps):
                 n_tokens = step['llm_stats'].get('completion_tokens', 0)
                 if n_tokens <= 0: continue
                 
+                # 定位 Reward 在 Tensor 中的位置
                 reward_idx = current_token_offset + n_tokens - 1
                 current_token_offset += n_tokens
+                if reward_idx >= rewards_tensor.shape[1]: break
                 
-                if reward_idx >= rewards_tensor.shape[1]:
-                    break
-                
-                # === [CCAPO v2.3 准备] 奖励计算与归因 ===
-                # 我们将各项分值先分开计算，方便 Logging
+                # === 组件计算 ===
                 r_exec = 0.0
                 r_logic = 0.0
                 r_milestone = 0.0
                 r_loop = 0.0
                 r_env = 0.0
                 
-                # 1. Exec
-                if lcs_mask[t]:
-                    r_exec = self.exec_reward_on
-                    batch_stats["exec_hits"] += 1
-                else:
-                    r_exec = self.exec_reward_off
+                # 1. Execution Reward (组内对齐)
+                if enable_exec:
+                    if t < len(lcs_mask) and lcs_mask[t]:
+                        r_exec = self.exec_reward_on
+                        batch_stats["exec_hits"] += 1
+                    else:
+                        r_exec = self.exec_reward_off # 抑制冗余步骤
                 
-                # 2. Logic (Skip first step)
-                if t > 0:
+                # 2. Logic Reward (概率图谱)
+                # 仅在非第一步计算转移分
+                if enable_logic and t > 0:
                     prev_act = steps[t-1]['action_abstract']
                     curr_act = step['action_abstract']
+                    # 从 Graph 获取 (Importance * Criticality * Utility)
                     score = self.stdb.get_transition_score(task_type, prev_act, curr_act)
                     r_logic = self.logic_scale * score
                     batch_stats["logic_score_sum"] += score
                 
-                # 3. Milestone
-                if step.get('milestones'):
-                    ms_count = len(step['milestones'])
-                    r_milestone = self.milestone_reward * ms_count
-                    batch_stats["milestones_triggered"] += ms_count
+                # 3. Milestone Reward (失败教学)
+                if enable_milestone:
+                    if step.get('milestones'):
+                        ms_count = len(step['milestones'])
+                        r_milestone = self.milestone_reward * ms_count
+                        batch_stats["milestones_triggered"] += ms_count
                 
-                # 4. Loop Penalty
+                # 4. Loop Penalty (全局生效，一票否决)
                 history_actions.append(step['action_raw'])
                 if detect_loop(history_actions):
                     r_loop = self.loop_penalty
                     batch_stats["loops_detected"] += 1
+                    # 发现 Loop 时，剥夺正向奖励 (降维打击)
+                    r_exec = 0.0
+                    r_logic = 0.0
+                    r_milestone = 0.0
                     
-                # 5. Environment Outcome Reward
+                # 5. Environment Outcome
                 if t == len(steps) - 1:
                     r_env = final_env_reward
 
@@ -195,8 +237,7 @@ class CCAPORewardManager:
                 total_val = r_exec + r_logic + r_milestone + r_loop + r_env
                 rewards_tensor[b_idx, reward_idx] = total_val
                 
-                # [CCAPO 新增] 采样记录奖励归因 (为避免日志爆炸，我们可以加一个采样率，或者全记)
-                # 这里暂时全记，因为 Debug 阶段数据最重要
+                # [Logger] 记录归因
                 self.logger.log_reward_composition(
                     step=self.global_batch_cnt,
                     trace_id=group_id,
@@ -209,39 +250,11 @@ class CCAPORewardManager:
                         "loop": r_loop,
                         "env": r_env
                     },
-                    meta={"act": step['action_abstract'], "valid": step['is_valid']}
+                    meta={
+                        "act": step['action_abstract'], 
+                        "status": "PIONEER" if is_pioneer else ("SUCCESS" if is_success else "FAIL")
+                    }
                 )
 
-        # [CCAPO 修复] 使用真实的 batch count
+        # 写入 Metric Log
         self.logger.log_step_metrics(step=self.global_batch_cnt, metrics=batch_stats)
-        
-        if traj_found == 0:
-            self.logger.log_event("missing_trajectory", {"reason": "no ccapo_trajectory in infos", "batch_size": int(len(infos))})
-
-    def _save_trajectory_to_disk(self, traj: Dict):
-        """
-        将单条轨迹保存为 JSON 文件。
-        结构: log_dir / task_type / group_id / timestamp_uuid.json
-        """
-        try:
-            meta = traj['meta']
-            task_type = meta.get('task_type', 'unknown')
-            group_id = meta.get('group_id', 'unknown')
-            
-            # 构建目录 (self.log_dir 需要在 init 中设置，或者使用全局 logger 目录)
-            # 这里为了不破坏原有逻辑，暂时不做改动，使用默认路径或 logger 路径
-            save_dir = os.path.join("experiments/ccapo_logs/trajectories", task_type, group_id)
-            os.makedirs(save_dir, exist_ok=True)
-            
-            # 文件名
-            uid = str(hash(str(traj))) 
-            timestamp = datetime.now().strftime("%H%M%S_%f")
-            filename = f"{timestamp}_{uid}.json"
-            
-            filepath = os.path.join(save_dir, filename)
-            
-            with open(filepath, 'w', encoding='utf-8') as f:
-                json.dump(traj, f, indent=2, ensure_ascii=False)
-                
-        except Exception as e:
-            logger.warning(f"[CCAPO] Failed to save trajectory: {e}")
