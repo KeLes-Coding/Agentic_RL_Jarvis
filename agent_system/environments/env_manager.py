@@ -167,9 +167,59 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
             return
         self._cached_confidence = metrics_list
     
+    def _clean_action_content(self, action_str):
+        """
+        [CCAPO Critical Fix v2] 增强型动作清洗器。
+        针对小模型（Qwen/DeepSeek）的 Instruction Following 能力弱点进行防御。
+        优先级：XML 标签 > Action 前缀 > 最后一行非空文本
+        """
+        if not action_str or not isinstance(action_str, str):
+            return "look" # 兜底动作，防止空串导致 STDB 报错
+
+        # 0. 预处理：移除 Think 标签内容（防止 Thought 中包含 Action 误导）
+        # 很多模型会输出 <think>I should go to...</think> Action: ...
+        action_str_clean = re.sub(r"<think>.*?</think>", "", action_str, flags=re.DOTALL)
+        
+        # 1. XML Tag Extraction (最高优先级，对齐 projection.py)
+        # 匹配 <action> content </action>，不区分大小写
+        match_xml = re.search(r"<action>(.*?)</action>", action_str_clean, re.DOTALL | re.IGNORECASE)
+        if match_xml:
+            content = match_xml.group(1).strip()
+            if content: return content
+
+        # 2. "Action:" Prefix Extraction (ReAct 格式)
+        # 匹配行首或换行后的 "Action: command"
+        # 使用 findall 取最后一个匹配项，防止 Thought 里引用 Action
+        matches_prefix = re.findall(r"(?:^|\n)(?:Action|Command):\s*(.+)", action_str_clean, re.IGNORECASE)
+        if matches_prefix:
+            content = matches_prefix[-1].strip()
+            if content: return content
+
+        # 3. Fallback: Last Non-Empty Line (最宽松策略)
+        # 过滤掉 "Thought:", "Observation:" 开头的行
+        lines = [line.strip() for line in action_str_clean.split('\n') if line.strip()]
+        if not lines:
+            return "look"
+            
+        last_line = lines[-1]
+        
+        # 简单的启发式过滤，防止把 Thought 当 Action
+        lower_line = last_line.lower()
+        if lower_line.startswith("thought:") or lower_line.startswith("observation:"):
+            # 如果最后一行是思考，尝试往前找一行
+            if len(lines) > 1:
+                return lines[-2]
+            return "look" # 实在找不到，发一个无害动作
+            
+        return last_line
+
     def step(self, text_actions: List[str]):
-        # 1. 动作映射与执行 (原有逻辑)
-        actions, valids = self.projection_f(text_actions, self.envs.get_admissible_commands)
+        # ================= [CCAPO 核心修复：提前清洗动作] =================
+        # 必须在传给环境之前清洗，否则环境无法识别指令，导致 Success=0
+        clean_text_actions = [self._clean_action_content(act) for act in text_actions]
+        
+        # 1. 动作映射与执行 (使用清洗后的动作)
+        actions, valids = self.projection_f(clean_text_actions, self.envs.get_admissible_commands)
         text_obs, image_obs, rewards, dones, infos = self.envs.step(actions)
         
         # 2. 内存更新 (原有逻辑)
@@ -184,21 +234,18 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
         for i, info in enumerate(infos):
             info['is_action_valid'] = to_numpy(valids[i])
 
-        # ================= [CCAPO 修改开始] =================
+        # ================= [CCAPO 数据组装] =================
         current_rewards = to_numpy(rewards)
         current_dones = to_numpy(dones)
         
-        # [新增] 获取配置中的最大步数，默认 50 以防万一
         max_steps = self.config.env.get('max_steps', 50)
         
         for i in range(len(text_actions)):
-            # A. 动作抽象
-            raw_action = text_actions[i]
-            abstract_action = self._abstract_action(raw_action)
-            
-            # B. 里程碑检测
-            meta = self.trajectory_meta[i] if i < len(self.trajectory_meta) else {}
-            milestones = self._detect_milestones(text_obs[i], meta.get('task_type', 'unknown'))
+            # A. 动作抽象 (使用已经清洗过的 clean_text_actions[i])
+            # 注意：raw_output 仍保留原始 LLM 输出，用于 Debug
+            raw_output = text_actions[i] 
+            clean_action = clean_text_actions[i]
+            abstract_action = self._abstract_action(clean_action)
             
             # C. 获取 LLM 内部状态
             token_stats = self._cached_token_usage[i] if i < len(self._cached_token_usage) else {}
@@ -207,46 +254,50 @@ class AlfWorldEnvironmentManager(EnvironmentManagerBase):
             # D. 组装单步数据
             step_record = {
                 "step_idx": len(self.trajectory_buffer[i]),
-                "action_raw": raw_action,
+                "action_raw": clean_action,       # 存清洗后的，供 STDB 使用
+                "action_llm_output": raw_output,  # 存原始的，供 Debug 分析
                 "action_abstract": abstract_action,
                 "observation": text_obs[i],
                 "reward_env": float(current_rewards[i]),
                 "is_valid": bool(valids[i]),
-                "milestones": milestones,
                 "llm_stats": {**token_stats, **conf_stats}
             }
             
             self.trajectory_buffer[i].append(step_record)
             
-            # [关键修复]：检测是否超时截断 (Buffer长度 >= MaxSteps)
-            # 注意：这里我们用 >= 是为了保险，防止之前 missed 掉
+            # 检测是否超时截断
             is_truncated = len(self.trajectory_buffer[i]) >= max_steps
             
             # F. 如果 Episode 结束 (Done 或 Truncated)
             if current_dones[i] or is_truncated:
+                # 1. 判定成功状态
                 is_success = bool(infos[i].get('won', False))
                 
+                # 2. [CRITICAL FIX] 强制对齐奖励与成功状态
+                # 如果 won=True，强制给 1.0，防止底层环境返回 0 导致训练崩塌
+                raw_reward = float(current_rewards[i])
+                final_reward = 1.0 if is_success else raw_reward
+                
+                # 双重保险
+                if final_reward >= 0.99: 
+                    is_success = True
+
                 full_trajectory_log = {
                     "meta": self.trajectory_meta[i],
                     "metrics": {
                         "total_steps": len(self.trajectory_buffer[i]),
                         "is_success": is_success,
-                        "final_env_reward": float(current_rewards[i]),
-                        # [新增] 标记是否为超时截断，方便后续分析
+                        "final_env_reward": final_reward, # 使用修正后的奖励
                         "is_truncated": is_truncated and not current_dones[i]
                     },
                     "steps": self.trajectory_buffer[i]
                 }
                 
-                # 1. 挂载到 info (供 RewardManager 使用)
+                # 3. 挂载到 info (供 RewardManager 和 Trainer 使用)
                 infos[i]['ccapo_trajectory'] = full_trajectory_log
                 
-                # 2. [关键] 立即保存到本地磁盘 (Worker 本地)
+                # 4. 立即保存到本地磁盘
                 self._save_trajectory_to_disk(full_trajectory_log)
-                
-                # 3. 如果是 Truncated 但还没 Done，为了保证 RewardManager 能统计到 fail，
-                #    这里不需要手动把 current_dones 改为 True (因为 verl 外层循环会处理)，
-                #    只要确保 ccapo_trajectory 挂载到了 infos[i] 上即可。
 
         # ================= [CCAPO 修改结束] =================
 
